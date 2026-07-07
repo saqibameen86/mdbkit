@@ -91,6 +91,22 @@ dropping). With `--schema`, it warns about multikey (array) fields,
 low-cardinality fields, and field-name typos. The schema export records field
 **names and types only — no values.**
 
+### Explain-plan analysis
+
+Got a slow query in hand rather than a log? Save its explain output and ask
+mdbkit what's wrong:
+
+```bash
+# in mongosh:  EJSON.stringify(db.orders.find({...}).sort({...}).explain("executionStats"))
+mdbkit explain explain.json
+```
+
+You get the plan chain (`SORT -> COLLSCAN`), the examined/returned math, plain-
+English verdicts (full collection scan, blocking in-memory sort, weakly
+selective index, covered query), and — when the plan needs help — the same
+evidence-backed candidate index the advisor would produce. Works with find and
+aggregate explains, classic and SBE (6.0+) plans, and sharded winning plans.
+
 ### Design principles
 
 * **Deterministic.** Same log in, same advice out. Rules, not AI. Every
@@ -117,13 +133,31 @@ original mtools still works.
 
 ## Roadmap
 
-* **v0.2** — FTDC (`diagnostic.data`) decoding: offline metrics summaries and
-  export of the telemetry MongoDB already collects on every node.
-* Query shape drill-down (`mdbkit queries --shape <n>` with per-shape detail).
-* HTML report export for sharing with your team.
+Terminal output is and will remain first-class — this tool is built for the
+Linux box the database actually runs on.
 
-Contributions and issue reports are very welcome, especially real-world log
-samples (redacted!) that parse incorrectly.
+* **v0.2** — FTDC (`diagnostic.data`) decoding: offline summaries of the
+  metrics MongoDB already records on every node; election/failover timeline
+  from REPL events; per-shape drill-down.
+* **v0.3** — shareable Markdown/HTML report export (for tickets and
+  post-incident reviews — a convenience layer, never a replacement for the
+  terminal).
+
+mdbkit is validated against real-world structured logs (tens of thousands of
+lines) in addition to its synthetic test fixtures.
+
+## Bugs, feature requests, questions
+
+Please use [GitHub Issues](../../issues) — it keeps problems and fixes public
+so the next person can find them. Real-world log lines that parse wrongly are
+the most valuable bug reports of all (redact literals first!).
+
+## Security
+
+mdbkit is offline by design: the codebase contains no network code, never
+executes or evaluates input, and treats every log line as untrusted data
+(strict JSON parsing only — shell constructors are never evaluated). See
+[SECURITY.md](SECURITY.md) for the reporting process.
 
 ## Non-affiliation
 

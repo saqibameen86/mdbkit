@@ -96,16 +96,18 @@ def _walk_filter(node, prefix: str, out: Dict[str, set], flags: set, depth: int 
 def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
     """Build a QueryShape from a 'Slow query' log entry, or None if not applicable."""
     attr = entry.attr
-    ns = attr.get("ns", "")
-    if not ns or ns.endswith(".$cmd"):
-        ns = attr.get("command", {}).get("$db", "") + "." + str(
-            attr.get("command", {}).get("find")
-            or attr.get("command", {}).get("aggregate")
-            or ""
-        ) if isinstance(attr.get("command"), dict) else ns
-
     command = attr.get("command") if isinstance(attr.get("command"), dict) else {}
     op_type = attr.get("type", "")
+
+    ns = attr.get("ns", "")
+    if (not ns or ns.endswith(".$cmd") or ns.endswith(".")) and command:
+        coll = (command.get("find") or command.get("aggregate")
+                or command.get("update") or command.get("delete")
+                or command.get("insert") or command.get("findAndModify")
+                or command.get("count") or command.get("distinct") or "")
+        db = command.get("$db", "")
+        if db and coll:
+            ns = f"{db}.{coll}"
 
     filter_doc: dict = {}
     sort_doc: dict = {}
@@ -146,6 +148,16 @@ def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
                 return QueryShape(shape.ns, "getMore(" + shape.operation + ")",
                                   shape.filter_fields, shape.sort_fields, shape.flags)
         operation = "getMore"
+    elif "update" in command and isinstance(command.get("updates"), list):
+        operation = "update"
+        first = command["updates"][0] if command["updates"] else {}
+        if isinstance(first, dict):
+            filter_doc = first.get("q") or {}
+    elif "delete" in command and isinstance(command.get("deletes"), list):
+        operation = "delete"
+        first = command["deletes"][0] if command["deletes"] else {}
+        if isinstance(first, dict):
+            filter_doc = first.get("q") or {}
     elif op_type in ("update", "remove"):
         operation = op_type
         filter_doc = command.get("q") or {}
@@ -194,7 +206,12 @@ class ShapeStats:
         self.durations.append(int(attr.get("durationMillis", 0) or 0))
         self.docs_examined += int(attr.get("docsExamined", 0) or 0)
         self.keys_examined += int(attr.get("keysExamined", 0) or 0)
-        self.n_returned += int(attr.get("nreturned", attr.get("nMatched", 0)) or 0)
+        n = attr.get("nreturned")
+        if n is None:
+            n = attr.get("nMatched")
+        if n is None:
+            n = attr.get("ndeleted", attr.get("nDeleted"))
+        self.n_returned += int(n or 0)
         plan = attr.get("planSummary", "")
         if plan:
             self.plan_summaries[plan] += 1
@@ -258,6 +275,15 @@ class QueryAggregator:
         self.min_ms = min_ms
         self.shapes: Dict[QueryShape, ShapeStats] = {}
 
+    NOISE_OPS = frozenset({
+        "hello", "isMaster", "ismaster", "ping", "endSessions", "saslStart",
+        "saslContinue", "buildInfo", "getParameter", "serverStatus", "getLog",
+        "replSetGetStatus", "connPoolStats", "getCmdLineOpts", "whatsmyuri",
+        "logout", "killCursors", "listCollections", "listIndexes",
+        "listDatabases", "getFreeMonitoringStatus", "dbStats", "collStats",
+        "top", "currentOp", "profile", "hostInfo", "createIndexes",
+    })
+
     def consume(self, entry: LogEntry):
         if not entry.is_slow_query:
             return
@@ -265,6 +291,13 @@ class QueryAggregator:
             return
         shape = extract_shape(entry)
         if shape is None or shape.operation == "insert":
+            return
+        if shape.operation in self.NOISE_OPS and not shape.filter_fields:
+            return
+        # Batched update/delete at COMMAND level often omits the per-op q;
+        # the paired WRITE entry carries the real shape and metrics.
+        if (shape.operation in ("update", "delete") and not shape.filter_fields
+                and entry.component == "COMMAND"):
             return
         stats = self.shapes.get(shape)
         if stats is None:

@@ -114,6 +114,23 @@ def cmd_advise(args) -> int:
     return 0
 
 
+def cmd_explain(args) -> int:
+    from .explain import analyze_explain, load_explain, render_explain
+    try:
+        doc = load_explain(args.explainfile)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    indexes = load_indexes(args.indexes) if args.indexes else None
+    schema = load_schema(args.schema) if args.schema else None
+    report = analyze_explain(doc, indexes=indexes, schema=schema)
+    if args.json:
+        print(dump_json(report.to_dict()))
+    else:
+        print(render_explain(report))
+    return 0
+
+
 def cmd_export_script(args) -> int:
     print(SCHEMA_SCRIPT if args.kind == "schema" else INDEXES_SCRIPT)
     return 0
@@ -173,6 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-count", type=int, default=1,
                     help="only advise on shapes seen at least N times")
     sp.set_defaults(func=cmd_advise)
+
+    sp = sub.add_parser("explain",
+                        help="analyze a saved explain('executionStats') JSON file")
+    sp.add_argument("explainfile",
+                    help="explain output saved as JSON (mongosh EJSON.stringify "
+                         "or Compass export)")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.add_argument("--indexes", help="indexes.json for overlap checks")
+    sp.add_argument("--schema", help="schema.json for field caveats")
+    sp.set_defaults(func=cmd_explain)
 
     sp = sub.add_parser("export-script",
                         help="print a mongosh script to export schema or indexes")
