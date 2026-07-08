@@ -1,0 +1,16 @@
+{"t":{"$date":"2024-03-18T10:49:12.595-04:00"},"s":"I",  "c":"REPL",     "id":21358,   "ctx":"conn5","msg":"Replica set state transition","attr":{"newState":"STARTUP2","oldState":"STARTUP"}}
+{"t":{"$date":"2024-03-18T10:49:12.596-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-1","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27019","newState":"STARTUP"}}
+{"t":{"$date":"2024-03-18T10:49:12.616-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-0","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27018","newState":"STARTUP"}}
+{"t":{"$date":"2024-03-18T10:49:12.617-04:00"},"s":"I",  "c":"REPL",     "id":21358,   "ctx":"conn5","msg":"Replica set state transition","attr":{"newState":"RECOVERING","oldState":"STARTUP2"}}
+{"t":{"$date":"2024-03-18T10:49:13.161-04:00"},"s":"I",  "c":"REPL",     "id":21358,   "ctx":"OplogApplier-0","msg":"Replica set state transition","attr":{"newState":"SECONDARY","oldState":"RECOVERING"}}
+{"t":{"$date":"2024-03-18T10:49:13.598-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-0","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27019","newState":"STARTUP2"}}
+{"t":{"$date":"2024-03-18T10:49:13.620-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-0","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27018","newState":"STARTUP2"}}
+{"t":{"$date":"2024-03-18T10:49:16.607-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-0","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27019","newState":"SECONDARY"}}
+{"t":{"$date":"2024-03-18T10:49:16.628-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-0","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27018","newState":"SECONDARY"}}
+{"t":{"$date":"2024-03-18T10:49:24.668-04:00"},"s":"I",  "c":"ELECTION", "id":4615652, "ctx":"ReplCoord-0","msg":"Starting an election, since we've seen no PRIMARY in election timeout period","attr":{"electionTimeoutPeriodMillis":10000}}
+{"t":{"$date":"2024-03-18T10:49:24.716-04:00"},"s":"I",  "c":"ELECTION", "id":21450,   "ctx":"ReplCoord-0","msg":"Election succeeded, assuming primary role","attr":{"term":1}}
+{"t":{"$date":"2024-03-18T10:49:24.716-04:00"},"s":"I",  "c":"REPL",     "id":21358,   "ctx":"ReplCoord-0","msg":"Replica set state transition","attr":{"newState":"PRIMARY","oldState":"SECONDARY"}}
+{"t":{"$date":"2024-03-18T10:52:44.658-04:00"},"s":"I",  "c":"REPL",     "id":21358,   "ctx":"conn58","msg":"Replica set state transition","attr":{"newState":"SECONDARY","oldState":"PRIMARY"}}
+{"t":{"$date":"2024-03-18T10:52:44.728-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-1","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27018","newState":"PRIMARY"}}
+{"t":{"$date":"2024-03-18T10:55:27.662-04:00"},"s":"I",  "c":"REPL",     "id":4784900, "ctx":"SignalHandler","msg":"Stepping down the ReplicationCoordinator for shutdown","attr":{"waitTimeMillis":15000}}
+{"t":{"$date":"2024-03-18T10:55:28.040-04:00"},"s":"I",  "c":"REPL",     "id":21215,   "ctx":"ReplCoord-7","msg":"Member is in new state","attr":{"hostAndPort":"localhost:27018","newState":"SECONDARY"}}
