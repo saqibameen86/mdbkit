@@ -131,6 +131,22 @@ def cmd_explain(args) -> int:
     return 0
 
 
+def cmd_triage(args) -> int:
+    from .triage import render_triage, run_triage
+    findings, stats, cutoff = run_triage(
+        args.logfile, window_min=args.window, dbpath=args.dbpath,
+        no_sysprobe=args.no_sysprobe)
+    _warn_if_pre44(stats)
+    if args.json:
+        print(dump_json({
+            "window": {"from": cutoff or stats.first_ts, "to": stats.last_ts},
+            "findings": [f.to_dict() for f in findings],
+        }))
+    else:
+        print(render_triage(findings, stats, cutoff))
+    return 0
+
+
 def cmd_export_script(args) -> int:
     print(SCHEMA_SCRIPT if args.kind == "schema" else INDEXES_SCRIPT)
     return 0
@@ -200,6 +216,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--indexes", help="indexes.json for overlap checks")
     sp.add_argument("--schema", help="schema.json for field caveats")
     sp.set_defaults(func=cmd_explain)
+
+    sp = sub.add_parser("triage",
+                        help="one-command incident snapshot (beta): elections, "
+                             "storms, hot collections, errors + local disk/"
+                             "memory/load probes")
+    sp.add_argument("logfile", help="mongod log (.log or .gz), or '-'")
+    sp.add_argument("--window", type=int, metavar="MINUTES",
+                    help="analyze only the last N minutes of log time "
+                         "(default: whole file)")
+    sp.add_argument("--dbpath", help="override dbPath for the disk probe")
+    sp.add_argument("--no-sysprobe", action="store_true",
+                    help="skip local disk/memory/load probes")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_triage)
 
     sp = sub.add_parser("export-script",
                         help="print a mongosh script to export schema or indexes")

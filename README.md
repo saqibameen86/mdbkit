@@ -91,6 +91,19 @@ dropping). With `--schema`, it warns about multikey (array) fields,
 low-cardinality fields, and field-name typos. The schema export records field
 **names and types only — no values.**
 
+### Incident triage (beta)
+
+```bash
+mdbkit triage /var/log/mongodb/mongod.log        # or a copied log + --no-sysprobe
+```
+
+One command during an incident: election/stepdown timeline, connection
+storms, hot collections, error clusters, slow checkpoints — plus local
+disk/memory/load probes when run on the DB host. Read-only: it never
+connects to the database, and every finding ends with a next step for a
+human to review. Detectors marked beta are validated against real logs
+where available and clearly labeled where broader validation is pending.
+
 ### Explain-plan analysis
 
 Got a slow query in hand rather than a log? Save its explain output and ask
