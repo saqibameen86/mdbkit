@@ -14,20 +14,42 @@ mdbkit fills that gap: a single, dependency-free CLI that turns structured logs 
 
 ## Install
 
+**Recommended on any Linux/Mac/Windows:**
 ```bash
-pipx install mdbkit        # recommended
-# or
 pip install mdbkit
 ```
 
-Zero runtime dependencies (pure Python stdlib), so it also installs cleanly on air-gapped hosts from a single wheel:
-
+**Ubuntu 20.04 / Debian / Amazon Linux 2 (Python 3.8 hosts):**
 ```bash
-pip download mdbkit -d ./wheels     # on a connected machine
-pip install --no-index --find-links ./wheels mdbkit   # on the DB host
+# Step 1: install pipx (manages isolated Python tool environments)
+sudo apt install pipx        # Ubuntu/Debian
+# or: sudo dnf install pipx  # RHEL/Rocky/Amazon Linux
+
+# Step 2: install mdbkit
+pipx install mdbkit
+
+# Step 3: if pipx is not on your PATH yet
+pipx ensurepath && source ~/.bashrc
 ```
 
-Requires Python 3.9+.
+**If you get "externally-managed-environment" on modern Ubuntu (23.04+):**
+```bash
+pip install mdbkit --break-system-packages
+```
+
+**Air-gapped database hosts (no internet access):**
+```bash
+# On a connected machine, download the wheel file
+pip download mdbkit -d ./wheels
+
+# Copy the ./wheels folder to the database host, then run
+pip install --no-index --find-links ./wheels mdbkit
+```
+
+Requires Python 3.8+. Zero runtime dependencies — safe to install on production hosts.
+
+> mdbkit is a Python package distributed via PyPI. It is **not** available
+> via `apt install`, `dnf install`, or `yum install` — use `pip` or `pipx`.
 
 ## Quick start
 
@@ -50,46 +72,75 @@ mdbkit filter mongod.log --from 2026-07-01T08:00:00Z --to 2026-07-01T09:00:00Z |
 mdbkit queries mongod.log.2.gz
 ```
 
-### Index advice
+### Step 1 — Export your indexes and schema (recommended)
 
+mdbkit never connects to your database directly. Instead it prints small
+`mongosh` scripts you run yourself, so you can inspect exactly what they do
+before running them. The exports contain **field names and types only — no
+document values.**
+
+**Generate the export scripts:**
 ```bash
-mdbkit advise mongod.log
+mdbkit export-script indexes > export_indexes.js
+mdbkit export-script schema  > export_schema.js
 ```
 
-Produces **candidate** indexes from observed slow-query shapes using the ESR
-(Equality → Sort → Range) guideline, with evidence, confidence, caveats, and a
-validation step for every recommendation:
+**Run them against your database** (replace with your actual host, port, and credentials):
+```bash
+# Basic (local, no auth):
+mongosh --quiet "mongodb://localhost/yourdb" export_indexes.js > indexes.json
+mongosh --quiet "mongodb://localhost/yourdb" export_schema.js  > schema.json
 
+# With authentication (typical production setup):
+mongosh --quiet \
+  --host your-db-host \
+  --port 27017 \
+  --username your-username \
+  --password your-password \
+  --authenticationDatabase admin \
+  --eval "$(cat export_indexes.js)" > indexes.json
+
+mongosh --quiet \
+  --host your-db-host \
+  --port 27017 \
+  --username your-username \
+  --password your-password \
+  --authenticationDatabase admin \
+  --eval "$(cat export_schema.js)" > schema.json
+```
+
+> In these examples, replace `yourdb` with your actual database name (e.g. `shop`, `myapp`).
+> The `--authenticationDatabase` is usually `admin` unless you use per-db auth.
+
+### Step 2 — Run index advice
+
+```bash
+# Basic (without index/schema context — still useful, but lower confidence):
+mdbkit advise mongod.log
+
+# Full (with context — sharper recommendations):
+mdbkit advise mongod.log --indexes indexes.json --schema schema.json
+
+# Focus on one collection (recommended for large logs):
+mdbkit advise mongod.log --indexes indexes.json --schema schema.json --ns shop.orders
+```
+
+Sample output:
 ```
 [1] shop.orders  —  confidence: HIGH
     query shape : {createdAt:gt, status:eq} sort:{createdAt:-1}
     candidate   : { status: 1, createdAt: -1 }
     evidence    : COLLSCAN observed in planSummary
-    evidence    : in-memory sort (hasSortStage) observed
     evidence    : examined 251,400 docs to return 73 (3444:1)
     caveat      : Every index adds write and storage overhead ...
     validate    : Re-run the query with .explain('executionStats') ...
 ```
 
-The advice gets sharper if you export your existing indexes and a sampled
-schema. mdbkit never connects to your database — instead it prints small
-`mongosh` scripts you run yourself, so you can read exactly what they do:
-
-```bash
-mdbkit export-script indexes > export_indexes.js
-mdbkit export-script schema  > export_schema.js
-mongosh --quiet "mongodb://localhost/shop" export_indexes.js > indexes.json
-mongosh --quiet "mongodb://localhost/shop" export_schema.js  > schema.json
-
-mdbkit advise mongod.log --indexes indexes.json --schema schema.json
-```
-
-With `--indexes`, mdbkit checks each candidate against your existing indexes
-(flagging when an existing index should already cover the query, or when a
-candidate would make an existing index redundant — it flags, never suggests
-dropping). With `--schema`, it warns about multikey (array) fields,
-low-cardinality fields, and field-name typos. The schema export records field
-**names and types only — no values.**
+With `--indexes`, mdbkit checks candidates against your existing indexes —
+flagging when an existing index should already cover the query (it flags, never
+auto-drops). With `--schema`, it warns about array (multikey) fields,
+low-cardinality booleans, and field-name typos, and adjusts confidence
+accordingly.
 
 ### Incident triage (beta)
 

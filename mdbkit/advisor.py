@@ -238,8 +238,9 @@ def advise(
             if flag in ("$text", "$where", "$expr"):
                 caveats.append(f"Query uses {flag}, which this rule engine does not model.")
 
-        # Schema-aware caveats.
+        # Schema-aware caveats and confidence adjustment.
         ns_schema = schema.get(shape.ns) or {}
+        schema_lowered = False
         for f, _d in candidate:
             info = ns_schema.get(f)
             if info is None and ns_schema:
@@ -254,9 +255,16 @@ def advise(
                     )
                 if info.get("types") == ["bool"]:
                     caveats.append(
-                        f"'{f}' is boolean — very low cardinality; place it only "
-                        "alongside more selective fields."
+                        f"'{f}' is boolean — very low cardinality; an index on a "
+                        "boolean field is rarely selective (typically 50/50 true/false). "
+                        "Place it only alongside more selective fields, or reconsider."
                     )
+                    if not schema_lowered:
+                        if confidence == "high":
+                            confidence = "medium"
+                        elif confidence == "medium":
+                            confidence = "low"
+                        schema_lowered = True
 
         caveats.append(
             "Every index adds write and storage overhead and takes time to build; "
