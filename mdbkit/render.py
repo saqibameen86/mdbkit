@@ -145,14 +145,35 @@ def render_connections(report: ConnectionReport, stats: ParseStats) -> str:
     return "\n".join(parts)
 
 
-def render_recommendations(recs: List[Recommendation], stats: ParseStats) -> str:
+def render_recommendations(recs: List[Recommendation], stats: ParseStats,
+                           limit: int = 0) -> str:
     parts = ["== mdbkit advise (candidate indexes) ==", render_parse_stats(stats), ""]
     if not recs:
         parts.append("No index candidates: no slow query shapes showed COLLSCAN, "
                       "in-memory sorts, or high scan ratios. Good sign — or the "
                       "log window is too quiet to judge.")
         return "\n".join(parts)
-    for i, rec in enumerate(recs, 1):
+
+    total = len(recs)
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for r in recs:
+        counts[r.confidence] = counts.get(r.confidence, 0) + 1
+    by_ns = {}
+    for r in recs:
+        by_ns.setdefault(r.ns, 0)
+        by_ns[r.ns] += 1
+
+    shown = recs[:limit] if limit else recs
+    parts.append(
+        f"{total} candidate(s): {counts['high']} high, {counts['medium']} medium, "
+        f"{counts['low']} low  |  across {len(by_ns)} namespace(s)"
+    )
+    if len(shown) < total:
+        parts.append(f"showing top {len(shown)} by confidence "
+                     f"(--limit 0 for all, --ns <namespace> to focus)")
+    parts.append("")
+
+    for i, rec in enumerate(shown, 1):
         parts.append(f"[{i}] {rec.ns}  —  confidence: {rec.confidence.upper()}")
         parts.append(f"    query shape : {rec.shape}")
         parts.append(f"    candidate   : {rec.candidate_str()}")

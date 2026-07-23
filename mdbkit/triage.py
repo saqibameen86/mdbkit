@@ -1,18 +1,22 @@
 """`mdbkit triage` — one-command incident snapshot (beta).
 
-At 3 a.m., on a box with nothing installed but mdbkit, one command answers:
-what is unhealthy, what changed, and where to look next.
+Answers the question a DBA has at 3 a.m.: *what happened in the last hour?*
+
+Defaults to the last 60 minutes of log time, because triage is for incidents
+happening now or just finished. Use --window N to widen, --window 0 for the
+whole file.
 
 Read-only, offline, single pass over the log plus optional local OS probes
-(statvfs/proc — nothing leaves the machine). Never connects to a database,
-never mutates anything; findings include next steps for a HUMAN to run.
+(/proc and statvfs — nothing leaves the machine, no shell-outs). Never
+connects to a database, never mutates anything; findings carry next steps
+for a HUMAN to run.
 
 Detector validation status:
-  stable : restarts, fatal errors, connection storms, hot collections
+  stable : restarts, fatal errors, connection storms, hot collections,
+           slow-query bursts, COLLSCAN volume, index builds
   beta   : elections/stepdowns, slow checkpoints, eviction pressure,
            flow control — pattern-matched from documented log messages,
-           pending validation against real-cluster fixtures
-           (see docs/TESTING-PLAYBOOK.md).
+           pending broader validation (see docs/TESTING-PLAYBOOK.md).
 """
 
 from __future__ import annotations
@@ -22,12 +26,16 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .analysis import QueryAggregator
 from .parser import ID_CONN_ACCEPTED, ID_STARTUP, LogEntry, ParseStats, iter_entries
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
+DEFAULT_WINDOW_MIN = 60
+
+COMMON_DBPATHS = ("/var/lib/mongodb", "/var/lib/mongo", "/data/db",
+                  "/opt/mongodb/data", "/mongodb/data")
 
 
 @dataclass
@@ -54,6 +62,14 @@ def _fmt_min(m: int) -> str:
     return datetime.fromtimestamp(m * 60, tz=timezone.utc).strftime("%H:%M")
 
 
+def _ms(v: float) -> str:
+    if v >= 60_000:
+        return "%.1fm" % (v / 60_000)
+    if v >= 1_000:
+        return "%.1fs" % (v / 1_000)
+    return "%dms" % int(v)
+
+
 class TriageEngine:
     """Single-pass log consumer feeding all detectors."""
 
@@ -61,20 +77,26 @@ class TriageEngine:
                       "stepping down", "stepped down")
     ELECTION_STATE = ("member is in new state", "replica set state transition",
                       "transition to")
+    INDEX_BUILD = ("index build", "build index", "index builds")
 
     def __init__(self):
         self.qagg = QueryAggregator()
         self.startups: List = []
         self.errors: Counter = Counter()
-        self.error_examples = {}
+        self.error_examples: Dict = {}
         self.conn_minutes: Counter = Counter()
         self.conn_ips: defaultdict = defaultdict(Counter)
-        self.elections: List = []      # (ts, kind, msg)
-        self.state_changes: List = []  # (ts, msg, newState)
-        self.checkpoints: List = []    # (ts, duration_ms or None)
+        self.elections: List = []
+        self.state_changes: List = []
+        self.checkpoints: List = []
         self.evictions = 0
         self.flow_control = 0
         self.dbpath: Optional[str] = None
+        self.slow_minutes: Counter = Counter()
+        self.collscan_count = 0
+        self.collscan_minutes: Counter = Counter()
+        self.slow_total = 0
+        self.index_builds: List = []
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
@@ -89,27 +111,45 @@ class TriageEngine:
             key = (entry.component, entry.msg)
             self.errors[key] += 1
             self.error_examples.setdefault(key, entry.ts)
+
         if entry.msg_id == ID_CONN_ACCEPTED and entry.ts is not None:
             m = _minute(entry.ts)
             self.conn_minutes[m] += 1
             remote = str(entry.attr.get("remote", "")).rsplit(":", 1)[0]
             self.conn_ips[m][remote] += 1
+
+        if entry.is_slow_query:
+            self.slow_total += 1
+            if entry.ts is not None:
+                self.slow_minutes[_minute(entry.ts)] += 1
+            if "COLLSCAN" in str(entry.attr.get("planSummary", "")):
+                self.collscan_count += 1
+                if entry.ts is not None:
+                    self.collscan_minutes[_minute(entry.ts)] += 1
+
         if entry.component in ("REPL", "ELECTION"):
             if any(p in msg_l for p in self.ELECTION_EVENT) and \
                     "not starting" not in msg_l:
                 self.elections.append((entry.ts, entry.msg))
             elif any(p in msg_l for p in self.ELECTION_STATE):
-                new_state = str(entry.attr.get("newState",
-                                entry.attr.get("memberState", "")))
-                self.state_changes.append((entry.ts, entry.msg, new_state))
+                self.state_changes.append(
+                    (entry.ts, entry.msg,
+                     str(entry.attr.get("newState",
+                                        entry.attr.get("memberState", "")))))
             if "flow control" in msg_l or "flow control" in wt_msg.lower():
                 self.flow_control += 1
+
+        if entry.component == "INDEX" and any(p in msg_l for p in self.INDEX_BUILD):
+            ns = entry.attr.get("namespace") or entry.attr.get("ns") or ""
+            self.index_builds.append((entry.ts, entry.msg, str(ns)))
+
         if "checkpoint" in msg_l or "checkpoint" in wt_msg.lower():
             dur = entry.attr.get("durationMillis")
             if dur is None:
                 m = re.search(r"took (\d+) second", wt_msg.lower())
                 dur = int(m.group(1)) * 1000 if m else None
             self.checkpoints.append((entry.ts, dur))
+
         if "eviction" in msg_l or "eviction" in wt_msg.lower():
             self.evictions += 1
 
@@ -117,84 +157,86 @@ class TriageEngine:
     def findings(self) -> List[Finding]:
         out: List[Finding] = []
 
-        # Elections / stepdowns (beta).
         if self.elections:
             times = [t.strftime("%H:%M:%S") if t else "?" for t, _ in self.elections]
             out.append(Finding(
                 "CRIT", "Replica set instability",
-                f"{len(self.elections)} election/stepdown event(s) in window "
-                f"at {', '.join(times[:6])}.",
+                "%d election/stepdown event(s) at %s." % (
+                    len(self.elections), ", ".join(times[:6])),
                 [m for _, m in self.elections[:6]],
-                "Check node health/network at those timestamps; correlate "
-                "with connection storms and slow checkpoints below. Timeline "
-                "of state changes: see --json output.", beta=True))
+                "Correlate with connection storms and slow checkpoints below; "
+                "check node health and network at those timestamps.",
+                beta=True))
         else:
             out.append(Finding("OK", "Replica set",
-                               "No election or stepdown messages found.",
+                               "No election or stepdown messages in window.",
                                beta=True))
 
-        # Restarts.
         if self.startups:
             ts = [t.strftime("%H:%M:%S") if t else "?" for t in self.startups]
             out.append(Finding(
-                "WARN", "Process start(s) in window",
-                f"mongod startup marker seen {len(self.startups)}x "
-                f"(at {', '.join(ts[:5])}). Unplanned restarts are incidents.",
-                next_step="If unexpected, check system OOM killer "
-                          "(journalctl / dmesg) and FatalError findings."))
+                "CRIT" if len(self.startups) > 1 else "WARN",
+                "Process start(s) in window",
+                "mongod startup marker seen %dx (at %s). Unplanned restarts "
+                "are incidents." % (len(self.startups), ", ".join(ts[:5])),
+                next_step="If unexpected: check the OOM killer (dmesg -T | "
+                          "grep -i oom) and the Errors finding below."))
 
-        # Fatal / error lines.
         if self.errors:
             total = sum(self.errors.values())
-            top = self.errors.most_common(5)
             out.append(Finding(
                 "WARN", "Error-severity log lines",
-                f"{total} E/F line(s) in window.",
-                [f"{n}x [{c}] {m}" for (c, m), n in top],
-                "Read the raw lines: mdbkit filter <log> --severity E"))
+                "%d E/F line(s) in window." % total,
+                ["%dx [%s] %s" % (n, c, m)
+                 for (c, m), n in self.errors.most_common(5)],
+                "Read them: mdbkit filter <log> --severity E --last 20"))
         else:
             out.append(Finding("OK", "Errors",
                                "No error/fatal severity lines in window."))
 
-        # Connection storm.
-        storm = self._storm_finding()
-        out.append(storm)
+        out.append(self._storm_finding())
+        out.extend(self._slow_query_findings())
 
-        # Hot collection.
-        out.append(self._hot_collection_finding())
+        if self.index_builds:
+            times = [t.strftime("%H:%M:%S") if t else "?"
+                     for t, _, _ in self.index_builds]
+            namespaces = sorted({ns for _, _, ns in self.index_builds if ns})
+            out.append(Finding(
+                "WARN", "Index build activity",
+                "%d index-build message(s) at %s%s. Index builds consume CPU, "
+                "memory and I/O and can slow the whole node." % (
+                    len(self.index_builds), ", ".join(times[:4]),
+                    " on " + ", ".join(namespaces[:3]) if namespaces else ""),
+                [m for _, m, _ in self.index_builds[:4]],
+                "If unexpected during an incident, find who started it: "
+                "db.currentOp({'command.createIndexes': {$exists: true}})"))
 
-        # Checkpoints (beta).
         slow_cp = [(t, d) for t, d in self.checkpoints if d and d >= 60_000]
         if slow_cp:
             worst = max(d for _, d in slow_cp)
             out.append(Finding(
                 "WARN", "Slow WiredTiger checkpoints",
-                f"{len(slow_cp)} checkpoint(s) over 60s (worst "
-                f"{worst/1000:.1f}s). Often disk I/O saturation or huge "
-                "dirty cache.",
-                next_step="Check disk latency/utilization at those times "
-                          "(FTDC will cover this in v0.2).", beta=True))
-        elif self.checkpoints:
-            out.append(Finding("INFO", "WiredTiger checkpoints",
-                               f"{len(self.checkpoints)} checkpoint "
-                               "message(s), none flagged slow (>60s).",
-                               beta=True))
+                "%d checkpoint(s) over 60s (worst %.1fs). Usually disk I/O "
+                "saturation or a large dirty cache." % (
+                    len(slow_cp), worst / 1000.0),
+                next_step="Check disk latency/utilisation at those times.",
+                beta=True))
 
-        # Eviction / flow control (beta).
         if self.evictions:
             out.append(Finding(
-                "WARN", "Cache eviction pressure indicators",
-                f"{self.evictions} eviction-related message(s) — application "
-                "threads may be doing eviction work (cache too small or "
-                "workload spike).",
-                next_step="Check WT cache usage vs configured max "
-                          "(db.serverStatus().wiredTiger.cache).", beta=True))
+                "WARN", "Cache eviction pressure",
+                "%d eviction-related message(s) — application threads may be "
+                "doing eviction work (cache too small or workload spike)." %
+                self.evictions,
+                next_step="Compare WT cache used vs configured: "
+                          "db.serverStatus().wiredTiger.cache", beta=True))
+
         if self.flow_control:
             out.append(Finding(
                 "WARN", "Flow control engaged",
-                f"{self.flow_control} flow-control message(s): the primary "
-                "throttled writes because majority-commit point lagged.",
-                next_step="Check secondary health/lag and network.",
+                "%d flow-control message(s): the primary throttled writes "
+                "because the majority-commit point lagged." % self.flow_control,
+                next_step="Check secondary health and replication lag.",
                 beta=True))
         return out
 
@@ -203,107 +245,261 @@ class TriageEngine:
             return Finding("INFO", "Connections",
                            "No connection-accepted events in window.")
         counts = sorted(self.conn_minutes.values())
-        baseline = counts[:-1] or counts  # the busiest minute can't be its own baseline
-        median = baseline[(len(baseline) - 1) // 2]
+        if len(counts) >= 2:
+            # The busiest minute must not be its own baseline.
+            baseline = counts[:-1]
+            median = baseline[(len(baseline) - 1) // 2]
+        else:
+            median = 0  # too little history — rely on the absolute floor
         threshold = max(60, 10 * max(1, median))
         storms = {m: n for m, n in self.conn_minutes.items() if n >= threshold}
+        peak_min = max(self.conn_minutes, key=self.conn_minutes.get)
+        peak_n = self.conn_minutes[peak_min]
         if not storms:
-            return Finding("OK", "Connections",
-                           f"No connection storms (peak "
-                           f"{max(counts)}/min, median {median}/min).")
-        worst_min = max(storms, key=storms.get)
-        top_ips = self.conn_ips[worst_min].most_common(3)
+            return Finding(
+                "OK", "Connections",
+                "No connection storms. Peak %d/min at %s UTC (median %d/min)."
+                % (peak_n, _fmt_min(peak_min), median))
+        top_ips = self.conn_ips[peak_min].most_common(3)
         return Finding(
             "WARN", "Connection storm",
-            f"{len(storms)} minute(s) at >= {threshold} new connections/min "
-            f"(baseline median {median}/min); worst {storms[worst_min]} at "
-            f"{_fmt_min(worst_min)} UTC.",
-            [f"{ip or 'unknown'}: {n} in worst minute" for ip, n in top_ips],
-            "Identify the client (appName via `mdbkit connections`); check "
-            "for pool misconfiguration or crash-loop reconnects.")
+            "%d minute(s) at >= %d new connections/min (baseline median "
+            "%d/min); peak %d at %s UTC." % (
+                len(storms), threshold, median, peak_n, _fmt_min(peak_min)),
+            ["%s: %d in the peak minute" % (ip or "unknown", n)
+             for ip, n in top_ips],
+            "Identify the client: mdbkit connections <log> — look for pool "
+            "misconfiguration or crash-loop reconnects.")
 
-    def _hot_collection_finding(self) -> Finding:
+    def _slow_query_findings(self) -> List[Finding]:
+        out: List[Finding] = []
         shapes = self.qagg.results()
         if not shapes:
-            return Finding("INFO", "Slow queries",
-                           "No slow queries logged in window (slowms "
-                           "default is 100 ms).")
+            out.append(Finding("OK", "Slow queries",
+                               "None logged in window (slowms default 100 ms)."))
+            return out
+
+        if self.slow_minutes:
+            peak_min = max(self.slow_minutes, key=self.slow_minutes.get)
+            peak_n = self.slow_minutes[peak_min]
+            counts = sorted(self.slow_minutes.values())
+            median = counts[len(counts) // 2] or 1
+            sev = "WARN" if peak_n >= max(20, 5 * median) else "INFO"
+            out.append(Finding(
+                sev, "Slow query volume",
+                "%d slow operations in window; peak %d in the minute at %s UTC "
+                "(median %d/min)." % (self.slow_total, peak_n,
+                                      _fmt_min(peak_min), median),
+                next_step="Zoom in on the peak: mdbkit filter <log> --slow 100 "
+                          "--last 20"))
+
+        if self.collscan_count:
+            pct = 100.0 * self.collscan_count / max(1, self.slow_total)
+            sev = "WARN" if pct >= 25 else "INFO"
+            peak = ""
+            if self.collscan_minutes:
+                pm = max(self.collscan_minutes, key=self.collscan_minutes.get)
+                peak = " Peak %d at %s UTC." % (self.collscan_minutes[pm],
+                                                _fmt_min(pm))
+            out.append(Finding(
+                sev, "Collection scans",
+                "%d of %d slow operations used COLLSCAN (%.0f%%).%s" % (
+                    self.collscan_count, self.slow_total, pct, peak),
+                next_step="mdbkit advise <log> --limit 5"))
+
         by_ns: Counter = Counter()
         for s in shapes:
             by_ns[s.shape.ns] += s.total_ms
         total = sum(by_ns.values()) or 1
         ns, ms = by_ns.most_common(1)[0]
         share = 100.0 * ms / total
-        ns_shapes = [s for s in shapes if s.shape.ns == ns]
-        worst = max(ns_shapes, key=lambda s: s.total_ms)
         sev = "WARN" if share >= 50 and len(shapes) >= 3 else "INFO"
-        return Finding(
+        out.append(Finding(
             sev, "Hot collection",
-            f"{ns} accounts for {share:.0f}% of slow-query time "
-            f"({ms/1000:.1f}s across {len(ns_shapes)} shape(s)).",
-            [f"worst shape: {worst.shape.pretty()} "
-             f"({worst.count}x, {worst.total_ms/1000:.1f}s total)"],
-            f"mdbkit advise <log>  # candidates for {ns}")
+            "%s accounts for %.0f%% of slow-query time (%.1fs)." % (
+                ns, share, ms / 1000.0),
+            ["%s | %s | %dx | %s cumulative | %s" % (
+                s.shape.ns, s.shape.operation, s.count, _ms(s.total_ms),
+                s.shape.pretty()[:60])
+             for s in shapes[:3]],
+            "mdbkit advise <log> --ns %s" % ns))
+        return out
 
 
 # ------------------------------------------------------------- sysprobe ----
 
-def sysprobe(dbpath: Optional[str]) -> List[Finding]:
-    """Local OS probes. Stdlib only, no shell-outs, everything try/except."""
-    out: List[Finding] = []
+def _read(path: str, limit: int = 65536) -> str:
+    try:
+        with open(path, "r", errors="replace") as fh:
+            return fh.read(limit)
+    except OSError:
+        return ""
 
-    if dbpath and os.path.isdir(dbpath):
-        try:
-            st = os.statvfs(dbpath)
-            free = st.f_bavail * st.f_frsize
-            totalb = st.f_blocks * st.f_frsize or 1
-            used_pct = 100.0 * (1 - st.f_bavail / (st.f_blocks or 1))
-            sev = "CRIT" if used_pct >= 95 else "WARN" if used_pct >= 85 else "OK"
-            out.append(Finding(
-                sev, "Disk (dbPath volume)",
-                f"{dbpath}: {used_pct:.0f}% used, "
-                f"{free / 2**30:.1f} GiB free of {totalb / 2**30:.1f} GiB.",
-                next_step="" if sev == "OK" else
-                "Free space or extend the volume; a full dbPath volume "
-                "stops writes and can corrupt shutdown."))
-        except OSError as exc:
-            out.append(Finding("INFO", "Disk probe unavailable", str(exc)))
+
+def find_mongod() -> Optional[Tuple[int, List[str]]]:
+    """Locate a running mongod by reading /proc — no shell-outs."""
+    if not os.path.isdir("/proc"):
+        return None
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        cmdline = _read("/proc/%s/cmdline" % pid, 8192)
+        if not cmdline:
+            continue
+        argv = [a for a in cmdline.split("\0") if a]
+        if argv and os.path.basename(argv[0]) == "mongod":
+            try:
+                return int(pid), argv
+            except ValueError:
+                continue
+    return None
+
+
+def dbpath_from_config(path: str) -> Optional[str]:
+    """Parse dbPath out of a mongod.conf (YAML or legacy ini). No deps."""
+    text = _read(path)
+    if not text:
+        return None
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        m = re.match(r"^dbPath\s*:\s*(\S+)", stripped, re.IGNORECASE)
+        if m:
+            return m.group(1).strip("\"'")
+        m = re.match(r"^dbpath\s*=\s*(\S+)", stripped, re.IGNORECASE)
+        if m:
+            return m.group(1).strip("\"'")
+    return None
+
+
+def dbpath_from_argv(argv: List[str]) -> Optional[str]:
+    """Extract dbPath from a mongod command line, or from its config file."""
+    for i, arg in enumerate(argv):
+        if arg in ("--dbpath", "--dbPath") and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--dbpath=") or arg.startswith("--dbPath="):
+            return arg.split("=", 1)[1]
+    for i, arg in enumerate(argv):
+        conf = None
+        if arg in ("-f", "--config") and i + 1 < len(argv):
+            conf = argv[i + 1]
+        elif arg.startswith("--config="):
+            conf = arg.split("=", 1)[1]
+        if conf:
+            return dbpath_from_config(conf)
+    return None
+
+
+def discover_dbpath(from_log: Optional[str]) -> Tuple[Optional[str], str]:
+    """Resolve dbPath through a fallback chain. Returns (path, how)."""
+    if from_log and os.path.isdir(from_log):
+        return from_log, "startup line in log"
+    found = find_mongod()
+    if found:
+        _pid, argv = found
+        candidate = dbpath_from_argv(argv)
+        if candidate and os.path.isdir(candidate):
+            return candidate, "running mongod process"
+    for conf in ("/etc/mongod.conf", "/etc/mongodb.conf",
+                 "/usr/local/etc/mongod.conf"):
+        candidate = dbpath_from_config(conf)
+        if candidate and os.path.isdir(candidate):
+            return candidate, conf
+    for candidate in COMMON_DBPATHS:
+        if os.path.isdir(candidate):
+            return candidate, "common default location"
+    return (from_log, "log (not present on this host)") if from_log else (None, "")
+
+
+def sysprobe(dbpath_from_log: Optional[str],
+             explicit: Optional[str] = None) -> List[Finding]:
+    """Local OS probes. Stdlib only, no shell-outs, all failures soft."""
+    out: List[Finding] = []
+    if explicit:
+        dbpath, how = explicit, "--dbpath"
     else:
+        dbpath, how = discover_dbpath(dbpath_from_log)
+
+    found = find_mongod()
+    if found:
+        pid, _argv = found
+        rss_kb = 0
+        for line in _read("/proc/%d/status" % pid).splitlines():
+            if line.startswith("VmRSS:"):
+                try:
+                    rss_kb = int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+                break
+        uptime_note = ""
+        try:
+            boot = float(_read("/proc/uptime").split()[0])
+            starttime = float(_read("/proc/%d/stat" % pid).split()[21])
+            hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+            age_s = boot - (starttime / hz)
+            if age_s > 0:
+                uptime_note = ", up %.1f h" % (age_s / 3600.0)
+        except (IndexError, ValueError, ZeroDivisionError, OSError):
+            pass
+        out.append(Finding(
+            "INFO", "mongod process",
+            "pid %d, RSS %.1f GiB%s." % (pid, rss_kb / 1048576.0, uptime_note)))
+
+    if not dbpath or not os.path.isdir(dbpath):
         out.append(Finding(
             "INFO", "System probes skipped",
-            "dbPath from the log was not found on this machine — the log "
-            "appears to be from another host. Run triage on the DB host "
-            "for disk/memory/load checks, or pass --dbpath."))
+            "Could not locate a dbPath on this machine (checked the log's "
+            "startup line, any running mongod, /etc/mongod.conf and common "
+            "defaults). Pass --dbpath /your/data/dir to enable the disk check."))
         return out
+
+    try:
+        st = os.statvfs(dbpath)
+        free = st.f_bavail * st.f_frsize
+        totalb = st.f_blocks * st.f_frsize or 1
+        used_pct = 100.0 * (1 - st.f_bavail / float(st.f_blocks or 1))
+        sev = "CRIT" if used_pct >= 95 else "WARN" if used_pct >= 85 else "OK"
+        out.append(Finding(
+            sev, "Disk (dbPath volume)",
+            "%s [%s]: %.0f%% used, %.1f GiB free of %.1f GiB." % (
+                dbpath, how, used_pct, free / 2.0 ** 30, totalb / 2.0 ** 30),
+            next_step="" if sev == "OK" else
+            "Free space or extend the volume — a full dbPath stops writes."))
+    except OSError as exc:
+        out.append(Finding("INFO", "Disk probe unavailable", str(exc)))
 
     try:
         info = {}
         with open("/proc/meminfo") as fh:
             for line in fh:
                 k, _, rest = line.partition(":")
-                info[k] = int(rest.strip().split()[0])  # kB
+                info[k] = int(rest.strip().split()[0])
         avail, total = info.get("MemAvailable", 0), info.get("MemTotal", 1)
         pct = 100.0 * avail / total
         sev = "WARN" if pct < 10 else "OK"
         out.append(Finding(sev, "Memory",
-                           f"{pct:.0f}% available "
-                           f"({avail / 2**20:.1f} GiB of {total / 2**20:.1f} GiB).",
+                           "%.0f%% available (%.1f GiB of %.1f GiB)." % (
+                               pct, avail / 1048576.0, total / 1048576.0),
                            next_step="" if sev == "OK" else
-                           "Check for OOM risk: page cache squeeze, other "
-                           "processes, or WT cache oversized."))
+                           "Check WT cache sizing and other processes; watch "
+                           "for the OOM killer."))
     except (OSError, ValueError, KeyError):
         out.append(Finding("INFO", "Memory probe unavailable",
                            "/proc/meminfo not readable (non-Linux?)."))
 
     try:
-        load1, _, _ = os.getloadavg()
+        load1, load5, _ = os.getloadavg()
         cores = os.cpu_count() or 1
         sev = "WARN" if load1 > 2 * cores else "OK"
         out.append(Finding(sev, "CPU load",
-                           f"load1={load1:.1f} on {cores} core(s).",
+                           "load1=%.1f load5=%.1f on %d core(s)." % (
+                               load1, load5, cores),
                            next_step="" if sev == "OK" else
-                           "Identify hot queries: mdbkit queries <log> "
-                           "--sort totalMs"))
+                           "Find the cost: mdbkit queries <log> --sort totalMs "
+                           "--limit 10"))
     except OSError:
         out.append(Finding("INFO", "Load probe unavailable", ""))
     return out
@@ -313,6 +509,13 @@ def sysprobe(dbpath: Optional[str]) -> List[Finding]:
 
 def run_triage(logfile: str, window_min: Optional[int] = None,
                dbpath: Optional[str] = None, no_sysprobe: bool = False):
+    """Analyze the last `window_min` minutes of log time (default 60).
+
+    window_min=0 analyzes the whole file.
+    """
+    if window_min is None:
+        window_min = DEFAULT_WINDOW_MIN
+
     cutoff = None
     if window_min and logfile != "-":
         pre = ParseStats()
@@ -330,31 +533,34 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
 
     findings = engine.findings()
     if not no_sysprobe:
-        findings += sysprobe(dbpath or engine.dbpath)
+        findings += sysprobe(engine.dbpath, explicit=dbpath)
     findings.sort(key=lambda f: SEV_ORDER.get(f.severity, 9))
     return findings, stats, cutoff
 
 
 def render_triage(findings: List[Finding], stats: ParseStats, cutoff) -> str:
     parts = ["== mdbkit triage (beta) =="]
-    span = ""
     if stats.first_ts and stats.last_ts:
         start = cutoff or stats.first_ts
-        span = f"window: {start.strftime('%H:%M')} -> " \
-               f"{stats.last_ts.strftime('%H:%M')} ({stats.parsed:,} lines)"
-    parts.append(span)
-    parts.append("beta detectors (elections/checkpoints/eviction/flow-control) "
-                 "are pattern-matched pending real-cluster validation — "
-                 "see docs/TESTING-PLAYBOOK.md")
+        parts.append("window: %s -> %s   (%s lines scanned)" % (
+            start.strftime("%Y-%m-%d %H:%M"),
+            stats.last_ts.strftime("%H:%M"), format(stats.parsed, ",")))
+    counts = Counter(f.severity for f in findings)
+    parts.append("findings: %d critical, %d warning, %d ok/info" % (
+        counts.get("CRIT", 0), counts.get("WARN", 0),
+        counts.get("OK", 0) + counts.get("INFO", 0)))
     parts.append("")
     for f in findings:
-        tag = f"[{f.severity}]"
-        parts.append(f"{tag:<6} {f.title}: {f.detail}")
+        parts.append("[%s] %s: %s" % (f.severity, f.title, f.detail))
         for e in f.evidence:
-            parts.append(f"        - {e}")
+            parts.append("        - %s" % e)
         if f.next_step:
-            parts.append(f"        next: {f.next_step}")
+            parts.append("        next: %s" % f.next_step)
     parts.append("")
+    parts.append("Window defaults to the last 60 minutes of log time "
+                 "(--window N, or --window 0 for the whole file).")
+    parts.append("beta detectors (elections/checkpoints/eviction/flow-control) "
+                 "are pattern-matched pending broader validation.")
     parts.append("mdbkit is read-only: it never runs commands against your "
                  "cluster. Review every next step before acting.")
     return "\n".join(parts)
