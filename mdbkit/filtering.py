@@ -41,15 +41,53 @@ class Filter:
         if self.slow_ms is not None:
             if int(entry.attr.get("durationMillis", -1) or -1) < self.slow_ms:
                 return False
-        if self.ts_from and (entry.ts is None or entry.ts < self.ts_from):
-            return False
-        if self.ts_to and (entry.ts is None or entry.ts > self.ts_to):
-            return False
+        if self.ts_from is not None:
+            if entry.ts is None or _lt(entry.ts, self.ts_from):
+                return False
+        if self.ts_to is not None:
+            if entry.ts is None or _lt(self.ts_to, entry.ts):
+                return False
         if self.msg_contains and self.msg_contains not in entry.msg.lower():
             return False
         return True
 
 
+def _lt(a: datetime, b: datetime) -> bool:
+    """Compare two datetimes safely when one may be naive.
+
+    Log timestamps carry an offset (e.g. +04:00); a user-supplied bound may
+    not. Comparing them directly raises TypeError, so a naive value is
+    interpreted in the other value's timezone (i.e. "local wall clock").
+    """
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=b.tzinfo)
+        else:
+            b = b.replace(tzinfo=a.tzinfo)
+    return a < b
+
+
 def parse_when(value: str) -> datetime:
-    """Parse a --from/--to value (ISO 8601, 'Z' allowed)."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    """Parse a --from/--to value.
+
+    Accepts, with or without a timezone offset:
+        2026-07-01T08:00:00+04:00   2026-07-01T08:00:00Z
+        2026-07-01T08:00:00         2026-07-01 08:00:00
+        2026-07-01T08:00            2026-07-01
+    A value without an offset is treated as wall-clock time in the log's own
+    timezone.
+    """
+    raw = value.strip().replace("Z", "+00:00").replace(" ", "T")
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    raise ValueError(
+        "Could not parse timestamp %r. Examples: 2026-07-01T08:00:00+04:00, "
+        "2026-07-01T08:00:00Z, 2026-07-01T08:00:00, 2026-07-01" % value)

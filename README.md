@@ -61,12 +61,23 @@ mdbkit loginfo /var/log/mongodb/mongod.log
 mdbkit queries mongod.log
 mdbkit queries mongod.log --sort scanRatio --limit 10 --json
 
+# Columns: cumMs = time summed across ALL occurrences of that shape (not one
+# query); docsEx = documents examined; scan = examined per doc returned;
+# plan = the plan MongoDB chose (COLLSCAN / IXSCAN{fields} / +SORT)
+
 # Connection churn by source IP, appName, and driver
 mdbkit connections mongod.log
 
 # Filter raw log lines (output stays valid logv2 JSON — chainable)
 mdbkit filter mongod.log --slow 500 --component COMMAND --ns shop.orders
-mdbkit filter mongod.log --from 2026-07-01T08:00:00Z --to 2026-07-01T09:00:00Z | mdbkit queries -
+mdbkit filter mongod.log --severity E --last 20      # 20 most recent errors
+mdbkit filter mongod.log --slow 200 --limit 50       # first 50 matches only
+
+# Time ranges — with or without a timezone offset
+mdbkit filter mongod.log --from 2026-07-01T08:00:00+04:00 --to 2026-07-01T09:00:00+04:00
+mdbkit filter mongod.log --from 2026-07-01T08:00:00Z     # UTC
+mdbkit filter mongod.log --from 2026-07-01T08:00:00      # log's own timezone
+mdbkit filter mongod.log --from 2026-07-01 | mdbkit queries -
 
 # Rotated/compressed logs work directly
 mdbkit queries mongod.log.2.gz
@@ -145,15 +156,34 @@ accordingly.
 ### Incident triage (beta)
 
 ```bash
-mdbkit triage /var/log/mongodb/mongod.log        # or a copied log + --no-sysprobe
+mdbkit triage /var/log/mongodb/mongod.log     # last 60 minutes (default)
+mdbkit triage mongod.log --window 30          # last 30 minutes
+mdbkit triage mongod.log --window 0           # whole file
+mdbkit triage mongod.log --dbpath /data/db    # if auto-discovery misses it
+mdbkit triage mongod.log --no-sysprobe        # analyzing a log copied off-host
 ```
 
-One command during an incident: election/stepdown timeline, connection
-storms, hot collections, error clusters, slow checkpoints — plus local
-disk/memory/load probes when run on the DB host. Read-only: it never
-connects to the database, and every finding ends with a next step for a
-human to review. Detectors marked beta are validated against real logs
-where available and clearly labeled where broader validation is pending.
+**Defaults to the last 60 minutes of log time**, because triage is for
+incidents happening now or just finished. In one command:
+
+- restarts, error clusters, election/stepdown events
+- connection storms — with the peak minute and the top source IPs
+- slow-query volume and the peak minute, so you know *when* it hurt
+- COLLSCAN share of slow operations (the missing-index signal)
+- the hot collection plus its top three query shapes inline
+- index-build activity (a common cause of surprise load)
+- slow checkpoints, cache eviction pressure, flow control
+- disk / memory / CPU load, and the running mongod's RSS and uptime
+
+When run on the database host, mdbkit finds `dbPath` automatically — from the
+log's startup line, or the running `mongod` process, or `/etc/mongod.conf`,
+or common defaults — so the disk check works even when the current log has no
+startup event. All probing is stdlib-only (`/proc`, `statvfs`); no shell-outs,
+nothing leaves the machine.
+
+Read-only: it never connects to the database, and every finding ends with a
+next step for a human to review. Detectors marked beta are pattern-matched and
+clearly labeled while broader validation is pending.
 
 ### Explain-plan analysis
 

@@ -118,3 +118,56 @@ def test_real_election_fixture_detected():
     assert f.severity == "CRIT"
     assert any("Starting an election" in e for e in f.evidence)
     assert any("Election succeeded" in e for e in f.evidence)
+
+
+# ------------------------------------------------- 0.1.1 additions ----
+
+INDEX_BUILD_LINES = [
+    '{"t":{"$date":"2026-07-01T08:45:00.000+00:00"},"s":"I","c":"INDEX","id":20438,"ctx":"conn5","msg":"Index build: registering","attr":{"namespace":"shop.orders","buildUUID":{"uuid":{"$uuid":"aaaa"}}}}',
+    '{"t":{"$date":"2026-07-01T08:46:30.000+00:00"},"s":"I","c":"INDEX","id":20440,"ctx":"conn5","msg":"Index build: done building","attr":{"namespace":"shop.orders"}}',
+]
+
+
+def test_index_build_detected(tmp_path):
+    log = build_log(tmp_path, INDEX_BUILD_LINES)
+    findings, _, _ = run_triage(log, no_sysprobe=True)
+    by = sev_map(findings)
+    f = by["Index build activity"]
+    assert f.severity == "WARN"
+    assert "shop.orders" in f.detail
+
+
+def test_collscan_and_volume_findings():
+    findings, _, _ = run_triage(FIXTURE, no_sysprobe=True)
+    by = sev_map(findings)
+    assert "Collection scans" in by
+    assert "COLLSCAN" in by["Collection scans"].detail
+    assert "Slow query volume" in by
+
+
+def test_default_window_is_60_minutes():
+    _f, _s, cutoff = run_triage(FIXTURE, no_sysprobe=True)
+    assert cutoff is not None  # default window applied, not whole file
+
+
+def test_whole_file_when_window_zero():
+    _f, _s, cutoff = run_triage(FIXTURE, window_min=0, no_sysprobe=True)
+    assert cutoff is None
+
+
+def test_dbpath_from_config_yaml_and_ini(tmp_path):
+    from mdbkit.triage import dbpath_from_config
+    y = tmp_path / "mongod.conf"
+    y.write_text("storage:\n  dbPath: /var/lib/mongodb\n  journal:\n    enabled: true\n")
+    assert dbpath_from_config(str(y)) == "/var/lib/mongodb"
+    i = tmp_path / "legacy.conf"
+    i.write_text("# comment\ndbpath=/data/db\nport=27017\n")
+    assert dbpath_from_config(str(i)) == "/data/db"
+    assert dbpath_from_config(str(tmp_path / "missing.conf")) is None
+
+
+def test_dbpath_from_argv():
+    from mdbkit.triage import dbpath_from_argv
+    assert dbpath_from_argv(["mongod", "--dbpath", "/data/db"]) == "/data/db"
+    assert dbpath_from_argv(["mongod", "--dbpath=/srv/mongo"]) == "/srv/mongo"
+    assert dbpath_from_argv(["mongod", "--port", "27017"]) is None

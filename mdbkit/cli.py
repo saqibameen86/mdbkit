@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import deque
 
 from . import __version__
 from .advisor import advise, load_indexes, load_schema
@@ -75,24 +76,49 @@ def cmd_connections(args) -> int:
 
 
 def cmd_filter(args) -> int:
-    flt = Filter(
-        component=args.component,
-        severity=args.severity,
-        namespace=args.ns,
-        slow_ms=args.slow,
-        ts_from=parse_when(args.ts_from) if args.ts_from else None,
-        ts_to=parse_when(args.ts_to) if args.ts_to else None,
-        msg_contains=args.msg,
-    )
+    _warn_large_file(args.logfile)
+    try:
+        flt = Filter(
+            component=args.component,
+            severity=args.severity,
+            namespace=args.ns,
+            slow_ms=args.slow,
+            ts_from=parse_when(args.ts_from) if args.ts_from else None,
+            ts_to=parse_when(args.ts_to) if args.ts_to else None,
+            msg_contains=args.msg,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     stats = ParseStats()
     matched = 0
+    shown = 0
+    tail = deque(maxlen=args.last) if args.last else None
+
     for entry in iter_entries(args.logfile, stats):
-        if flt.matches(entry):
+        if not flt.matches(entry):
+            continue
+        matched += 1
+        if tail is not None:
+            tail.append(entry.raw)
+        elif args.limit and shown >= args.limit:
+            continue
+        else:
             print(entry.raw)
-            matched += 1
+            shown += 1
+
+    if tail is not None:
+        for raw in tail:
+            print(raw)
+        shown = len(tail)
+
     _warn_if_pre44(stats)
-    print(f"filter: matched {matched:,} of {stats.parsed:,} parsed lines",
-          file=sys.stderr)
+    note = f"filter: matched {matched:,} of {stats.parsed:,} parsed lines"
+    if shown < matched:
+        which = "most recent" if tail is not None else "first"
+        note += f"; showing {which} {shown:,} (use --limit/--last to change)"
+    print(note, file=sys.stderr)
     return 0
 
 
@@ -133,7 +159,7 @@ def cmd_advise(args) -> int:
     if args.json:
         print(dump_json([r.to_dict() for r in recs]))
     else:
-        print(render_recommendations(recs, stats))
+        print(render_recommendations(recs, stats, limit=args.limit))
     return 0
 
 
@@ -219,6 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--from", dest="ts_from", help="ISO timestamp lower bound")
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--msg", help="substring match on the msg field")
+    sp.add_argument("--limit", type=int, metavar="N",
+                    help="print only the first N matching lines")
+    sp.add_argument("--last", type=int, metavar="N",
+                    help="print only the LAST N matching lines (most recent — "
+                         "usually what you want during an incident)")
     sp.set_defaults(func=cmd_filter)
 
     sp = sub.add_parser("advise", help="deterministic candidate-index recommendations")
@@ -230,6 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="only advise on shapes seen at least N times")
     sp.add_argument("--ns", metavar="NAMESPACE",
                     help="only advise on this namespace, e.g. shop.orders")
+    sp.add_argument("--limit", type=int, default=10, metavar="N",
+                    help="show only the top N recommendations (default 10; "
+                         "0 = all)")
     sp.set_defaults(func=cmd_advise)
 
     sp = sub.add_parser("explain",

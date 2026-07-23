@@ -213,3 +213,76 @@ def test_cli_smoke(capsys):
     out = capsys.readouterr().out
     assert "mdbkit" in out
     assert "COLLSCAN" in out or "candidate" in out
+
+
+# ------------------------------------------------- 0.1.1 additions ----
+
+def test_parse_when_accepts_offsets_and_naive():
+    from mdbkit.filtering import parse_when
+    assert parse_when("2026-07-01T08:00:00+04:00").tzinfo is not None
+    assert parse_when("2026-07-01T08:00:00Z").tzinfo is not None
+    assert parse_when("2026-07-01T08:00:00").tzinfo is None
+    assert parse_when("2026-07-01 08:00:00").hour == 8
+    assert parse_when("2026-07-01").day == 1
+    try:
+        parse_when("not-a-date")
+        assert False, "should raise"
+    except ValueError as exc:
+        assert "Could not parse" in str(exc)
+
+
+def test_filter_naive_bound_does_not_crash():
+    """Log timestamps carry +00:00; a naive bound must not raise TypeError."""
+    from mdbkit.filtering import Filter, parse_when
+    flt = Filter(ts_from=parse_when("2026-07-01T08:05:00"))
+    matched = [e for e in iter_entries(FIXTURE) if flt.matches(e)]
+    assert matched  # comparison worked
+    assert all(e.ts.hour >= 8 for e in matched if e.ts)
+
+
+def test_filter_limit_and_last(capsys):
+    from mdbkit.cli import main
+    assert main(["filter", FIXTURE, "--component", "COMMAND", "--limit", "2"]) == 0
+    out = capsys.readouterr()
+    assert len([l for l in out.out.splitlines() if l.strip()]) == 2
+    assert "showing first 2" in out.err
+
+    assert main(["filter", FIXTURE, "--component", "COMMAND", "--last", "2"]) == 0
+    out2 = capsys.readouterr()
+    assert len([l for l in out2.out.splitlines() if l.strip()]) == 2
+    assert "most recent" in out2.err
+
+
+def test_advise_summary_header_and_limit(capsys):
+    from mdbkit.cli import main
+    assert main(["advise", FIXTURE, "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "candidate(s):" in out
+    assert "showing top 1" in out
+
+
+def test_advise_ns_filter(capsys):
+    from mdbkit.cli import main
+    assert main(["advise", FIXTURE, "--ns", "shop.products", "--json"]) == 0
+    import json as _json
+    data = _json.loads(capsys.readouterr().out)
+    assert data and all(r["ns"] == "shop.products" for r in data)
+
+
+def test_bool_field_lowers_confidence(tmp_path):
+    """A boolean candidate field must reduce confidence, not stay flat."""
+    from mdbkit.advisor import advise, load_schema
+    agg = QueryAggregator()
+    for e in iter_entries(FIXTURE):
+        agg.consume(e)
+    base = {r.ns: r for r in advise(agg.results())}
+    schema_file = tmp_path / "schema.json"
+    schema_file.write_text(json.dumps({
+        "db": "shop",
+        "collections": {"products": {"sampleSize": 100, "fields": {
+            "sku": {"types": ["bool"], "presence": 1.0}}}},
+    }))
+    with_schema = {r.ns: r for r in advise(agg.results(),
+                                            schema=load_schema(str(schema_file)))}
+    assert base["shop.products"].confidence != with_schema["shop.products"].confidence
+    assert any("boolean" in c for c in with_schema["shop.products"].caveats)
