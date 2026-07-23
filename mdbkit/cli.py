@@ -6,6 +6,7 @@ Fully offline: reads files/stdin, writes stdout. No network, no telemetry.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import __version__
@@ -29,6 +30,7 @@ def _warn_if_pre44(stats: ParseStats) -> None:
 
 
 def cmd_loginfo(args) -> int:
+    _warn_large_file(args.logfile)
     stats = ParseStats()
     agg = SummaryAggregator()
     for entry in iter_entries(args.logfile, stats):
@@ -45,6 +47,7 @@ def cmd_loginfo(args) -> int:
 
 
 def cmd_queries(args) -> int:
+    _warn_large_file(args.logfile)
     stats = ParseStats()
     agg = QueryAggregator(min_ms=args.min_ms)
     for entry in iter_entries(args.logfile, stats):
@@ -93,7 +96,24 @@ def cmd_filter(args) -> int:
     return 0
 
 
+def _warn_large_file(logfile: str) -> None:
+    """Warn when a log file is large so users know to be patient."""
+    if logfile == "-":
+        return
+    try:
+        mb = os.path.getsize(logfile) / 1024 / 1024
+        if mb > 500:
+            print(f"note: {logfile} is {mb:.0f} MB — analysis may take several "
+                  f"minutes. Ctrl-C to abort.", file=sys.stderr)
+        elif mb > 100:
+            print(f"note: {logfile} is {mb:.0f} MB — this may take a moment.",
+                  file=sys.stderr)
+    except OSError:
+        pass
+
+
 def cmd_advise(args) -> int:
+    _warn_large_file(args.logfile)
     stats = ParseStats()
     agg = QueryAggregator(min_ms=args.min_ms)
     for entry in iter_entries(args.logfile, stats):
@@ -101,11 +121,14 @@ def cmd_advise(args) -> int:
     _warn_if_pre44(stats)
     indexes = load_indexes(args.indexes) if args.indexes else None
     schema = load_schema(args.schema) if args.schema else None
-    recs = advise(agg.results(), indexes=indexes, schema=schema,
+    results = agg.results()
+    if args.ns:
+        results = [r for r in results if r.shape.ns == args.ns]
+    recs = advise(results, indexes=indexes, schema=schema,
                   min_count=args.min_count)
     if not args.indexes:
         print("note: no --indexes file given; overlap with existing indexes was "
-              "not checked. Export with: mdbkit export-script indexes",
+              "not checked. Run: mdbkit export-script indexes  (then pass --indexes)",
               file=sys.stderr)
     if args.json:
         print(dump_json([r.to_dict() for r in recs]))
@@ -205,6 +228,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-ms", type=int, default=0)
     sp.add_argument("--min-count", type=int, default=1,
                     help="only advise on shapes seen at least N times")
+    sp.add_argument("--ns", metavar="NAMESPACE",
+                    help="only advise on this namespace, e.g. shop.orders")
     sp.set_defaults(func=cmd_advise)
 
     sp = sub.add_parser("explain",

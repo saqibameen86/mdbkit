@@ -55,11 +55,31 @@ def render_summary(summary: LogSummary, stats: ParseStats) -> str:
         + (f" (slowest {_ms(summary.slowest_ms)})" if summary.slow_queries else "")
     )
     parts.append(f"warnings: {summary.warnings:,}   errors: {summary.errors:,}")
+    if summary.warnings:
+        parts.append(f"  next: mdbkit filter <log> --severity W")
+    if summary.errors:
+        parts.append(f"  next: mdbkit filter <log> --severity E")
     parts.append("")
     top = summary.component_counts.most_common(8)
     if top:
         parts.append(_table(["component", "lines"], [(c, f"{n:,}") for c, n in top]))
     return "\n".join(parts)
+
+
+def _plan_label(s) -> str:
+    """Shortest useful plan label from planSummaries counter."""
+    if not s.plan_summaries:
+        return "?"
+    top = s.plan_summaries.most_common(1)[0][0]
+    if "COLLSCAN" in top:
+        return "COLLSCAN" + ("+SORT" if s.in_memory_sort else "")
+    if "IXSCAN" in top:
+        # "IXSCAN { a: 1, b: -1 }" -> "IXSCAN{a,b}"
+        inner = top[top.find("{"):top.find("}")+1] if "{" in top else ""
+        fields = ",".join(p.strip().split(":")[0].strip() for p in inner.strip("{}").split(",") if p.strip())
+        label = f"IXSCAN{{{fields}}}" if fields else "IXSCAN"
+        return label + ("+SORT" if s.in_memory_sort else "")
+    return top[:18]
 
 
 def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
@@ -71,11 +91,13 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
         return "\n".join(parts)
     rows = []
     for s in results:
-        flags = []
-        if s.collscan:
-            flags.append("COLLSCAN")
-        if s.in_memory_sort:
-            flags.append("SORT")
+        # scan ratio: handle zero-return ops (updates, deletes) gracefully
+        if s.n_returned:
+            scan = f"{s.scan_ratio:.0f}:1"
+        elif s.docs_examined:
+            scan = f"{s.docs_examined:,}ex/0ret"
+        else:
+            scan = "-"
         rows.append((
             s.shape.ns,
             s.shape.operation,
@@ -83,17 +105,24 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
             _ms(s.total_ms),
             _ms(s.mean_ms),
             _ms(s.max_ms),
-            f"{s.scan_ratio:.0f}:1" if s.n_returned else "-",
-            ",".join(flags) or "-",
-            s.shape.pretty()[:70],
+            f"{s.docs_examined:,}" if s.docs_examined else "-",
+            scan,
+            _plan_label(s),
+            s.shape.pretty()[:55],
         ))
     parts.append(_table(
-        ["namespace", "op", "count", "total", "mean", "max", "scan", "flags", "shape"],
+        ["namespace", "op", "count", "cumMs", "mean", "max", "docsEx", "scan", "plan", "shape"],
         rows,
     ))
     parts.append("")
-    parts.append("scan = docsExamined per returned doc. COLLSCAN/SORT flags mean an "
-                 "index is likely missing; run `mdbkit advise` for candidates.")
+    parts.append(
+        "cumMs  = total wall time accumulated across ALL occurrences (not one query)\n"
+        "docsEx = total documents examined across all occurrences\n"
+        "scan   = docsExamined per returned doc (high = index missing or weak)\n"
+        "plan   = most common query plan; COLLSCAN/+SORT = index needed\n"
+        "         empty plan (?) = plan not present in log (below slowms threshold)\n"
+        "next   : mdbkit advise <log> [--ns <namespace>] for index candidates"
+    )
     return "\n".join(parts)
 
 
