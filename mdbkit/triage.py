@@ -13,7 +13,7 @@ for a HUMAN to run.
 
 Detector validation status:
   stable : restarts, fatal errors, connection storms, hot collections,
-           slow-query bursts, COLLSCAN volume, index builds
+           slow-query bursts, COLLSCAN volume, index builds, noise filtering
   beta   : elections/stepdowns, slow checkpoints, eviction pressure,
            flow control — pattern-matched from documented log messages,
            pending broader validation (see docs/TESTING-PLAYBOOK.md).
@@ -57,9 +57,14 @@ def _minute(ts) -> int:
     return int(ts.timestamp() // 60)
 
 
-def _fmt_min(m: int) -> str:
+def _fmt_min(m: int, tz=None) -> str:
+    """Format a minute bucket in the log's own timezone (not UTC).
+
+    Log timestamps carry an offset (e.g. -04:00); showing peaks in UTC while
+    the window header shows local time is confusing during an incident.
+    """
     from datetime import datetime, timezone
-    return datetime.fromtimestamp(m * 60, tz=timezone.utc).strftime("%H:%M")
+    return datetime.fromtimestamp(m * 60, tz=tz or timezone.utc).strftime("%H:%M")
 
 
 def _ms(v: float) -> str:
@@ -97,9 +102,13 @@ class TriageEngine:
         self.collscan_minutes: Counter = Counter()
         self.slow_total = 0
         self.index_builds: List = []
+        self.log_tz = None
+        self.system_index_builds = 0
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
+        if self.log_tz is None and entry.ts is not None:
+            self.log_tz = entry.ts.tzinfo
         self.qagg.consume(entry)
         msg_l = entry.msg.lower()
         wt_msg = str(entry.attr.get("message", "")) if entry.attr else ""
@@ -118,7 +127,9 @@ class TriageEngine:
             remote = str(entry.attr.get("remote", "")).rsplit(":", 1)[0]
             self.conn_ips[m][remote] += 1
 
-        if entry.is_slow_query:
+        if entry.is_slow_query and not (
+                not self.qagg.include_system
+                and QueryAggregator.is_system_ns(str(entry.attr.get("ns", "")))):
             self.slow_total += 1
             if entry.ts is not None:
                 self.slow_minutes[_minute(entry.ts)] += 1
@@ -140,8 +151,11 @@ class TriageEngine:
                 self.flow_control += 1
 
         if entry.component == "INDEX" and any(p in msg_l for p in self.INDEX_BUILD):
-            ns = entry.attr.get("namespace") or entry.attr.get("ns") or ""
-            self.index_builds.append((entry.ts, entry.msg, str(ns)))
+            ns = str(entry.attr.get("namespace") or entry.attr.get("ns") or "")
+            if QueryAggregator.is_system_ns(ns):
+                self.system_index_builds += 1
+            else:
+                self.index_builds.append((entry.ts, entry.msg, ns))
 
         if "checkpoint" in msg_l or "checkpoint" in wt_msg.lower():
             dur = entry.attr.get("durationMillis")
@@ -210,6 +224,12 @@ class TriageEngine:
                 [m for _, m, _ in self.index_builds[:4]],
                 "If unexpected during an incident, find who started it: "
                 "db.currentOp({'command.createIndexes': {$exists: true}})"))
+        elif self.system_index_builds:
+            out.append(Finding(
+                "INFO", "Index builds (system only)",
+                "%d index-build message(s), all on internal namespaces "
+                "(admin/config/local) — normal startup housekeeping." %
+                self.system_index_builds))
 
         slow_cp = [(t, d) for t, d in self.checkpoints if d and d >= 60_000]
         if slow_cp:
@@ -258,14 +278,14 @@ class TriageEngine:
         if not storms:
             return Finding(
                 "OK", "Connections",
-                "No connection storms. Peak %d/min at %s UTC (median %d/min)."
-                % (peak_n, _fmt_min(peak_min), median))
+                "No connection storms. Peak %d/min at %s (median %d/min)."
+                % (peak_n, _fmt_min(peak_min, self.log_tz), median))
         top_ips = self.conn_ips[peak_min].most_common(3)
         return Finding(
             "WARN", "Connection storm",
             "%d minute(s) at >= %d new connections/min (baseline median "
-            "%d/min); peak %d at %s UTC." % (
-                len(storms), threshold, median, peak_n, _fmt_min(peak_min)),
+            "%d/min); peak %d at %s." % (
+                len(storms), threshold, median, peak_n, _fmt_min(peak_min, self.log_tz)),
             ["%s: %d in the peak minute" % (ip or "unknown", n)
              for ip, n in top_ips],
             "Identify the client: mdbkit connections <log> — look for pool "
@@ -275,8 +295,11 @@ class TriageEngine:
         out: List[Finding] = []
         shapes = self.qagg.results()
         if not shapes:
-            out.append(Finding("OK", "Slow queries",
-                               "None logged in window (slowms default 100 ms)."))
+            detail = "None logged in window (slowms default 100 ms)."
+            if self.qagg.skipped_system:
+                detail += (" %d internal operation(s) on admin/config/local "
+                           "were excluded." % self.qagg.skipped_system)
+            out.append(Finding("OK", "Slow queries", detail))
             return out
 
         if self.slow_minutes:
@@ -284,12 +307,12 @@ class TriageEngine:
             peak_n = self.slow_minutes[peak_min]
             counts = sorted(self.slow_minutes.values())
             median = counts[len(counts) // 2] or 1
-            sev = "WARN" if peak_n >= max(20, 5 * median) else "INFO"
+            sev = "WARN" if peak_n >= max(50, 5 * median) else "INFO"
             out.append(Finding(
                 sev, "Slow query volume",
-                "%d slow operations in window; peak %d in the minute at %s UTC "
+                "%d slow operations in window; peak %d in the minute at %s "
                 "(median %d/min)." % (self.slow_total, peak_n,
-                                      _fmt_min(peak_min), median),
+                                      _fmt_min(peak_min, self.log_tz), median),
                 next_step="Zoom in on the peak: mdbkit filter <log> --slow 100 "
                           "--last 20"))
 
@@ -299,8 +322,8 @@ class TriageEngine:
             peak = ""
             if self.collscan_minutes:
                 pm = max(self.collscan_minutes, key=self.collscan_minutes.get)
-                peak = " Peak %d at %s UTC." % (self.collscan_minutes[pm],
-                                                _fmt_min(pm))
+                peak = " Peak %d at %s." % (self.collscan_minutes[pm],
+                                                _fmt_min(pm, self.log_tz))
             out.append(Finding(
                 sev, "Collection scans",
                 "%d of %d slow operations used COLLSCAN (%.0f%%).%s" % (
@@ -313,7 +336,9 @@ class TriageEngine:
         total = sum(by_ns.values()) or 1
         ns, ms = by_ns.most_common(1)[0]
         share = 100.0 * ms / total
-        sev = "WARN" if share >= 50 and len(shapes) >= 3 else "INFO"
+        # A dominant share of a trivial total is not an incident.
+        sev = ("WARN" if share >= 50 and len(shapes) >= 3 and ms >= 5_000
+               else "INFO")
         out.append(Finding(
             sev, "Hot collection",
             "%s accounts for %.0f%% of slow-query time (%.1fs)." % (

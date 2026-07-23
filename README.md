@@ -46,6 +46,15 @@ pip download mdbkit -d ./wheels
 pip install --no-index --find-links ./wheels mdbkit
 ```
 
+**Upgrading to a newer version:**
+```bash
+pip install --upgrade mdbkit      # if installed with pip
+pipx upgrade mdbkit               # if installed with pipx
+mdbkit --version                  # confirm
+```
+mdbkit never updates itself and never checks for updates — it makes no network
+calls at all. Upgrades are always explicit.
+
 Requires Python 3.8+. Zero runtime dependencies — safe to install on production hosts.
 
 > mdbkit is a Python package distributed via PyPI. It is **not** available
@@ -224,6 +233,195 @@ db.setProfilingLevel(1, { slowms: 50 })
 
 Pre-4.4 plain-text logs are detected and politely refused — for those, the
 original mtools still works.
+
+## Command reference
+
+Every command reads files or stdin and writes to stdout. `--help` works on any
+command (`mdbkit queries --help`). Global: `mdbkit --version`.
+
+All commands that read a log accept a path to a `.log` file, a rotated `.gz`
+file, or `-` for stdin.
+
+---
+
+### `mdbkit loginfo <log>`
+
+Overall log summary: server version, host, restarts, connections accepted,
+slow-query count, warning/error counts, and a per-component line breakdown.
+
+| Option | Description |
+|---|---|
+| `--json` | Machine-readable output |
+
+```bash
+mdbkit loginfo /var/log/mongodb/mongod.log
+mdbkit loginfo mongod.log.2.gz --json
+```
+
+---
+
+### `mdbkit queries <log>`
+
+Slow queries grouped by **query shape** — literal values stripped, so the same
+query with different parameters is counted once.
+
+| Option | Default | Description |
+|---|---|---|
+| `--sort FIELD` | `totalMs` | Order by `totalMs`, `count`, `mean`, `max`, `docsExamined`, or `scanRatio` |
+| `--limit N` | all | Show only the top N shapes |
+| `--min-ms N` | 0 | Ignore operations faster than N milliseconds |
+| `--include-system` | off | Include internal `admin`/`config`/`local` namespaces (hidden by default — they are server housekeeping, not your workload) |
+| `--json` | | Machine-readable output |
+
+**Reading the columns:**
+
+| Column | Meaning |
+|---|---|
+| `cumMs` | Time summed across **all** occurrences of that shape — not one query |
+| `mean` / `max` | Per-occurrence average and worst case |
+| `docsEx` | Documents examined, summed across all occurrences |
+| `scan` | Documents examined per document returned. `1:1` is ideal; `3444:1` means a missing or weak index |
+| `plan` | The plan MongoDB chose: `COLLSCAN` (no index), `IXSCAN{fields}` (index used), `IDHACK` (`_id` lookup), `+SORT` (in-memory sort). `?` = the plan was not recorded on that line |
+| `shape` | Fields and operators queried, with the sort |
+
+```bash
+mdbkit queries mongod.log
+mdbkit queries mongod.log --sort scanRatio --limit 10
+mdbkit queries mongod.log --min-ms 500 --json
+```
+
+---
+
+### `mdbkit connections <log>`
+
+Connection churn: totals, peak concurrent count, per-source-IP breakdown, and
+the client applications and drivers seen.
+
+| Option | Description |
+|---|---|
+| `--json` | Machine-readable output |
+
+---
+
+### `mdbkit filter <log>`
+
+Streams **matching raw log lines** to stdout. Output stays valid logv2 JSON, so
+it chains with other tools (including mdbkit itself).
+
+| Option | Description |
+|---|---|
+| `--component NAME` | `COMMAND`, `NETWORK`, `REPL`, `STORAGE`, `INDEX`, `WRITE`, `QUERY`, `CONTROL`, … |
+| `--severity S` | `I` info, `W` warning, `E` error, `F` fatal |
+| `--ns NAMESPACE` | Exact namespace, e.g. `shop.orders` |
+| `--slow N` | Only operations with `durationMillis` >= N |
+| `--from TIMESTAMP` | Lower time bound (inclusive) |
+| `--to TIMESTAMP` | Upper time bound (inclusive) |
+| `--msg TEXT` | Substring match on the message field |
+| `--limit N` | Print only the **first** N matches |
+| `--last N` | Print only the **last** N matches — usually what you want during an incident |
+
+**Timestamp formats accepted** by `--from` / `--to`:
+
+```
+2026-07-01T08:00:00+04:00     with an explicit offset (production logs)
+2026-07-01T08:00:00Z          UTC
+2026-07-01T08:00:00           no offset — read as the log's own timezone
+2026-07-01 08:00:00           space instead of T
+2026-07-01T08:00               minute precision
+2026-07-01                     whole day
+```
+
+```bash
+mdbkit filter mongod.log --severity E --last 20
+mdbkit filter mongod.log --component REPL --msg election
+mdbkit filter mongod.log --slow 500 --ns shop.orders --limit 50
+mdbkit filter mongod.log --from 2026-07-01T14:30:00+04:00 --to 2026-07-01T15:00:00+04:00
+mdbkit filter mongod.log --slow 100 | mdbkit queries -
+```
+
+---
+
+### `mdbkit advise <log>`
+
+Deterministic **candidate** index recommendations from observed slow-query
+shapes, using the ESR guideline (Equality → Sort → Range). Rules, not AI: the
+same log always produces the same advice.
+
+| Option | Default | Description |
+|---|---|---|
+| `--indexes FILE` | | `indexes.json` from `mdbkit export-script indexes` — enables overlap checks against existing indexes |
+| `--schema FILE` | | `schema.json` from `mdbkit export-script schema` — enables field-type caveats and confidence adjustment |
+| `--ns NAMESPACE` | all | Only advise on one namespace (recommended on large logs) |
+| `--limit N` | 10 | Show only the top N recommendations (`0` = all) |
+| `--min-ms N` | 0 | Ignore operations faster than N milliseconds |
+| `--min-count N` | 1 | Only advise on shapes seen at least N times |
+| `--include-system` | off | Include internal `admin`/`config`/`local` namespaces |
+| `--json` | | Machine-readable output |
+
+Each recommendation carries a candidate key pattern, the evidence behind it, a
+confidence level, caveats, and a validation step. mdbkit never advises dropping
+an index — at most it flags an overlap to investigate.
+
+```bash
+mdbkit advise mongod.log
+mdbkit advise mongod.log --indexes indexes.json --schema schema.json
+mdbkit advise mongod.log --ns shop.orders --limit 3
+```
+
+---
+
+### `mdbkit explain <file>`
+
+Analyzes a saved `explain("executionStats")` document: the plan chain, the
+examined-vs-returned math, plain-English verdicts, and — when the plan needs
+help — a candidate index from the same advisor engine.
+
+| Option | Description |
+|---|---|
+| `--indexes FILE` | Overlap check against existing indexes |
+| `--schema FILE` | Field-type caveats |
+| `--json` | Machine-readable output |
+
+Produce the input with mongosh:
+```bash
+mongosh --quiet --eval 'EJSON.stringify(db.orders.find({status:"open"}).sort({ts:-1}).explain("executionStats"))' > explain.json
+mdbkit explain explain.json
+```
+
+---
+
+### `mdbkit triage <log>`
+
+One-command incident snapshot. **Defaults to the last 60 minutes of log time.**
+
+| Option | Default | Description |
+|---|---|---|
+| `--window N` | 60 | Analyze the last N minutes of log time; `0` = the whole file |
+| `--dbpath PATH` | auto | Override the data directory used for the disk check |
+| `--no-sysprobe` | off | Skip local disk/memory/CPU probes — use when analyzing a log copied off the host |
+| `--json` | | Machine-readable output |
+
+```bash
+mdbkit triage /var/log/mongodb/mongod.log
+mdbkit triage mongod.log --window 30
+mdbkit triage mongod.log --window 0 --no-sysprobe
+```
+
+---
+
+### `mdbkit export-script {schema|indexes}`
+
+Prints a small `mongosh` script to stdout. **mdbkit never connects to your
+database** — you run these yourself, so you can read exactly what they do
+first. Both are read-only and export **field names and types only, never
+document values**.
+
+```bash
+mdbkit export-script indexes > export_indexes.js
+mdbkit export-script schema  > export_schema.js
+```
+
+---
 
 ## Roadmap
 

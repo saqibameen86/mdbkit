@@ -271,10 +271,6 @@ class ShapeStats:
 
 
 class QueryAggregator:
-    def __init__(self, min_ms: int = 0):
-        self.min_ms = min_ms
-        self.shapes: Dict[QueryShape, ShapeStats] = {}
-
     NOISE_OPS = frozenset({
         "hello", "isMaster", "ismaster", "ping", "endSessions", "saslStart",
         "saslContinue", "buildInfo", "getParameter", "serverStatus", "getLog",
@@ -282,7 +278,29 @@ class QueryAggregator:
         "logout", "killCursors", "listCollections", "listIndexes",
         "listDatabases", "getFreeMonitoringStatus", "dbStats", "collStats",
         "top", "currentOp", "profile", "hostInfo", "createIndexes",
+        # DDL and internal replication coordination — not workload queries
+        "create", "drop", "dropDatabase", "createUser", "renameCollection",
+        "voteCommitIndexBuild", "voteAbortIndexBuild", "replSetInitiate",
+        "replSetUpdatePosition", "replSetHeartbeat", "_flushRoutingTableCacheUpdates",
+        "appendOplogNote", "setFeatureCompatibilityVersion",
     })
+
+    # MongoDB-internal databases: their traffic is server housekeeping, not
+    # the user workload a DBA is triaging.
+    SYSTEM_DBS = frozenset({"local", "config", "admin"})
+
+    def __init__(self, min_ms: int = 0, include_system: bool = False):
+        self.min_ms = min_ms
+        self.include_system = include_system
+        self.shapes: Dict[QueryShape, ShapeStats] = {}
+        self.skipped_system = 0
+
+    @classmethod
+    def is_system_ns(cls, ns: str) -> bool:
+        if not ns:
+            return False
+        db = ns.split(".", 1)[0]
+        return db in cls.SYSTEM_DBS or ".system." in ns
 
     def consume(self, entry: LogEntry):
         if not entry.is_slow_query:
@@ -293,6 +311,9 @@ class QueryAggregator:
         if shape is None or shape.operation == "insert":
             return
         if shape.operation in self.NOISE_OPS and not shape.filter_fields:
+            return
+        if not self.include_system and self.is_system_ns(shape.ns):
+            self.skipped_system += 1
             return
         # Batched update/delete at COMMAND level often omits the per-op q;
         # the paired WRITE entry carries the real shape and metrics.

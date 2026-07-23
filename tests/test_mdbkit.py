@@ -286,3 +286,46 @@ def test_bool_field_lowers_confidence(tmp_path):
                                             schema=load_schema(str(schema_file)))}
     assert base["shop.products"].confidence != with_schema["shop.products"].confidence
     assert any("boolean" in c for c in with_schema["shop.products"].caveats)
+
+
+def test_system_namespaces_excluded_by_default():
+    """Internal admin/config/local traffic is server housekeeping, not the
+    user workload — QA on real replica logs showed it drowning the report."""
+    from mdbkit.analysis import QueryAggregator
+    assert QueryAggregator.is_system_ns("local.oplog.rs")
+    assert QueryAggregator.is_system_ns("config.system.indexBuilds")
+    assert QueryAggregator.is_system_ns("admin.$cmd")
+    assert QueryAggregator.is_system_ns("testdb.system.buckets.x")
+    assert not QueryAggregator.is_system_ns("shop.orders")
+
+    line = json.dumps({
+        "t": {"$date": "2026-07-01T09:00:00.000+00:00"}, "s": "I",
+        "c": "COMMAND", "id": 51803, "ctx": "conn1", "msg": "Slow query",
+        "attr": {"type": "command", "ns": "local.oplog.rs",
+                 "command": {"getMore": 1, "collection": "oplog.rs",
+                             "$db": "local"},
+                 "planSummary": "COLLSCAN", "docsExamined": 9999,
+                 "nreturned": 1, "durationMillis": 200}})
+    entry = parse_line(line)
+    agg = QueryAggregator()
+    agg.consume(entry)
+    assert agg.results() == []
+    assert agg.skipped_system == 1
+
+    agg2 = QueryAggregator(include_system=True)
+    agg2.consume(entry)
+    assert len(agg2.results()) == 1
+
+
+def test_ddl_ops_are_noise():
+    from mdbkit.analysis import QueryAggregator
+    for op in ("create", "voteCommitIndexBuild", "replSetInitiate"):
+        line = json.dumps({
+            "t": {"$date": "2026-07-01T09:00:00.000+00:00"}, "s": "I",
+            "c": "COMMAND", "id": 51803, "ctx": "c", "msg": "Slow query",
+            "attr": {"type": "command", "ns": "testdb.x",
+                     "command": {op: "x", "$db": "testdb"},
+                     "durationMillis": 300}})
+        agg = QueryAggregator()
+        agg.consume(parse_line(line))
+        assert agg.results() == [], "%s should be filtered as noise" % op
