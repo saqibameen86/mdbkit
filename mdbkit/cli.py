@@ -50,11 +50,16 @@ def cmd_loginfo(args) -> int:
 def cmd_queries(args) -> int:
     _warn_large_file(args.logfile)
     stats = ParseStats()
-    agg = QueryAggregator(min_ms=args.min_ms)
+    agg = QueryAggregator(min_ms=args.min_ms,
+                          include_system=getattr(args, "include_system", False))
     for entry in iter_entries(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
     results = agg.results(sort_by=args.sort, limit=args.limit)
+    if agg.skipped_system:
+        print("note: excluded %d internal operation(s) on admin/config/local "
+              "(--include-system to show them)" % agg.skipped_system,
+              file=sys.stderr)
     if args.json:
         print(dump_json([s.to_dict() for s in results]))
     else:
@@ -141,7 +146,8 @@ def _warn_large_file(logfile: str) -> None:
 def cmd_advise(args) -> int:
     _warn_large_file(args.logfile)
     stats = ParseStats()
-    agg = QueryAggregator(min_ms=args.min_ms)
+    agg = QueryAggregator(min_ms=args.min_ms,
+                          include_system=getattr(args, "include_system", False))
     for entry in iter_entries(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
@@ -230,6 +236,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=0, help="show top N shapes")
     sp.add_argument("--min-ms", type=int, default=0,
                     help="ignore operations faster than this")
+    sp.add_argument("--include-system", action="store_true",
+                    help="include internal admin/config/local namespaces "
+                         "(hidden by default — they are server housekeeping, "
+                         "not your workload)")
     sp.set_defaults(func=cmd_queries)
 
     sp = sub.add_parser("connections", help="connection churn by source IP and app")
@@ -264,6 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=10, metavar="N",
                     help="show only the top N recommendations (default 10; "
                          "0 = all)")
+    sp.add_argument("--include-system", action="store_true",
+                    help="include internal admin/config/local namespaces")
     sp.set_defaults(func=cmd_advise)
 
     sp = sub.add_parser("explain",
