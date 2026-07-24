@@ -60,6 +60,22 @@ def cmd_queries(args) -> int:
         print("note: excluded %d internal operation(s) on admin/config/local "
               "(--include-system to show them)" % agg.skipped_system,
               file=sys.stderr)
+    if args.report:
+        from .report import Report, stamp
+        rep = Report("MongoDB slow query analysis", stamp())
+        rows = [[s.shape.ns, s.shape.operation, s.count, s.total_ms,
+                 round(s.mean_ms), s.max_ms, s.docs_examined,
+                 ("%.0f:1" % s.scan_ratio) if s.n_returned else "-",
+                 s.shape.pretty()[:80]] for s in results]
+        rep.table("Slow query shapes",
+                  ["namespace", "op", "count", "cumMs", "mean", "max",
+                   "docsEx", "scan", "shape"], rows)
+        rep.text("Note",
+                 "cumMs is time summed across all occurrences of a shape, not "
+                 "a single query. Literal values are never included: these are "
+                 "query shapes only.")
+        print("wrote %s" % rep.write(args.report), file=sys.stderr)
+        return 0
     if args.json:
         print(dump_json([s.to_dict() for s in results]))
     else:
@@ -78,6 +94,16 @@ def cmd_connections(args) -> int:
     else:
         print(render_connections(agg.report, stats))
     return 0
+
+
+def _emit(entry, as_explain: bool, wrap: bool) -> str:
+    if not as_explain:
+        return entry.raw
+    from .rebuild import to_mongosh, wrap_for_export
+    cmd = to_mongosh(entry)
+    if cmd is None:
+        return None
+    return wrap_for_export(cmd) if wrap else cmd
 
 
 def cmd_filter(args) -> int:
@@ -105,12 +131,15 @@ def cmd_filter(args) -> int:
         if not flt.matches(entry):
             continue
         matched += 1
+        line = _emit(entry, args.as_explain, args.explain_script)
+        if line is None:
+            continue
         if tail is not None:
-            tail.append(entry.raw)
+            tail.append(line)
         elif args.limit and shown >= args.limit:
             continue
         else:
-            print(entry.raw)
+            print(line)
             shown += 1
 
     if tail is not None:
@@ -190,8 +219,20 @@ def cmd_triage(args) -> int:
     from .triage import render_triage, run_triage
     findings, stats, cutoff = run_triage(
         args.logfile, window_min=args.window, dbpath=args.dbpath,
-        no_sysprobe=args.no_sysprobe)
+        no_sysprobe=args.no_sysprobe, ftdc_path=args.ftdc)
     _warn_if_pre44(stats)
+    if args.report:
+        from .report import Report, stamp
+        win = ""
+        if stats.first_ts and stats.last_ts:
+            win = "window %s -> %s" % (
+                (cutoff or stats.first_ts).strftime("%Y-%m-%d %H:%M"),
+                stats.last_ts.strftime("%H:%M"))
+        rep = Report("MongoDB incident triage", stamp(win))
+        rep.findings("Findings", findings)
+        path = rep.write(args.report)
+        print("wrote %s" % path, file=sys.stderr)
+        return 0
     if args.json:
         print(dump_json({
             "window": {"from": cutoff or stats.first_ts, "to": stats.last_ts},
@@ -199,6 +240,52 @@ def cmd_triage(args) -> int:
         }))
     else:
         print(render_triage(findings, stats, cutoff))
+    return 0
+
+
+def cmd_ftdc(args) -> int:
+    from .ftdc import FtdcReader, ftdc_files
+    from .render import render_ftdc_summary, render_ftdc_timeline
+    files = ftdc_files(args.path)
+    if not files:
+        print("error: no FTDC files found at %s (expected a "
+              "diagnostic.data directory or a metrics.* file)" % args.path,
+              file=sys.stderr)
+        return 2
+    wanted = args.metric or None
+    reader = FtdcReader(wanted=wanted)
+    ts_from = parse_when(args.ts_from) if args.ts_from else None
+    ts_to = parse_when(args.ts_to) if args.ts_to else None
+    reader.read(args.path, ts_from=ts_from, ts_to=ts_to)
+    if reader.chunks == 0:
+        print("warning: no metric chunks decoded from %d file(s)" % len(files),
+              file=sys.stderr)
+    if args.action == "summary":
+        if args.json:
+            print(dump_json(reader.summary()))
+        else:
+            print(render_ftdc_summary(reader, len(files)))
+    elif args.action == "timeline":
+        if args.json:
+            print(dump_json({k: {"times": [t.isoformat() for t in v.times],
+                                 "values": v.values}
+                             for k, v in reader.series.items()}))
+        else:
+            print(render_ftdc_timeline(reader, args.step))
+    else:  # export
+        import csv as _csv
+        labels = sorted(reader.series)
+        if not labels:
+            return 0
+        writer = _csv.writer(sys.stdout)
+        writer.writerow(["time"] + labels)
+        base = reader.series[labels[0]]
+        for i, t in enumerate(base.times):
+            row = [t.isoformat()]
+            for lb in labels:
+                vals = reader.series[lb].values
+                row.append(vals[i] if i < len(vals) else "")
+            writer.writerow(row)
     return 0
 
 
@@ -240,6 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="include internal admin/config/local namespaces "
                          "(hidden by default — they are server housekeeping, "
                          "not your workload)")
+    sp.add_argument("--report", metavar="FILE",
+                    help="write a shareable .md or .html report instead")
     sp.set_defaults(func=cmd_queries)
 
     sp = sub.add_parser("connections", help="connection churn by source IP and app")
@@ -260,6 +349,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--last", type=int, metavar="N",
                     help="print only the LAST N matching lines (most recent — "
                          "usually what you want during an incident)")
+    sp.add_argument("--as-explain", action="store_true",
+                    help="rebuild each matching slow query as a runnable "
+                         "mongosh .explain() command instead of printing the "
+                         "raw log line")
+    sp.add_argument("--explain-script", action="store_true",
+                    help="with --as-explain, wrap output in EJSON.stringify() "
+                         "and usage comments so it can be piped to a .js file")
     sp.set_defaults(func=cmd_filter)
 
     sp = sub.add_parser("advise", help="deterministic candidate-index recommendations")
@@ -299,8 +395,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dbpath", help="override dbPath for the disk probe")
     sp.add_argument("--no-sysprobe", action="store_true",
                     help="skip local disk/memory/load probes")
+    sp.add_argument("--ftdc", metavar="PATH",
+                    help="diagnostic.data directory — adds CPU, memory, cache "
+                         "and connection metrics from MongoDB's own recorder")
+    sp.add_argument("--report", metavar="FILE",
+                    help="write a shareable report instead of terminal output "
+                         "(.md or .html; self-contained, no external assets)")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_triage)
+
+    sp = sub.add_parser("ftdc",
+                        help="decode diagnostic.data (FTDC): CPU, memory, "
+                             "cache, connections and op rates, offline")
+    sp.add_argument("action", choices=["summary", "timeline", "export"],
+                    help="summary = min/avg/max per metric; timeline = values "
+                         "over time; export = CSV to stdout")
+    sp.add_argument("path", help="diagnostic.data directory or a metrics.* file")
+    sp.add_argument("--metric", action="append",
+                    help="restrict to a metric label (repeatable), "
+                         "e.g. --metric conns.current")
+    sp.add_argument("--step", type=int, default=60, metavar="SECONDS",
+                    help="timeline bucket size (default 60)")
+    sp.add_argument("--from", dest="ts_from", help="ISO timestamp lower bound")
+    sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_ftdc)
 
     sp = sub.add_parser("export-script",
                         help="print a mongosh script to export schema or indexes")

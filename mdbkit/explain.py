@@ -13,6 +13,7 @@ and sharded winning plans. Reuses the same deterministic advisor as
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -83,19 +84,54 @@ def _find_query_planner(doc: dict) -> Tuple[dict, dict]:
     return {}, {}
 
 
+_SHELL_CTORS = re.compile(
+    r'\b(?:NumberLong|NumberInt|NumberDecimal|ISODate|BinData|UUID|Timestamp)'
+    r'\s*\(\s*([^()]*?)\s*\)')
+_OBJECTID = re.compile(r'\bObjectId\s*\(\s*([\'"][^\'"]*[\'"])\s*\)')
+
+
+def _relax_shell_json(text: str) -> str:
+    """Convert legacy mongo-shell constructors into plain JSON values.
+
+    The old `mongo` shell (and copy/paste from Compass) emits things like
+    NumberLong(42) and ISODate("...") which are JavaScript, not JSON. The
+    values themselves do not affect plan analysis, so we unwrap them rather
+    than making the user re-export.
+    """
+    text = _OBJECTID.sub(lambda m: m.group(1).replace("'", '"'), text)
+
+    def unwrap(m):
+        inner = m.group(1).strip()
+        if not inner:
+            return "0"
+        if inner[0] in "\'\"":
+            return '"%s"' % inner[1:-1]
+        if "," in inner:  # Timestamp(a, b) / BinData(t, "...")
+            inner = inner.split(",", 1)[1].strip()
+            if inner and inner[0] in "\'\"":
+                return '"%s"' % inner[1:-1]
+        return inner or "0"
+
+    text = _SHELL_CTORS.sub(unwrap, text)
+    return text
+
+
 def load_explain(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     try:
         doc = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "This file is not valid JSON. Legacy mongo-shell explain output "
-            "contains constructors like NumberLong(...) that are not JSON; "
-            "re-export with mongosh (e.g. "
-            "`EJSON.stringify(db.coll.find(...).explain('executionStats'))`) "
-            "or use Compass's JSON export."
-        ) from exc
+    except json.JSONDecodeError:
+        try:
+            doc = json.loads(_relax_shell_json(text))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Could not parse this file as JSON, even after relaxing "
+                "mongo-shell constructors. Re-export with mongosh:\n"
+                "  mongosh --quiet --eval "
+                "'EJSON.stringify(db.COLL.find({...}).explain(\"executionStats\"))'"
+                " > explain.json"
+            ) from exc
     if isinstance(doc, list) and doc:
         doc = doc[0]
     if not isinstance(doc, dict):
@@ -198,7 +234,8 @@ def analyze_explain(doc: dict, indexes=None, schema=None) -> ExplainReport:
         )
         agg = QueryAggregator()
         agg.consume(entry)
-        recs = advise(agg.results(), indexes=indexes, schema=schema)
+        recs = advise(agg.results(), indexes=indexes, schema=schema,
+                      single_sample=True)
         if recs:
             recommendation = recs[0]
 

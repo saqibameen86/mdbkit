@@ -113,18 +113,18 @@ mongosh --quiet "mongodb://localhost/yourdb" export_schema.js  > schema.json
 
 # With authentication (typical production setup):
 mongosh --quiet \
-  --host your-db-host \
+  --host your_db_host \
   --port 27017 \
-  --username your-username \
-  --password your-password \
+  --username your_username \
+  --password your_password \
   --authenticationDatabase admin \
   --eval "$(cat export_indexes.js)" > indexes.json
 
 mongosh --quiet \
-  --host your-db-host \
+  --host your_db_host \
   --port 27017 \
-  --username your-username \
-  --password your-password \
+  --username your_username \
+  --password your_password \
   --authenticationDatabase admin \
   --eval "$(cat export_schema.js)" > schema.json
 ```
@@ -271,6 +271,7 @@ query with different parameters is counted once.
 | `--limit N` | all | Show only the top N shapes |
 | `--min-ms N` | 0 | Ignore operations faster than N milliseconds |
 | `--include-system` | off | Include internal `admin`/`config`/`local` namespaces (hidden by default — they are server housekeeping, not your workload) |
+| `--report FILE` | | Write a shareable `.md` or `.html` report instead |
 | `--json` | | Machine-readable output |
 
 **Reading the columns:**
@@ -319,6 +320,8 @@ it chains with other tools (including mdbkit itself).
 | `--msg TEXT` | Substring match on the message field |
 | `--limit N` | Print only the **first** N matches |
 | `--last N` | Print only the **last** N matches — usually what you want during an incident |
+| `--as-explain` | Rebuild each matching slow query as a runnable `mongosh` `.explain()` command instead of printing the raw log line |
+| `--explain-script` | With `--as-explain`, wrap in `EJSON.stringify()` plus usage comments so it can be saved as a `.js` file |
 
 **Timestamp formats accepted** by `--from` / `--to`:
 
@@ -332,12 +335,32 @@ it chains with other tools (including mdbkit itself).
 ```
 
 ```bash
-mdbkit filter mongod.log --severity E --last 20
+mdbkit filter mongod.log --severity E --last 20    # errors (most recent 20)
+mdbkit filter mongod.log --severity F               # fatal — always investigate
+mdbkit filter mongod.log --severity W --last 50     # warnings
 mdbkit filter mongod.log --component REPL --msg election
 mdbkit filter mongod.log --slow 500 --ns shop.orders --limit 50
 mdbkit filter mongod.log --from 2026-07-01T14:30:00+04:00 --to 2026-07-01T15:00:00+04:00
 mdbkit filter mongod.log --slow 100 | mdbkit queries -
 ```
+
+**From a slow query in the log to an explain plan**, without hand-writing the
+query — `--as-explain` rebuilds the command that ran:
+
+```bash
+# See the actual commands behind your slowest operations
+mdbkit filter mongod.log --ns shop.orders --slow 500 --last 3 --as-explain
+
+# Or produce a runnable script, get the plan, and analyze it
+mdbkit filter mongod.log --slow 500 --last 1 --as-explain --explain-script > q.js
+mongosh --quiet --host your_db_host --username your_username \\
+        --password your_password --authenticationDatabase admin \\
+        --eval "$(cat q.js)" > explain.json
+mdbkit explain explain.json
+```
+
+> Rebuilt commands contain the **real values** from your log (not redacted
+> shapes) — treat them as sensitive.
 
 ---
 
@@ -382,30 +405,95 @@ help — a candidate index from the same advisor engine.
 | `--schema FILE` | Field-type caveats |
 | `--json` | Machine-readable output |
 
-Produce the input with mongosh:
+**Full example.** Get a plan for a query and analyze it:
+
 ```bash
-mongosh --quiet --eval 'EJSON.stringify(db.orders.find({status:"open"}).sort({ts:-1}).explain("executionStats"))' > explain.json
+# 1. Capture the plan (adjust host/credentials for your deployment)
+mongosh --quiet \\
+  --host your_db_host \\
+  --port 27017 \\
+  --username your_username \\
+  --password your_password \\
+  --authenticationDatabase admin \\
+  --eval 'EJSON.stringify(db.getSiblingDB("shop").orders.find({status:"open"}).sort({ts:-1}).explain("executionStats"))' \\
+  > explain.json
+
+# 2. Analyze it
 mdbkit explain explain.json
+
+# 3. Sharper, with your existing indexes and sampled schema
+mdbkit explain explain.json --indexes indexes.json --schema schema.json
 ```
+
+Don't want to write the query by hand? `mdbkit filter ... --as-explain`
+rebuilds it from the log for you (see the `filter` section above).
+
+Legacy `mongo` shell and Compass output containing `NumberLong(...)`,
+`ISODate(...)` or `ObjectId(...)` is accepted — mdbkit unwraps those
+automatically, so you do not have to re-export.
 
 ---
 
 ### `mdbkit triage <log>`
 
-One-command incident snapshot. **Defaults to the last 60 minutes of log time.**
+**"Triage" means: quickly work out what is wrong and what to look at first.**
+Run this when something has gone wrong — or has just gone wrong — and you need
+one screen that says what happened, how bad it is, and where to look next.
+**Defaults to the last 60 minutes of log time.**
 
 | Option | Default | Description |
 |---|---|---|
 | `--window N` | 60 | Analyze the last N minutes of log time; `0` = the whole file |
 | `--dbpath PATH` | auto | Override the data directory used for the disk check |
 | `--no-sysprobe` | off | Skip local disk/memory/CPU probes — use when analyzing a log copied off the host |
+| `--ftdc PATH` | | `diagnostic.data` directory — adds CPU, memory, cache, queue and connection history from MongoDB's own recorder |
+| `--report FILE` | | Write a shareable `.md` or `.html` report instead of terminal output |
 | `--json` | | Machine-readable output |
 
 ```bash
 mdbkit triage /var/log/mongodb/mongod.log
 mdbkit triage mongod.log --window 30
+mdbkit triage mongod.log --ftdc /var/lib/mongodb/diagnostic.data
+mdbkit triage mongod.log --report incident.html
 mdbkit triage mongod.log --window 0 --no-sysprobe
 ```
+
+---
+
+### `mdbkit ftdc {summary|timeline|export} <path>`
+
+Decodes `diagnostic.data` — **FTDC (Full-Time Diagnostic Data Capture)**, the
+metrics recorder every mongod already runs. It holds CPU, memory, WiredTiger
+cache, connection, queue and operation history for every node, with no
+monitoring agent installed and no database connection. It is compressed BSON,
+not encrypted; mdbkit decodes it offline.
+
+| Action | Description |
+|---|---|
+| `summary` | min / avg / max / last per metric, plus per-second rates for counters |
+| `timeline` | Values bucketed over time — shows *when* something spiked |
+| `export` | CSV to stdout, for a spreadsheet or your own tooling |
+
+| Option | Default | Description |
+|---|---|---|
+| `--metric LABEL` | all | Restrict to one metric (repeatable), e.g. `--metric conns.current` |
+| `--step SECONDS` | 60 | Timeline bucket size |
+| `--from` / `--to` | | Time bounds (same formats as `filter`) |
+| `--json` | | Machine-readable output |
+
+```bash
+mdbkit ftdc summary /var/lib/mongodb/diagnostic.data
+mdbkit ftdc timeline diagnostic.data --metric conns.current --step 300
+mdbkit ftdc export diagnostic.data > metrics.csv
+```
+
+Metric labels include `ops.*` (insert/query/update/delete/getmore/command),
+`conns.current`, `conns.available`, `queue.readers`, `queue.writers`,
+`cache.usedBytes`, `cache.maxBytes`, `cache.dirtyBytes`, `tickets.*`,
+`mem.residentMB`, and on Linux `sys.cpu.*` and `sys.mem.availableKB`.
+
+The data directory can be copied off the host and analyzed elsewhere — it
+contains metrics only, never document contents.
 
 ---
 
@@ -428,12 +516,15 @@ mdbkit export-script schema  > export_schema.js
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
 
-* **v0.2** — FTDC (`diagnostic.data`) decoding: offline summaries of the
-  metrics MongoDB already records on every node; election/failover timeline
-  from REPL events; per-shape drill-down.
-* **v0.3** — shareable Markdown/HTML report export (for tickets and
-  post-incident reviews — a convenience layer, never a replacement for the
-  terminal).
+**Shipped in v0.2:** FTDC decoding, incident triage with system metrics,
+query reconstruction (`--as-explain`), and shareable Markdown/HTML reports.
+
+Next up:
+* Per-shape drill-down (`mdbkit queries --shape N` with full detail).
+* `serverStatus` snapshot digest for triage (two snapshots for true rates).
+* Graduating the remaining beta detectors (checkpoints, eviction, flow
+  control) once validated against real incident logs — see
+  `docs/TESTING-PLAYBOOK.md`. Real logs very welcome.
 
 mdbkit is validated against real-world structured logs (tens of thousands of
 lines) in addition to its synthetic test fixtures.

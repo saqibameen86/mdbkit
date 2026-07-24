@@ -532,8 +532,102 @@ def sysprobe(dbpath_from_log: Optional[str],
 
 # ------------------------------------------------------------------ run ----
 
+def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
+    """Turn decoded FTDC metrics into triage findings.
+
+    FTDC is MongoDB's own flight recorder: it already holds CPU, memory,
+    cache and connection history for every node, with no monitoring stack
+    installed. This reads it offline.
+    """
+    from .ftdc import FtdcReader, ftdc_files
+    out: List[Finding] = []
+    files = ftdc_files(path)
+    if not files:
+        return [Finding("INFO", "FTDC", "No metrics.* files found at %s." % path)]
+    reader = FtdcReader().read(path, ts_from=ts_from, ts_to=ts_to)
+    if reader.chunks == 0:
+        return [Finding("INFO", "FTDC",
+                        "Found %d file(s) but decoded no metric chunks." %
+                        len(files))]
+
+    span = ""
+    if reader.first_ts and reader.last_ts:
+        span = " (%s -> %s)" % (reader.first_ts.strftime("%H:%M"),
+                                reader.last_ts.strftime("%H:%M"))
+    out.append(Finding(
+        "INFO", "FTDC metrics",
+        "Decoded %d chunk(s), %d sample(s) from %d file(s)%s." % (
+            reader.chunks, reader.samples, len(files), span)))
+
+    pct = reader.cache_pct()
+    if pct is not None:
+        sev = "CRIT" if pct >= 95 else "WARN" if pct >= 90 else "OK"
+        out.append(Finding(
+            sev, "WiredTiger cache",
+            "Peak usage %.0f%% of configured maximum." % pct,
+            next_step="" if sev == "OK" else
+            "Sustained pressure above 95%% forces application threads to "
+            "evict, which shows up as slow queries."))
+
+    conns = reader.series.get("conns.current")
+    if conns and conns.values:
+        avail = reader.series.get("conns.available")
+        detail = "peak %d concurrent, last %d." % (max(conns.values),
+                                                   conns.values[-1])
+        sev = "OK"
+        if avail and avail.values:
+            total = max(conns.values) + min(avail.values)
+            used_pct = 100.0 * max(conns.values) / max(1, total)
+            detail = ("peak %d of ~%d available (%.0f%%)." %
+                      (max(conns.values), total, used_pct))
+            sev = "WARN" if used_pct >= 80 else "OK"
+        out.append(Finding(sev, "Connections (FTDC)", detail))
+
+    for label, title in (("queue.readers", "Read queue"),
+                         ("queue.writers", "Write queue")):
+        s_ = reader.series.get(label)
+        if s_ and s_.values and max(s_.values) > 0:
+            peak = max(s_.values)
+            sev = "WARN" if peak >= 10 else "INFO"
+            out.append(Finding(
+                sev, title + " (FTDC)",
+                "Peak %d operation(s) queued waiting for a lock/ticket." % peak,
+                next_step="" if sev == "INFO" else
+                "Queueing means the server ran out of capacity — correlate "
+                "with the slow-query peak above."))
+
+    mem = reader.series.get("mem.residentMB")
+    if mem and mem.values:
+        out.append(Finding("INFO", "mongod memory (FTDC)",
+                           "Resident peak %.1f GiB." % (max(mem.values) / 1024.0)))
+
+    for label, title in (("sys.cpu.iowaitMs", "CPU iowait (FTDC)"),
+                         ("sys.cpu.userMs", "CPU user (FTDC)")):
+        r = reader.rate(label)
+        if r is not None and r > 0:
+            pct_cpu = r / 10.0  # ms/s across all cores -> rough %
+            sev = ("WARN" if label.endswith("iowaitMs") and pct_cpu > 20
+                   else "INFO")
+            out.append(Finding(
+                sev, title, "~%.0f%% of one core equivalent." % pct_cpu,
+                next_step="" if sev == "INFO" else
+                "High iowait points at disk saturation rather than CPU."))
+
+    rates = []
+    for label in ("ops.query", "ops.insert", "ops.update", "ops.delete",
+                  "ops.getmore", "ops.command"):
+        r = reader.rate(label)
+        if r is not None and r >= 1:
+            rates.append("%s ~%.0f/s" % (label.split(".")[1], r))
+    if rates:
+        out.append(Finding("INFO", "Throughput (FTDC)",
+                           "Average over the window: " + ", ".join(rates) + "."))
+    return out
+
+
 def run_triage(logfile: str, window_min: Optional[int] = None,
-               dbpath: Optional[str] = None, no_sysprobe: bool = False):
+               dbpath: Optional[str] = None, no_sysprobe: bool = False,
+               ftdc_path: Optional[str] = None):
     """Analyze the last `window_min` minutes of log time (default 60).
 
     window_min=0 analyzes the whole file.
@@ -559,12 +653,17 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
     findings = engine.findings()
     if not no_sysprobe:
         findings += sysprobe(engine.dbpath, explicit=dbpath)
+    if ftdc_path:
+        try:
+            findings += ftdc_findings(ftdc_path, ts_from=cutoff)
+        except Exception as exc:  # never let metrics break log triage
+            findings.append(Finding("INFO", "FTDC unavailable", str(exc)[:200]))
     findings.sort(key=lambda f: SEV_ORDER.get(f.severity, 9))
     return findings, stats, cutoff
 
 
 def render_triage(findings: List[Finding], stats: ParseStats, cutoff) -> str:
-    parts = ["== mdbkit triage (beta) =="]
+    parts = ["== mdbkit triage: what happened recently? =="]
     if stats.first_ts and stats.last_ts:
         start = cutoff or stats.first_ts
         parts.append("window: %s -> %s   (%s lines scanned)" % (
@@ -584,8 +683,8 @@ def render_triage(findings: List[Finding], stats: ParseStats, cutoff) -> str:
     parts.append("")
     parts.append("Window defaults to the last 60 minutes of log time "
                  "(--window N, or --window 0 for the whole file).")
-    parts.append("beta detectors (elections/checkpoints/eviction/flow-control) "
-                 "are pattern-matched pending broader validation.")
+    parts.append("Checkpoint, eviction and flow-control detectors are marked "
+                 "[beta] and pending validation against real incident logs.")
     parts.append("mdbkit is read-only: it never runs commands against your "
                  "cluster. Review every next step before acting.")
     return "\n".join(parts)
