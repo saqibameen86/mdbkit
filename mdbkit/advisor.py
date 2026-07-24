@@ -148,7 +148,10 @@ def advise(
     indexes: Optional[Dict[str, List[dict]]] = None,
     schema: Optional[Dict[str, dict]] = None,
     min_count: int = 1,
+    single_sample: bool = False,
 ) -> List[Recommendation]:
+    """single_sample=True when analyzing one explain document: the shape is
+    seen once by construction, so the 'seen only once' caveat is noise."""
     indexes = indexes or {}
     schema = schema or {}
     recs: List[Recommendation] = []
@@ -221,11 +224,17 @@ def advise(
             confidence = "medium"
         else:
             confidence = "low"
-        if stats.count < 3:
+        if stats.count < 3 and not single_sample:
             confidence = "low" if confidence == "medium" else confidence
             caveats.append(
                 f"Shape seen only {stats.count} time(s); confirm it is recurring "
                 "before creating an index for it."
+            )
+        elif single_sample:
+            caveats.append(
+                "Based on a single explain document — confirm this query shape "
+                "is frequent enough to justify an index "
+                "(mdbkit queries <log> --ns %s)." % shape.ns
             )
 
         # Flags from the shape.

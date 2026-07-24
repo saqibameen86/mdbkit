@@ -34,15 +34,14 @@ implementing a design doc in this folder MUST honor these principles.
 
 * **v0.1 (shipped)** — structured log toolkit: loginfo, queries,
   connections, filter, advise, explain, export-script.
-* **v0.2** — the incident release:
+* **v0.2 (shipped)** — the incident release:
   * FTDC decoder (`DESIGN-ftdc.md`) — offline metrics from diagnostic.data,
     including system CPU/memory/disk that FTDC already records.
   * Triage command (`DESIGN-triage.md`) — one-command incident snapshot:
     log detectors + local OS probes + optional serverStatus digest + hot
     collection ranking.
   * Election/failover timeline (part of triage design).
-* **v0.3** — shareable reports (`DESIGN-reports.md`): Markdown/HTML export
-  of any analysis, self-contained, offline.
+* **v0.3 (shipped early, in v0.2)** — shareable Markdown/HTML reports.
 * **Later / separate product** — GUI control plane, continuous backup
   health, scheduling (the commercial platform). The CLI stays free and
   fully functional forever; it is the trust anchor, not a crippled demo.

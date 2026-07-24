@@ -189,3 +189,111 @@ def render_recommendations(recs: List[Recommendation], stats: ParseStats,
     parts.append("These are CANDIDATES, not commands. Review, test on staging, and "
                   "watch write latency and index build impact before production.")
     return "\n".join(parts)
+
+
+# ----------------------------------------------------------------- FTDC ----
+
+def _human(n: float, label: str = "") -> str:
+    """Format an FTDC value, honouring the unit implied by its label.
+
+    Only byte-valued metrics get binary-prefix formatting; a metric already
+    expressed in KB or MB must not be re-scaled as if it were bytes.
+    """
+    low = label.lower()
+    if low.endswith("bytes"):
+        if n >= 2 ** 30:
+            return "%.1f GiB" % (n / 2 ** 30)
+        if n >= 2 ** 20:
+            return "%.1f MiB" % (n / 2 ** 20)
+        if n >= 1024:
+            return "%.1f KiB" % (n / 1024.0)
+        return "%.0f B" % n
+    if low.endswith("kb"):
+        return "%.1f GiB" % (n / 1048576.0) if n >= 1048576 else \
+               "%.1f MiB" % (n / 1024.0)
+    if low.endswith("mb"):
+        return "%.1f GiB" % (n / 1024.0) if n >= 1024 else "%.0f MiB" % n
+    if low.endswith("ms"):
+        return "%.1f s" % (n / 1000.0) if n >= 1000 else "%.0f ms" % n
+    return "{:,.0f}".format(n)
+
+
+def render_ftdc_summary(reader, file_count: int) -> str:
+    parts = ["== mdbkit ftdc summary =="]
+    span = ""
+    if reader.first_ts and reader.last_ts:
+        span = "  %s -> %s" % (reader.first_ts.strftime("%Y-%m-%d %H:%M"),
+                               reader.last_ts.strftime("%H:%M"))
+    parts.append("files: %d   chunks: %d   samples: %s%s" % (
+        file_count, reader.chunks, format(reader.samples, ","), span))
+    if reader.errors:
+        parts.append("corrupt/skipped chunks: %d" % reader.errors)
+    parts.append("")
+    if not reader.series:
+        parts.append("No curated metrics found. The file decoded but none of "
+                     "the expected serverStatus/systemMetrics paths were "
+                     "present — try `mdbkit ftdc export` to see raw metrics.")
+        return "\n".join(parts)
+
+    rows = []
+    for label in sorted(reader.series):
+        s = reader.series[label]
+        st = s.stats()
+        if not st:
+            continue
+        rate = reader.rate(label) if s.kind == "counter" else None
+        rows.append((
+            label,
+            _human(st["min"], label),
+            _human(st["avg"], label),
+            _human(st["max"], label),
+            _human(st["last"], label),
+            "%.1f/s" % rate if rate is not None else "-",
+        ))
+    parts.append(_table(["metric", "min", "avg", "max", "last", "rate"], rows))
+
+    pct = reader.cache_pct()
+    if pct is not None:
+        parts.append("")
+        parts.append("WiredTiger cache peak: %.0f%% of configured maximum" % pct)
+    parts.append("")
+    parts.append("FTDC is MongoDB's own always-on recorder: these numbers were "
+                 "already on disk, no monitoring agent required.")
+    return "\n".join(parts)
+
+
+def render_ftdc_timeline(reader, step: int = 60) -> str:
+    parts = ["== mdbkit ftdc timeline ==", ""]
+    if not reader.series:
+        parts.append("No metrics decoded.")
+        return "\n".join(parts)
+    labels = sorted(reader.series)
+    base = reader.series[labels[0]]
+    if not base.times:
+        parts.append("No samples.")
+        return "\n".join(parts)
+
+    buckets = {}
+    order = []
+    for i, t in enumerate(base.times):
+        key = int(t.timestamp() // step) * step
+        if key not in buckets:
+            buckets[key] = {}
+            order.append(key)
+        for lb in labels:
+            vals = reader.series[lb].values
+            if i < len(vals):
+                buckets[key].setdefault(lb, []).append(vals[i])
+
+    from datetime import datetime, timezone
+    rows = []
+    for key in order:
+        row = [datetime.fromtimestamp(key, tz=timezone.utc).strftime("%H:%M")]
+        for lb in labels:
+            vals = buckets[key].get(lb) or []
+            row.append(_human(max(vals), lb) if vals else "-")
+        rows.append(row)
+    parts.append(_table(["time"] + labels, rows))
+    parts.append("")
+    parts.append("Each row is the peak within a %ds bucket." % step)
+    return "\n".join(parts)
