@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -156,7 +156,8 @@ def numeric_metrics(doc: dict, prefix: str = "",
 # -------------------------------------------------------------- codec ------
 
 def read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
-    """Unsigned LEB128."""
+    """Unsigned LEB128. Kept for tests and external callers; the hot decode
+    path inlines this rather than paying the call overhead 4M times."""
     result = 0
     shift = 0
     n = len(buf)
@@ -172,35 +173,114 @@ def read_varint(buf: bytes, pos: int) -> Tuple[int, int]:
     raise BsonError("truncated varint")
 
 
-def decode_metrics(buf: bytes, metric_count: int, sample_count: int,
-                   base: List[int]) -> List[List[int]]:
-    """Decode the column-major delta/RLE/varint array.
+def decode_selective(buf: bytes, metric_count: int, sample_count: int,
+                     base: List[int],
+                     wanted: Optional[set] = None) -> Dict[int, List[int]]:
+    """Decode the column-major delta/RLE/varint block.
 
-    Returns metric_count rows of sample_count values (absolute, not deltas).
+    `wanted` limits which metric columns are materialised. The stream is
+    sequential so every varint must still be consumed, but skipping the
+    arithmetic and list building for unwanted columns is the difference
+    between minutes and seconds: a real serverStatus chunk carries a few
+    thousand metrics and a curated view needs about twenty of them.
+
+    Returns {metric_index: [values]} for the wanted columns only.
     """
+    out: Dict[int, List[int]] = {}
     pos = 0
     n = len(buf)
-    rows: List[List[int]] = []
-    zeros_left = 0
+    zeros = 0                      # pending zero-deltas, may span metrics
+    nbase = len(base)
+    want_all = wanted is None
+
     for m in range(metric_count):
-        value = base[m] if m < len(base) else 0
-        row: List[int] = []
-        for _ in range(sample_count):
-            if zeros_left > 0:
-                zeros_left -= 1
-                delta = 0
-            elif pos >= n:
-                delta = 0
-            else:
-                delta, pos = read_varint(buf, pos)
-                if delta == 0:
-                    if pos < n:
-                        extra, pos = read_varint(buf, pos)
-                        zeros_left = extra
-            value = (value + delta) & MASK64
-            row.append(value)
-        rows.append(row)
-    return rows
+        left = sample_count
+        if want_all or m in wanted:
+            value = base[m] if m < nbase else 0
+            row: List[int] = []
+            append = row.append
+            extend = row.extend
+            while left:
+                if zeros:
+                    take = zeros if zeros < left else left
+                    zeros -= take
+                    left -= take
+                    extend([value] * take)
+                    continue
+                if pos >= n:
+                    extend([value] * left)
+                    break
+                b = buf[pos]
+                pos += 1
+                if b == 0:
+                    # zero delta, followed by a count of additional zeros
+                    run = 0
+                    shift = 0
+                    while pos < n:
+                        c = buf[pos]
+                        pos += 1
+                        run |= (c & 0x7F) << shift
+                        if c < 0x80:
+                            break
+                        shift += 7
+                    zeros = run
+                    left -= 1
+                    append(value)
+                    continue
+                if b < 0x80:
+                    delta = b
+                else:
+                    delta = b & 0x7F
+                    shift = 7
+                    while pos < n:
+                        c = buf[pos]
+                        pos += 1
+                        delta |= (c & 0x7F) << shift
+                        if c < 0x80:
+                            break
+                        shift += 7
+                value = (value + delta) & MASK64
+                left -= 1
+                append(value)
+            out[m] = row
+        else:
+            # Skip path: consume varints, touch nothing else.
+            while left:
+                if zeros:
+                    take = zeros if zeros < left else left
+                    zeros -= take
+                    left -= take
+                    continue
+                if pos >= n:
+                    break
+                b = buf[pos]
+                pos += 1
+                if b == 0:
+                    run = 0
+                    shift = 0
+                    while pos < n:
+                        c = buf[pos]
+                        pos += 1
+                        run |= (c & 0x7F) << shift
+                        if c < 0x80:
+                            break
+                        shift += 7
+                    zeros = run
+                elif b >= 0x80:
+                    # multi-byte varint: a canonical encoder never writes a
+                    # multi-byte zero, so no run can follow
+                    while pos < n and buf[pos] >= 0x80:
+                        pos += 1
+                    pos += 1
+                left -= 1
+    return out
+
+
+def decode_metrics(buf: bytes, metric_count: int, sample_count: int,
+                   base: List[int]) -> List[List[int]]:
+    """Decode every column. Convenience wrapper over decode_selective."""
+    got = decode_selective(buf, metric_count, sample_count, base, None)
+    return [got.get(m, []) for m in range(metric_count)]
 
 
 # ------------------------------------------------------------- reader ------
@@ -233,8 +313,24 @@ def iter_documents(path: str) -> Iterator[dict]:
         yield doc
 
 
-def decode_chunk(doc: dict) -> Optional[Chunk]:
-    """Decode one type-1 metrics document into a Chunk."""
+def chunk_timestamp(doc: dict) -> Optional[datetime]:
+    """Timestamp of a metrics document, without decompressing it.
+
+    Lets callers skip whole chunks outside their window before paying for
+    zlib and the delta decode — the single biggest win when triaging the
+    last hour of a multi-hundred-megabyte diagnostic.data.
+    """
+    ts = doc.get("_id")
+    return _to_dt(ts) if isinstance(ts, int) else None
+
+
+def decode_chunk(doc: dict, wanted_paths: Optional[set] = None
+                 ) -> Optional[Chunk]:
+    """Decode one type-1 metrics document.
+
+    `wanted_paths` restricts which metric columns are materialised; the
+    returned Chunk then carries only those (rows aligned to paths).
+    """
     blob = doc.get("data")
     if not isinstance(blob, (bytes, bytearray)) or len(blob) < 8:
         return None
@@ -249,17 +345,27 @@ def decode_chunk(doc: dict) -> Optional[Chunk]:
     paths = [p for p, _ in leaves]
     base = [v for _, v in leaves]
     if metric_count != len(paths):
-        # Schema/parse mismatch: trust the file, pad or trim names.
         if metric_count < len(paths):
             paths, base = paths[:metric_count], base[:metric_count]
         else:
             extra = metric_count - len(paths)
             paths += ["_unknown.%d" % i for i in range(extra)]
             base += [0] * extra
-    rows = decode_metrics(raw[pos:], metric_count, sample_count, base)
-    # Prepend the reference sample so the chunk holds sample_count+1 samples.
-    rows = [[base[i]] + rows[i] for i in range(metric_count)]
-    return Chunk(ts=_to_dt(doc.get("_id", 0) or 0), paths=paths, rows=rows)
+
+    if wanted_paths is None:
+        wanted_idx = None
+        keep = list(range(metric_count))
+    else:
+        keep = [i for i, p in enumerate(paths) if p in wanted_paths]
+        wanted_idx = set(keep)
+        if not keep:
+            return Chunk(ts=_to_dt(doc.get("_id", 0) or 0), paths=[], rows=[])
+
+    got = decode_selective(raw[pos:], metric_count, sample_count, base,
+                           wanted_idx)
+    rows = [[base[i]] + got.get(i, []) for i in keep]
+    return Chunk(ts=_to_dt(doc.get("_id", 0) or 0),
+                 paths=[paths[i] for i in keep], rows=rows)
 
 
 def iter_chunks(path: str) -> Iterator[Chunk]:
@@ -326,53 +432,114 @@ CURATED: List[Tuple[str, str, str]] = [
 
 @dataclass
 class Series:
+    """Streaming statistics for one metric.
+
+    Full sample history is only retained when `keep_values` is on. Over a
+    250 MB diagnostic.data a single metric can carry millions of samples,
+    so the CLI computes min/avg/max/rate incrementally and never holds the
+    series in memory.
+    """
     label: str
     path: str
     kind: str
-    times: List[datetime]
-    values: List[int]
+    times: List[datetime] = field(default_factory=list)
+    values: List[int] = field(default_factory=list)
+    n: int = 0
+    vmin: Optional[int] = None
+    vmax: Optional[int] = None
+    total: int = 0
+    first: Optional[int] = None
+    last: Optional[int] = None
+    first_ts: Optional[datetime] = None
+    last_ts: Optional[datetime] = None
+
+    def observe(self, vals: List[int], t0: Optional[datetime],
+                t1: Optional[datetime]):
+        if not vals:
+            return
+        lo = min(vals)
+        hi = max(vals)
+        self.vmin = lo if self.vmin is None else (lo if lo < self.vmin else self.vmin)
+        self.vmax = hi if self.vmax is None else (hi if hi > self.vmax else self.vmax)
+        self.total += sum(vals)
+        self.n += len(vals)
+        if self.first is None:
+            self.first = vals[0]
+            self.first_ts = t0
+        self.last = vals[-1]
+        self.last_ts = t1
 
     def stats(self) -> Dict[str, float]:
-        if not self.values:
+        if not self.n:
             return {}
-        return {"min": min(self.values), "max": max(self.values),
-                "avg": sum(self.values) / float(len(self.values)),
-                "last": self.values[-1]}
+        return {"min": self.vmin, "max": self.vmax,
+                "avg": self.total / float(self.n), "last": self.last}
 
 
 class FtdcReader:
-    """Streaming reader that collects curated (or requested) series."""
+    """Streaming reader over one file or a diagnostic.data directory.
+
+    Only the curated (or explicitly requested) metrics are decoded, and by
+    default no per-sample history is retained.
+    """
 
     def __init__(self, wanted: Optional[List[str]] = None,
-                 sample_secs: int = 1):
+                 sample_secs: int = 1, keep_values: bool = True,
+                 on_chunk=None, progress=None):
         self.wanted = wanted
         self.sample_secs = sample_secs
+        self.keep_values = keep_values
+        self.on_chunk = on_chunk          # callback(times, {label: values})
+        self.progress = progress          # callback(files_done, files_total)
         self.series: Dict[str, Series] = {}
         self.chunks = 0
         self.samples = 0
         self.errors = 0
+        self.skipped = 0                  # chunks outside the time window
         self.first_ts: Optional[datetime] = None
         self.last_ts: Optional[datetime] = None
         self.host: Optional[str] = None
         self.version: Optional[str] = None
+        self._plan: Optional[List[Tuple[str, str, str]]] = None
+        self._paths: Optional[set] = None
 
-    def _select(self, paths: List[str]) -> List[Tuple[str, str, str, int]]:
+    # -- metric selection -------------------------------------------------
+    def _wanted_paths(self) -> set:
+        if self._paths is None:
+            if self.wanted:
+                keep = set(self.wanted)
+                paths = {p for lb, p, _k in CURATED if lb in keep}
+                paths |= {w for w in self.wanted if "." in w and w not in
+                          {lb for lb, _p, _k in CURATED}}
+            else:
+                paths = {p for _lb, p, _k in CURATED}
+            self._paths = paths
+        return self._paths
+
+    def _plan_for(self, paths: List[str]) -> List[Tuple[str, str, str]]:
+        """Map the chunk's path list onto (label, kind, index)."""
         index = {p: i for i, p in enumerate(paths)}
         chosen = []
         for label, path, kind in CURATED:
             if self.wanted and label not in self.wanted:
                 continue
             if path in index:
-                chosen.append((label, path, kind, index[path]))
+                chosen.append((label, kind, index[path]))
         if self.wanted:
+            known = {lb for lb, _p, _k in CURATED}
             for w in self.wanted:
-                if w in index and not any(c[0] == w for c in chosen):
-                    chosen.append((w, w, "gauge", index[w]))
+                if w in index and w not in known:
+                    chosen.append((w, "gauge", index[w]))
         return chosen
 
+    # -- reading ----------------------------------------------------------
     def read(self, path: str, ts_from: Optional[datetime] = None,
              ts_to: Optional[datetime] = None) -> "FtdcReader":
-        for f in ftdc_files(path):
+        files = ftdc_files(path)
+        wanted_paths = self._wanted_paths()
+        for i, f in enumerate(files):
+            if self.progress:
+                self.progress(i, len(files))
             for doc in iter_documents(f):
                 dtype = doc.get("type")
                 if dtype == 0:
@@ -380,18 +547,25 @@ class FtdcReader:
                     continue
                 if dtype != 1:
                     continue
+                # Cheap window check before zlib + delta decode.
+                cts = chunk_timestamp(doc)
+                if cts is not None:
+                    if ts_from and cts < ts_from:
+                        self.skipped += 1
+                        continue
+                    if ts_to and cts > ts_to:
+                        self.skipped += 1
+                        continue
                 try:
-                    chunk = decode_chunk(doc)
+                    chunk = decode_chunk(doc, wanted_paths)
                 except (BsonError, zlib.error, struct.error, ValueError):
                     self.errors += 1
                     continue
-                if chunk is None:
-                    continue
-                if ts_from and chunk.ts < ts_from:
-                    continue
-                if ts_to and chunk.ts > ts_to:
+                if chunk is None or not chunk.rows:
                     continue
                 self._absorb(chunk)
+        if self.progress:
+            self.progress(len(files), len(files))
         return self
 
     def _meta(self, doc: dict):
@@ -401,7 +575,7 @@ class FtdcReader:
                 continue
             hi = coll.get("hostinfo") or coll.get("system")
             if isinstance(hi, dict) and not self.host:
-                self.host = hi.get("hostname") or hi.get("currentTime")
+                self.host = hi.get("hostname")
             bi = coll.get("buildInfo") or coll
             if isinstance(bi, dict) and not self.version:
                 v = bi.get("version")
@@ -410,45 +584,59 @@ class FtdcReader:
 
     def _absorb(self, chunk: Chunk):
         self.chunks += 1
-        chosen = self._select(chunk.paths)
+        plan = self._plan_for(chunk.paths)
         n = chunk.sample_count
+        if not n:
+            return
         self.samples += n
-        # FTDC samples default to one per second.
-        times = [datetime.fromtimestamp(
-            chunk.ts.timestamp() + i * self.sample_secs, tz=timezone.utc)
-            for i in range(n)]
+        step = self.sample_secs
+        t0s = chunk.ts.timestamp()
+        t0 = chunk.ts
+        t1 = datetime.fromtimestamp(t0s + (n - 1) * step, tz=timezone.utc)
         if self.first_ts is None:
-            self.first_ts = times[0] if times else chunk.ts
-        if times:
-            self.last_ts = times[-1]
-        for label, path, kind, idx in chosen:
-            series = self.series.get(label)
-            if series is None:
-                series = self.series[label] = Series(label, path, kind, [], [])
-            series.times.extend(times)
-            series.values.extend(chunk.rows[idx])
+            self.first_ts = t0
+        self.last_ts = t1
+
+        emit = {} if self.on_chunk else None
+        for label, kind, idx in plan:
+            vals = chunk.rows[idx]
+            s = self.series.get(label)
+            if s is None:
+                s = self.series[label] = Series(label, label, kind)
+            s.observe(vals, t0, t1)
+            if self.keep_values:
+                s.values.extend(vals)
+                s.times.extend(
+                    datetime.fromtimestamp(t0s + i * step, tz=timezone.utc)
+                    for i in range(n))
+            if emit is not None:
+                emit[label] = vals
+        if self.on_chunk:
+            times = [datetime.fromtimestamp(t0s + i * step, tz=timezone.utc)
+                     for i in range(n)]
+            self.on_chunk(times, emit)
 
     # -- derived views ----------------------------------------------------
     def rate(self, label: str) -> Optional[float]:
-        """Average per-second rate for a counter series."""
         s = self.series.get(label)
-        if not s or len(s.values) < 2:
+        if not s or s.first is None or s.last is None or s.n < 2:
             return None
-        span = (s.times[-1] - s.times[0]).total_seconds() or 1.0
-        return (s.values[-1] - s.values[0]) / span
+        if not s.first_ts or not s.last_ts:
+            return None
+        span = (s.last_ts - s.first_ts).total_seconds() or 1.0
+        return (s.last - s.first) / span
 
     def cache_pct(self) -> Optional[float]:
         used = self.series.get("cache.usedBytes")
         mx = self.series.get("cache.maxBytes")
-        if not used or not mx or not used.values or not mx.values:
+        if not used or not mx or used.vmax is None or not mx.vmax:
             return None
-        peak = max(mx.values) or 1
-        return 100.0 * max(used.values) / peak
+        return 100.0 * used.vmax / mx.vmax
 
     def summary(self) -> dict:
         out = {
             "chunks": self.chunks, "samples": self.samples,
-            "corruptChunks": self.errors,
+            "corruptChunks": self.errors, "skippedChunks": self.skipped,
             "from": self.first_ts.isoformat() if self.first_ts else None,
             "to": self.last_ts.isoformat() if self.last_ts else None,
             "series": {},

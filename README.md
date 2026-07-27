@@ -271,7 +271,7 @@ query with different parameters is counted once.
 | `--limit N` | all | Show only the top N shapes |
 | `--min-ms N` | 0 | Ignore operations faster than N milliseconds |
 | `--include-system` | off | Include internal `admin`/`config`/`local` namespaces (hidden by default — they are server housekeeping, not your workload) |
-| `--report FILE` | | Write a shareable `.md` or `.html` report instead |
+| `--report FILE` | | Write a shareable `.md` or `.html` report instead (see [Shareable reports](#shareable-reports----report-file)) |
 | `--json` | | Machine-readable output |
 
 **Reading the columns:**
@@ -476,10 +476,20 @@ not encrypted; mdbkit decodes it offline.
 
 | Option | Default | Description |
 |---|---|---|
+| `--last DURATION` | `4h` | Analyze only the most recent window — `90m`, `4h`, `2d` |
+| `--all` | off | Analyze the entire history (see the performance note below) |
 | `--metric LABEL` | all | Restrict to one metric (repeatable), e.g. `--metric conns.current` |
 | `--step SECONDS` | 60 | Timeline bucket size |
-| `--from` / `--to` | | Time bounds (same formats as `filter`) |
+| `--from` / `--to` | | Explicit time bounds (same formats as `filter`) |
 | `--json` | | Machine-readable output |
+
+**Performance note.** `diagnostic.data` can hold weeks of per-second samples —
+a few hundred megabytes covering thousands of chunks and several thousand
+metrics each. Decoding all of it is CPU-bound and takes minutes, so these
+commands **default to the last 4 hours** and skip older chunks before
+decompressing them. On a 250 MB directory that is the difference between about
+a second and about a minute. Use `--last`/`--from`/`--to` to move the window,
+and `--all` when you really do want the whole history.
 
 ```bash
 mdbkit ftdc summary /var/lib/mongodb/diagnostic.data
@@ -494,6 +504,47 @@ Metric labels include `ops.*` (insert/query/update/delete/getmore/command),
 
 The data directory can be copied off the host and analyzed elsewhere — it
 contains metrics only, never document contents.
+
+---
+
+### Shareable reports — `--report FILE`
+
+`triage` and `queries` can write a self-contained report instead of printing to
+the terminal — for a ticket, a handover, or a post-incident review.
+
+```bash
+mdbkit triage mongod.log --report incident.html     # styled, self-contained
+mdbkit triage mongod.log --report incident.md       # for tickets and PRs
+mdbkit queries mongod.log --limit 20 --report slow-queries.md
+```
+
+The format follows the file extension: `.html` or `.md`.
+
+Markdown output looks like this:
+
+```markdown
+# MongoDB incident triage
+
+*window 2026-07-01 08:10 -> 09:10  ·  generated 2026-07-01 09:12*
+
+## Findings
+
+- **[CRIT] Replica set instability** — 3 election/stepdown event(s) at 08:41:02, 08:58:14
+    - Starting an election, since we've seen no PRIMARY in election timeout period
+    - *next:* `Correlate with connection storms and slow checkpoints below`
+- **[WARN] Connection storm** — 2 minute(s) at >= 60 new connections/min; peak 480 at 08:41
+    - 10.2.1.7: 312 in the peak minute
+    - *next:* `mdbkit connections <log>`
+- **[OK] Errors** — No error/fatal severity lines in window.
+```
+
+The HTML version carries the same content with a dark, print-friendly
+stylesheet. It is **fully self-contained**: inline CSS, no JavaScript, no
+external assets or CDN references, so it opens on an air-gapped machine and
+sends nothing anywhere.
+
+Reports contain the same information as the terminal output — query **shapes**
+and metrics, never literal values from your documents.
 
 ---
 
