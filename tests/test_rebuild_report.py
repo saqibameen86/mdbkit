@@ -123,3 +123,38 @@ def test_cli_as_explain_and_report(tmp_path, capsys):
     assert main(["triage", FIXTURE, "--no-sysprobe",
                  "--report", str(report)]) == 0
     assert "MongoDB incident triage" in report.read_text()
+
+
+# --------------------------------------------- 0.2.1 regression tests ----
+
+def test_updates_as_int_does_not_crash():
+    """Real staging log crashed with: TypeError: 'int' object is not
+    subscriptable — command['updates'] was a count, not an array."""
+    assert to_mongosh(entry_for({"update": "histories", "updates": 1,
+                                 "$db": "app"})) is None
+    assert to_mongosh(entry_for({"delete": "histories", "deletes": 3,
+                                 "$db": "app"})) is None
+    assert to_mongosh(entry_for({"update": "h", "updates": "weird",
+                                 "$db": "app"})) is None
+
+
+def test_malformed_command_fields_do_not_crash():
+    for cmd in (
+        {"find": "c", "filter": 5, "$db": "d"},
+        {"find": "c", "filter": {"a": 1}, "sort": 3, "$db": "d"},
+        {"find": "c", "filter": {"a": 1}, "projection": "x", "$db": "d"},
+        {"aggregate": "c", "pipeline": 7, "$db": "d"},
+        {"count": "c", "query": 9, "$db": "d"},
+        {"update": "c", "updates": [{"q": 4, "u": {}}], "$db": "d"},
+    ):
+        to_mongosh(entry_for(cmd))  # must not raise
+
+
+def test_emit_never_raises_on_bad_entry():
+    from mdbkit.cli import _emit
+
+    class Boom:
+        raw = "{}"
+        attr = property(lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+
+    assert _emit(Boom(), True, False) is None

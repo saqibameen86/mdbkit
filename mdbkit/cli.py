@@ -96,11 +96,16 @@ def cmd_connections(args) -> int:
     return 0
 
 
-def _emit(entry, as_explain: bool, wrap: bool) -> str:
+def _emit(entry, as_explain: bool, wrap: bool):
+    """Render one matching entry. Never raises: a single odd log line must
+    not abort a filter run over a million-line file."""
     if not as_explain:
         return entry.raw
     from .rebuild import to_mongosh, wrap_for_export
-    cmd = to_mongosh(entry)
+    try:
+        cmd = to_mongosh(entry)
+    except Exception:
+        return None
     if cmd is None:
         return None
     return wrap_for_export(cmd) if wrap else cmd
@@ -243,6 +248,48 @@ def cmd_triage(args) -> int:
     return 0
 
 
+def parse_duration(text: str) -> int:
+    """Parse '90m', '4h', '2d' or a bare number of minutes."""
+    t = text.strip().lower()
+    mult = 1
+    if t.endswith("m"):
+        t = t[:-1]
+    elif t.endswith("h"):
+        t, mult = t[:-1], 60
+    elif t.endswith("d"):
+        t, mult = t[:-1], 1440
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        raise ValueError("could not parse duration %r (try 90m, 4h, 2d)" % text)
+
+
+def _ftdc_window(path, args):
+    """Resolve the time window for an ftdc command.
+
+    diagnostic.data can hold weeks of history; decoding all of it is a
+    minutes-long, CPU-bound job. Commands therefore default to a recent
+    window and skip older chunks before decompressing them.
+    """
+    from .ftdc import ftdc_files, iter_documents, chunk_timestamp
+    from datetime import timedelta
+    ts_from = parse_when(args.ts_from) if args.ts_from else None
+    ts_to = parse_when(args.ts_to) if args.ts_to else None
+    if ts_from or ts_to or getattr(args, "all", False):
+        return ts_from, ts_to, None
+    minutes = parse_duration(args.last) if args.last else 240
+    newest = None
+    for f in ftdc_files(path):
+        for doc in iter_documents(f):
+            if doc.get("type") == 1:
+                t = chunk_timestamp(doc)
+                if t and (newest is None or t > newest):
+                    newest = t
+    if newest is None:
+        return None, None, None
+    return newest - timedelta(minutes=minutes), None, minutes
+
+
 def cmd_ftdc(args) -> int:
     from .ftdc import FtdcReader, ftdc_files
     from .render import render_ftdc_summary, render_ftdc_timeline
@@ -252,10 +299,25 @@ def cmd_ftdc(args) -> int:
               "diagnostic.data directory or a metrics.* file)" % args.path,
               file=sys.stderr)
         return 2
+    try:
+        ts_from, ts_to, win_min = _ftdc_window(args.path, args)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    if win_min:
+        print("note: showing the last %s of recorded metrics "
+              "(--last/--from/--to to change, --all for everything)"
+              % (args.last or "4h"), file=sys.stderr)
+
+    def progress(done, total):
+        if total > 3:
+            print("\rreading FTDC: file %d/%d" % (done, total),
+                  end="" if done < total else "\n", file=sys.stderr)
+
     wanted = args.metric or None
-    reader = FtdcReader(wanted=wanted)
-    ts_from = parse_when(args.ts_from) if args.ts_from else None
-    ts_to = parse_when(args.ts_to) if args.ts_to else None
+    reader = FtdcReader(wanted=wanted, keep_values=False, progress=progress)
+    if args.action in ("timeline", "export"):
+        reader.keep_values = True
     reader.read(args.path, ts_from=ts_from, ts_to=ts_to)
     if reader.chunks == 0:
         print("warning: no metric chunks decoded from %d file(s)" % len(files),
@@ -416,6 +478,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "e.g. --metric conns.current")
     sp.add_argument("--step", type=int, default=60, metavar="SECONDS",
                     help="timeline bucket size (default 60)")
+    sp.add_argument("--last", metavar="DURATION",
+                    help="analyze only the most recent window, e.g. 90m, 4h, "
+                         "2d (default 4h)")
+    sp.add_argument("--all", action="store_true",
+                    help="analyze the entire history — can take minutes and "
+                         "is CPU-bound on a large diagnostic.data")
     sp.add_argument("--from", dest="ts_from", help="ISO timestamp lower bound")
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--json", action="store_true")

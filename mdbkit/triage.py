@@ -544,11 +544,17 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
     files = ftdc_files(path)
     if not files:
         return [Finding("INFO", "FTDC", "No metrics.* files found at %s." % path)]
-    reader = FtdcReader().read(path, ts_from=ts_from, ts_to=ts_to)
+    reader = FtdcReader(keep_values=False).read(path, ts_from=ts_from,
+                                                ts_to=ts_to)
     if reader.chunks == 0:
-        return [Finding("INFO", "FTDC",
-                        "Found %d file(s) but decoded no metric chunks." %
-                        len(files))]
+        detail = "Found %d file(s) but decoded no metric chunks." % len(files)
+        if reader.skipped:
+            detail = ("Found %d file(s), but all %d metric chunks fall outside "
+                      "the triage window — the log and diagnostic.data appear "
+                      "to cover different time ranges. Widen with --window, or "
+                      "inspect the metrics directly with `mdbkit ftdc summary`."
+                      % (len(files), reader.skipped))
+        return [Finding("INFO", "FTDC", detail)]
 
     span = ""
     if reader.first_ts and reader.last_ts:

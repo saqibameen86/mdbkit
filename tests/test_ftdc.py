@@ -264,3 +264,57 @@ def test_truncated_file_stops_cleanly(tmp_path):
     truncated.write_bytes(data[:len(data) // 2])
     reader = FtdcReader().read(str(truncated))
     assert reader.chunks == 0   # nothing usable, but no exception
+
+
+# --------------------------------------------- 0.2.1 performance tests ----
+
+def test_selective_decode_matches_full_decode():
+    """Skipping unwanted columns must not shift the stream: the values of
+    the columns we do keep have to be identical either way."""
+    from mdbkit.ftdc import decode_selective
+    deltas = [3, 0, 0, 5,   0, 0, 0, 0,   7, 2, 0, 1]  # 3 metrics x 4 samples
+    buf = rle_varint(deltas)
+    base = [10, 20, 30]
+    full = decode_metrics(buf, 3, 4, base)
+    part = decode_selective(buf, 3, 4, base, {2})
+    assert part[2] == full[2]
+    part0 = decode_selective(buf, 3, 4, base, {0})
+    assert part0[0] == full[0]
+
+
+def test_chunk_timestamp_without_decompressing(tmp_path):
+    from mdbkit.ftdc import chunk_timestamp, iter_documents
+    path = build_ftdc_file(tmp_path, [
+        {"insert": 1, "query": 1, "current": 1},
+        {"insert": 2, "query": 2, "current": 2},
+    ])
+    docs = [d for d in iter_documents(path) if d.get("type") == 1]
+    assert docs
+    ts = chunk_timestamp(docs[0])
+    assert ts is not None and ts.year >= 2023
+
+
+def test_time_window_skips_chunks_before_decode(tmp_path):
+    from datetime import timedelta
+    path = build_ftdc_file(tmp_path, [
+        {"insert": 1, "query": 1, "current": 1},
+        {"insert": 2, "query": 2, "current": 2},
+    ])
+    r = FtdcReader(keep_values=False).read(path)
+    assert r.chunks == 1 and r.skipped == 0
+    far_future = r.last_ts + timedelta(days=365)
+    r2 = FtdcReader(keep_values=False).read(path, ts_from=far_future)
+    assert r2.chunks == 0 and r2.skipped == 1
+
+
+def test_streaming_stats_without_keeping_values(tmp_path):
+    path = build_ftdc_file(tmp_path, [
+        {"insert": 100, "query": 500, "current": 10},
+        {"insert": 110, "query": 505, "current": 12},
+        {"insert": 125, "query": 505, "current": 9},
+    ])
+    r = FtdcReader(keep_values=False).read(path)
+    s = r.series["conns.current"]
+    assert s.values == []          # nothing retained
+    assert s.vmin == 9 and s.vmax == 12 and s.last == 9
+    assert r.summary()["series"]["conns.current"]["max"] == 12

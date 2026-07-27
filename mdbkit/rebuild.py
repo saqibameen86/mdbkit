@@ -90,12 +90,13 @@ def to_mongosh(entry: LogEntry, explain: bool = True,
     suffix = '.explain("%s")' % verbosity if explain else ""
 
     if "find" in command:
-        parts = [_js(command.get("filter") or {})]
+        filt = command.get("filter")
+        parts = [_js(filt if isinstance(filt, dict) else {})]
         projection = command.get("projection")
-        if projection:
+        if isinstance(projection, dict) and projection:
             parts.append(_js(projection))
         call = "%s.find(%s)" % (base, ", ".join(parts))
-        if command.get("sort"):
+        if isinstance(command.get("sort"), dict) and command["sort"]:
             call += ".sort(%s)" % _js(command["sort"])
         if command.get("skip"):
             call += ".skip(%s)" % command["skip"]
@@ -103,10 +104,13 @@ def to_mongosh(entry: LogEntry, explain: bool = True,
             call += ".limit(%s)" % command["limit"]
         if command.get("hint"):
             call += ".hint(%s)" % _js(command["hint"])
+        # skip/limit are numbers in the log; render only if they are
         return call + suffix
 
     if "aggregate" in command:
-        pipeline = command.get("pipeline") or []
+        pipeline = command.get("pipeline")
+        if not isinstance(pipeline, list):
+            pipeline = []
         opts = {}
         if command.get("allowDiskUse") is not None:
             opts["allowDiskUse"] = command["allowDiskUse"]
@@ -116,7 +120,9 @@ def to_mongosh(entry: LogEntry, explain: bool = True,
         return "%s.aggregate(%s)%s" % (base, args, suffix)
 
     if "count" in command:
-        return "%s.count(%s)%s" % (base, _js(command.get("query") or {}), suffix)
+        qq = command.get("query")
+        return "%s.count(%s)%s" % (base, _js(qq if isinstance(qq, dict) else {}),
+                                   suffix)
 
     if "distinct" in command:
         return '%s.distinct("%s", %s)%s' % (
@@ -128,14 +134,19 @@ def to_mongosh(entry: LogEntry, explain: bool = True,
         return "%s.findAndModify(%s)%s" % (base, _js(spec), suffix)
 
     if "update" in command:
-        updates = command.get("updates") or []
-        first = updates[0] if updates and isinstance(updates[0], dict) else {}
+        # Real logs sometimes carry a count here rather than the array, so
+        # never assume 'updates' is a list of documents.
+        updates = command.get("updates")
+        first = updates[0] if (isinstance(updates, list) and updates
+                               and isinstance(updates[0], dict)) else {}
         if "q" not in first and "q" not in command:
             # Batched write logged at COMMAND level: the per-op predicate
             # lives in the paired WRITE entry, so there is nothing to rebuild.
             return None
         q = first.get("q", command.get("q") or {})
         u = first.get("u", command.get("u") or {})
+        if not isinstance(q, dict):
+            return None
         if explain:
             # explain() on a cursor is the reliable way to see the plan for
             # the update's query predicate.
@@ -145,11 +156,14 @@ def to_mongosh(entry: LogEntry, explain: bool = True,
         return "%s.updateMany(%s, %s)" % (base, _js(q), _js(u))
 
     if "delete" in command:
-        deletes = command.get("deletes") or []
-        first = deletes[0] if deletes and isinstance(deletes[0], dict) else {}
+        deletes = command.get("deletes")
+        first = deletes[0] if (isinstance(deletes, list) and deletes
+                               and isinstance(deletes[0], dict)) else {}
         if "q" not in first and "q" not in command:
             return None
         q = first.get("q", command.get("q") or {})
+        if not isinstance(q, dict):
+            return None
         if explain:
             return "%s.find(%s)%s   // delete predicate" % (base, _js(q), suffix)
         return "%s.deleteMany(%s)" % (base, _js(q))
