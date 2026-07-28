@@ -1,0 +1,567 @@
+"""Aggregation of parsed log entries into DBA-useful summaries.
+
+Three analyses, mirroring the most-used mtools workflows:
+
+* summarize      -> `mdbkit loginfo`  (like mloginfo)
+* QueryAggregator -> `mdbkit queries` (like mloginfo --queries)
+* ConnectionAggregator -> `mdbkit connections` (like mloginfo --connections)
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from .parser import (
+    ID_AUTH_FAIL,
+    ID_AUTH_OK,
+    ID_AUTH_OK_ALT,
+    ID_BUILD_INFO,
+    ID_CLIENT_METADATA,
+    ID_CONN_ACCEPTED,
+    ID_CONN_ENDED,
+    ID_STARTUP,
+    LogEntry,
+)
+
+# ---------------------------------------------------------------------------
+# Query shape extraction
+# ---------------------------------------------------------------------------
+
+# Operators that keep equality semantics for index purposes.
+EQUALITY_OPS = {"$eq", "$in"}
+RANGE_OPS = {"$gt", "$gte", "$lt", "$lte"}
+LOW_SELECTIVITY_OPS = {"$ne", "$nin", "$exists", "$not"}
+SPECIAL_OPS = {"$text", "$where", "$expr", "$geoWithin", "$geoIntersects", "$near", "$nearSphere"}
+
+
+@dataclass(frozen=True)
+class QueryShape:
+    """A literal-free signature of a query: what fields, which operators, what sort."""
+
+    ns: str
+    operation: str
+    filter_fields: Tuple[Tuple[str, Tuple[str, ...]], ...]  # ((path, (ops...)), ...)
+    sort_fields: Tuple[Tuple[str, int], ...]  # ((path, direction), ...)
+    flags: Tuple[str, ...] = ()  # e.g. ("$or", "$text")
+
+    def pretty(self) -> str:
+        parts = []
+        for path, ops in self.filter_fields:
+            parts.append(f"{path}:{'|'.join(o.lstrip('$') for o in ops)}")
+        text = "{" + ", ".join(parts) + "}"
+        if self.sort_fields:
+            text += " sort:{" + ", ".join(f"{p}:{d}" for p, d in self.sort_fields) + "}"
+        if self.flags:
+            text += " [" + ",".join(self.flags) + "]"
+        return text
+
+
+def _walk_filter(node, prefix: str, out: Dict[str, set], flags: set, depth: int = 0):
+    """Recursively collect (field path -> operator set) from a filter document."""
+    if depth > 12 or not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key in ("$and",):
+            if isinstance(value, list):
+                for sub in value:
+                    _walk_filter(sub, prefix, out, flags, depth + 1)
+        elif key in ("$or", "$nor"):
+            flags.add(key)
+            if isinstance(value, list):
+                for sub in value:
+                    _walk_filter(sub, prefix, out, flags, depth + 1)
+        elif key in SPECIAL_OPS:
+            flags.add(key)
+        elif key.startswith("$"):
+            # An operator appearing at document level we don't model; note it.
+            flags.add(key)
+        else:
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                ops = {op for op in value.keys() if op.startswith("$")}
+                if ops:
+                    out[path].update(ops)
+                    inner = value.get("$elemMatch")
+                    if isinstance(inner, dict):
+                        _walk_filter(inner, path, out, flags, depth + 1)
+                    if "$regex" in ops:
+                        flags.add("$regex")
+                else:
+                    # Sub-document equality match on the whole object.
+                    out[path].add("$eq")
+            else:
+                out[path].add("$eq")
+
+
+def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
+    """Build a QueryShape from a 'Slow query' log entry, or None if not applicable."""
+    attr = entry.attr
+    command = attr.get("command") if isinstance(attr.get("command"), dict) else {}
+    op_type = attr.get("type", "")
+
+    ns = attr.get("ns", "")
+    if (not ns or ns.endswith(".$cmd") or ns.endswith(".")) and command:
+        coll = (command.get("find") or command.get("aggregate")
+                or command.get("update") or command.get("delete")
+                or command.get("insert") or command.get("findAndModify")
+                or command.get("count") or command.get("distinct") or "")
+        db = command.get("$db", "")
+        if db and coll:
+            ns = f"{db}.{coll}"
+
+    filter_doc: dict = {}
+    sort_doc: dict = {}
+    operation = "unknown"
+
+    if "find" in command:
+        operation = "find"
+        filter_doc = command.get("filter") or {}
+        sort_doc = command.get("sort") or {}
+    elif "aggregate" in command:
+        operation = "aggregate"
+        pipeline = command.get("pipeline") or []
+        for stage in pipeline:
+            if not isinstance(stage, dict):
+                continue
+            if "$match" in stage and not filter_doc:
+                filter_doc = stage["$match"] or {}
+            elif "$sort" in stage and not sort_doc:
+                sort_doc = stage["$sort"] or {}
+            elif filter_doc or sort_doc:
+                break  # only leading $match/$sort benefit from an index
+    elif "count" in command:
+        operation = "count"
+        filter_doc = command.get("query") or {}
+    elif "distinct" in command:
+        operation = "distinct"
+        filter_doc = command.get("query") or {}
+    elif "getMore" in command:
+        origin = command.get("originatingCommand")
+        if isinstance(origin, dict):
+            fake = LogEntry(
+                ts=entry.ts, severity=entry.severity, component=entry.component,
+                msg_id=entry.msg_id, ctx=entry.ctx, msg=entry.msg,
+                attr={"ns": ns, "command": origin},
+            )
+            shape = extract_shape(fake)
+            if shape:
+                return QueryShape(shape.ns, "getMore(" + shape.operation + ")",
+                                  shape.filter_fields, shape.sort_fields, shape.flags)
+        operation = "getMore"
+    elif "update" in command and isinstance(command.get("updates"), list):
+        operation = "update"
+        first = command["updates"][0] if command["updates"] else {}
+        if isinstance(first, dict):
+            filter_doc = first.get("q") or {}
+    elif "delete" in command and isinstance(command.get("deletes"), list):
+        operation = "delete"
+        first = command["deletes"][0] if command["deletes"] else {}
+        if isinstance(first, dict):
+            filter_doc = first.get("q") or {}
+    elif op_type in ("update", "remove"):
+        operation = op_type
+        filter_doc = command.get("q") or {}
+    elif "findAndModify" in command:
+        operation = "findAndModify"
+        filter_doc = command.get("query") or {}
+        sort_doc = command.get("sort") or {}
+    elif "insert" in command or op_type == "insert":
+        operation = "insert"
+    elif command:
+        operation = next(iter(command.keys()), "unknown")
+
+    fields: Dict[str, set] = defaultdict(set)
+    flags: set = set()
+    _walk_filter(filter_doc, "", fields, flags)
+
+    filter_fields = tuple(sorted((p, tuple(sorted(ops))) for p, ops in fields.items()))
+    sort_fields = tuple(
+        (k, int(v) if isinstance(v, (int, float)) else 1) for k, v in sort_doc.items()
+    ) if isinstance(sort_doc, dict) else ()
+
+    return QueryShape(ns=ns, operation=operation, filter_fields=filter_fields,
+                      sort_fields=sort_fields, flags=tuple(sorted(flags)))
+
+
+# ---------------------------------------------------------------------------
+# Slow query aggregation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShapeStats:
+    shape: QueryShape
+    count: int = 0
+    durations: List[int] = field(default_factory=list)
+    docs_examined: int = 0
+    keys_examined: int = 0
+    n_returned: int = 0
+    collscan: bool = False
+    in_memory_sort: bool = False
+    plan_summaries: Counter = field(default_factory=Counter)
+    example: str = ""
+
+    def add(self, entry: LogEntry):
+        attr = entry.attr
+        self.count += 1
+        self.durations.append(int(attr.get("durationMillis", 0) or 0))
+        self.docs_examined += int(attr.get("docsExamined", 0) or 0)
+        self.keys_examined += int(attr.get("keysExamined", 0) or 0)
+        n = attr.get("nreturned")
+        if n is None:
+            n = attr.get("nMatched")
+        if n is None:
+            n = attr.get("ndeleted", attr.get("nDeleted"))
+        self.n_returned += int(n or 0)
+        plan = attr.get("planSummary", "")
+        if plan:
+            self.plan_summaries[plan] += 1
+            if "COLLSCAN" in plan:
+                self.collscan = True
+        if attr.get("hasSortStage"):
+            self.in_memory_sort = True
+        if not self.example:
+            self.example = entry.raw[:2000]
+
+    # -- derived metrics ---------------------------------------------------
+    @property
+    def total_ms(self) -> int:
+        return sum(self.durations)
+
+    @property
+    def mean_ms(self) -> float:
+        return self.total_ms / self.count if self.count else 0.0
+
+    @property
+    def max_ms(self) -> int:
+        return max(self.durations) if self.durations else 0
+
+    @property
+    def p95_ms(self) -> int:
+        if not self.durations:
+            return 0
+        ordered = sorted(self.durations)
+        idx = max(0, math.ceil(0.95 * len(ordered)) - 1)
+        return ordered[idx]
+
+    @property
+    def scan_ratio(self) -> float:
+        """docsExamined per document returned — the classic inefficiency signal."""
+        return self.docs_examined / self.n_returned if self.n_returned else float(
+            self.docs_examined or 0
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "ns": self.shape.ns,
+            "operation": self.shape.operation,
+            "shape": self.shape.pretty(),
+            "count": self.count,
+            "totalMs": self.total_ms,
+            "meanMs": round(self.mean_ms, 1),
+            "maxMs": self.max_ms,
+            "p95Ms": self.p95_ms,
+            "docsExamined": self.docs_examined,
+            "keysExamined": self.keys_examined,
+            "nReturned": self.n_returned,
+            "scanRatio": round(self.scan_ratio, 1),
+            "collscan": self.collscan,
+            "inMemorySort": self.in_memory_sort,
+            "planSummaries": dict(self.plan_summaries),
+        }
+
+
+class QueryAggregator:
+    NOISE_OPS = frozenset({
+        "hello", "isMaster", "ismaster", "ping", "endSessions", "saslStart",
+        "saslContinue", "buildInfo", "getParameter", "serverStatus", "getLog",
+        "replSetGetStatus", "connPoolStats", "getCmdLineOpts", "whatsmyuri",
+        "logout", "killCursors", "listCollections", "listIndexes",
+        "listDatabases", "getFreeMonitoringStatus", "dbStats", "collStats",
+        "top", "currentOp", "profile", "hostInfo", "createIndexes",
+        # DDL and internal replication coordination — not workload queries
+        "create", "drop", "dropDatabase", "createUser", "renameCollection",
+        "voteCommitIndexBuild", "voteAbortIndexBuild", "replSetInitiate",
+        "replSetUpdatePosition", "replSetHeartbeat", "_flushRoutingTableCacheUpdates",
+        "appendOplogNote", "setFeatureCompatibilityVersion",
+    })
+
+    # MongoDB-internal databases: their traffic is server housekeeping, not
+    # the user workload a DBA is triaging.
+    SYSTEM_DBS = frozenset({"local", "config", "admin"})
+
+    def __init__(self, min_ms: int = 0, include_system: bool = False):
+        self.min_ms = min_ms
+        self.include_system = include_system
+        self.shapes: Dict[QueryShape, ShapeStats] = {}
+        self.skipped_system = 0
+
+    @classmethod
+    def is_system_ns(cls, ns: str) -> bool:
+        if not ns:
+            return False
+        db = ns.split(".", 1)[0]
+        return db in cls.SYSTEM_DBS or ".system." in ns
+
+    def consume(self, entry: LogEntry):
+        if not entry.is_slow_query:
+            return
+        if int(entry.attr.get("durationMillis", 0) or 0) < self.min_ms:
+            return
+        shape = extract_shape(entry)
+        if shape is None or shape.operation == "insert":
+            return
+        if shape.operation in self.NOISE_OPS and not shape.filter_fields:
+            return
+        if not self.include_system and self.is_system_ns(shape.ns):
+            self.skipped_system += 1
+            return
+        # Batched update/delete at COMMAND level often omits the per-op q;
+        # the paired WRITE entry carries the real shape and metrics.
+        if (shape.operation in ("update", "delete") and not shape.filter_fields
+                and entry.component == "COMMAND"):
+            return
+        stats = self.shapes.get(shape)
+        if stats is None:
+            stats = self.shapes[shape] = ShapeStats(shape=shape)
+        stats.add(entry)
+
+    def results(self, sort_by: str = "totalMs", limit: int = 0) -> List[ShapeStats]:
+        keymap = {
+            "duration": lambda s: s.total_ms,
+            "totalMs": lambda s: s.total_ms,
+            "count": lambda s: s.count,
+            "mean": lambda s: s.mean_ms,
+            "max": lambda s: s.max_ms,
+            "docsExamined": lambda s: s.docs_examined,
+            "scanRatio": lambda s: s.scan_ratio,
+        }
+        key = keymap.get(sort_by, keymap["totalMs"])
+        ordered = sorted(self.shapes.values(), key=key, reverse=True)
+        return ordered[:limit] if limit else ordered
+
+
+# ---------------------------------------------------------------------------
+# Connections
+# ---------------------------------------------------------------------------
+
+def _ip_of(remote: str) -> str:
+    return remote.rsplit(":", 1)[0] if remote else "unknown"
+
+
+@dataclass
+class UserActivity:
+    """What the log knows about one authenticated principal."""
+    user: str
+    auth_db: str = ""
+    successes: int = 0
+    failures: int = 0
+    first_seen: Optional[object] = None
+    last_seen: Optional[object] = None
+    ips: Counter = field(default_factory=Counter)
+    apps: Counter = field(default_factory=Counter)
+    last_error: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "user": self.user, "authDb": self.auth_db,
+            "successes": self.successes, "failures": self.failures,
+            "firstSeen": self.first_seen.isoformat() if self.first_seen else None,
+            "lastSeen": self.last_seen.isoformat() if self.last_seen else None,
+            "sourceIps": dict(self.ips.most_common()),
+            "appNames": dict(self.apps.most_common()),
+            "lastError": self.last_error,
+        }
+
+
+@dataclass
+class ConnectionReport:
+    accepted: Counter = field(default_factory=Counter)
+    ended: Counter = field(default_factory=Counter)
+    app_names: Counter = field(default_factory=Counter)
+    drivers: Counter = field(default_factory=Counter)
+    peak_count: int = 0
+    last_seen: Dict[str, object] = field(default_factory=dict)   # ip -> ts
+    first_seen: Dict[str, object] = field(default_factory=dict)
+    ip_apps: defaultdict = field(default_factory=lambda: defaultdict(Counter))
+    users: Dict[str, UserActivity] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "totalAccepted": sum(self.accepted.values()),
+            "totalEnded": sum(self.ended.values()),
+            "peakConnectionCount": self.peak_count,
+            "byIp": [
+                {"ip": ip, "accepted": n, "ended": self.ended.get(ip, 0),
+                 "appNames": dict(self.ip_apps.get(ip, Counter()).most_common(3)),
+                 "firstSeen": (self.first_seen[ip].isoformat()
+                               if self.first_seen.get(ip) else None),
+                 "lastSeen": (self.last_seen[ip].isoformat()
+                              if self.last_seen.get(ip) else None)}
+                for ip, n in self.accepted.most_common()
+            ],
+            "byUser": [u.to_dict() for u in sorted(
+                self.users.values(),
+                key=lambda x: (x.successes + x.failures), reverse=True)],
+            "appNames": dict(self.app_names.most_common()),
+            "drivers": dict(self.drivers.most_common()),
+        }
+
+
+class ConnectionAggregator:
+    """Connection churn, plus who authenticated and when.
+
+    'Did that user ever connect, and when last?' is one of the first
+    questions during an access incident, and the answer is in the log.
+    """
+
+    AUTH_OK_TEXT = ("authentication succeeded", "successfully authenticated")
+    AUTH_FAIL_TEXT = ("authentication failed",)
+
+    def __init__(self):
+        self.report = ConnectionReport()
+        self._conn_ip: Dict[str, str] = {}   # ctx -> ip, to attribute apps
+
+    def _touch_ip(self, ip: str, ts):
+        if ts is None or not ip:
+            return
+        r = self.report
+        if ip not in r.first_seen:
+            r.first_seen[ip] = ts
+        r.last_seen[ip] = ts
+
+    def _user(self, name: str) -> UserActivity:
+        u = self.report.users.get(name)
+        if u is None:
+            u = self.report.users[name] = UserActivity(user=name)
+        return u
+
+    def consume(self, entry: LogEntry):
+        attr = entry.attr
+        msg_l = entry.msg.lower()
+
+        if entry.msg_id == ID_CONN_ACCEPTED:
+            ip = _ip_of(attr.get("remote", ""))
+            self.report.accepted[ip] += 1
+            self._touch_ip(ip, entry.ts)
+            if entry.attr.get("connectionId") is not None:
+                self._conn_ip["conn%s" % attr.get("connectionId")] = ip
+            self.report.peak_count = max(
+                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
+        elif entry.msg_id == ID_CONN_ENDED:
+            ip = _ip_of(attr.get("remote", ""))
+            self.report.ended[ip] += 1
+            self._touch_ip(ip, entry.ts)
+            self.report.peak_count = max(
+                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
+        elif entry.msg_id == ID_CLIENT_METADATA:
+            doc = attr.get("doc", {}) or {}
+            app = (doc.get("application") or {}).get("name")
+            ip = _ip_of(attr.get("remote", "")) or self._conn_ip.get(entry.ctx, "")
+            if app:
+                self.report.app_names[app] += 1
+                if ip:
+                    self.report.ip_apps[ip][app] += 1
+            driver = (doc.get("driver") or {}).get("name")
+            if driver:
+                self.report.drivers[driver] += 1
+            self._touch_ip(ip, entry.ts)
+        elif (entry.msg_id in (ID_AUTH_OK, ID_AUTH_OK_ALT)
+              or any(t in msg_l for t in self.AUTH_OK_TEXT)):
+            self._auth(entry, ok=True)
+        elif entry.msg_id == ID_AUTH_FAIL or any(
+                t in msg_l for t in self.AUTH_FAIL_TEXT):
+            self._auth(entry, ok=False)
+
+    def _auth(self, entry: LogEntry, ok: bool):
+        attr = entry.attr
+        name = (attr.get("principalName") or attr.get("user")
+                or attr.get("principal") or "")
+        if not name:
+            return
+        u = self._user(str(name))
+        u.auth_db = str(attr.get("authenticationDatabase")
+                        or attr.get("db") or u.auth_db)
+        ip = _ip_of(str(attr.get("remote") or attr.get("client") or ""))
+        if ip:
+            u.ips[ip] += 1
+            app = self.report.ip_apps.get(ip)
+            if app:
+                for a_name, n in app.items():
+                    u.apps[a_name] += 0 if u.apps.get(a_name) else n
+        if entry.ts is not None:
+            if u.first_seen is None:
+                u.first_seen = entry.ts
+            u.last_seen = entry.ts
+        if ok:
+            u.successes += 1
+        else:
+            u.failures += 1
+            err = attr.get("error")
+            if isinstance(err, dict):
+                u.last_error = str(err.get("codeName") or err.get("errmsg") or "")
+            elif err:
+                u.last_error = str(err)[:80]
+
+
+# ---------------------------------------------------------------------------
+# Whole-log summary (loginfo)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LogSummary:
+    versions: List[str] = field(default_factory=list)
+    startups: int = 0
+    host_info: List[str] = field(default_factory=list)
+    severity_counts: Counter = field(default_factory=Counter)
+    component_counts: Counter = field(default_factory=Counter)
+    slow_queries: int = 0
+    slowest_ms: int = 0
+    connections_accepted: int = 0
+    warnings: int = 0
+    errors: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "startups": self.startups,
+            "versions": self.versions,
+            "hosts": self.host_info,
+            "slowQueries": self.slow_queries,
+            "slowestMs": self.slowest_ms,
+            "connectionsAccepted": self.connections_accepted,
+            "warnings": self.warnings,
+            "errors": self.errors,
+            "bySeverity": dict(self.severity_counts),
+            "byComponent": dict(self.component_counts.most_common()),
+        }
+
+
+class SummaryAggregator:
+    def __init__(self):
+        self.summary = LogSummary()
+
+    def consume(self, entry: LogEntry):
+        s = self.summary
+        s.severity_counts[entry.severity] += 1
+        s.component_counts[entry.component] += 1
+        if entry.severity == "W":
+            s.warnings += 1
+        elif entry.severity in ("E", "F"):
+            s.errors += 1
+        if entry.msg_id == ID_STARTUP:
+            s.startups += 1
+            host = entry.attr.get("host")
+            port = entry.attr.get("port")
+            if host:
+                s.host_info.append(f"{host}:{port}" if port else str(host))
+        elif entry.msg_id == ID_BUILD_INFO:
+            version = (entry.attr.get("buildInfo") or {}).get("version")
+            if version and version not in s.versions:
+                s.versions.append(version)
+        elif entry.msg_id == ID_CONN_ACCEPTED:
+            s.connections_accepted += 1
+        if entry.is_slow_query:
+            s.slow_queries += 1
+            s.slowest_ms = max(s.slowest_ms, int(entry.attr.get("durationMillis", 0) or 0))
