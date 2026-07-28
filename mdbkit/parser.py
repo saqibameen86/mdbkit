@@ -27,6 +27,13 @@ ID_CONN_ENDED = 22944
 ID_CLIENT_METADATA = 51800
 ID_STARTUP = 4615611
 ID_BUILD_INFO = 23403
+# Authentication (ACCESS component). MongoDB has used several ids for these
+# across versions, so the aggregator matches on id OR message text.
+ID_AUTH_OK = 20250
+ID_AUTH_OK_ALT = 5286306
+ID_AUTH_FAIL = 20249
+ID_LISTENING = 23016
+ID_SHUTDOWN = 23138
 
 
 @dataclass

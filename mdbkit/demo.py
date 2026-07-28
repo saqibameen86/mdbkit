@@ -21,9 +21,9 @@ from typing import Dict, List, Optional
 SCENARIOS = ("healthy", "incident", "mixed")
 
 APPS = [
-    ("OrderService", "mongo-java-driver|sync", "4.11.0"),
-    ("ReportWorker", "PyMongo", "4.8.0"),
-    ("checkout-api", "nodejs", "6.5.0"),
+    ("OrderService", "mongo-java-driver|sync", "4.11.0", "svc_orders"),
+    ("ReportWorker", "PyMongo", "4.8.0", "svc_reports"),
+    ("checkout-api", "nodejs", "6.5.0", "svc_checkout"),
 ]
 
 CLIENT_IPS = ["10.20.4.11", "10.20.4.12", "10.20.5.30", "10.20.7.8"]
@@ -125,6 +125,11 @@ class DemoLog:
                   "doc": {"application": {"name": app[0]},
                           "driver": {"name": app[1], "version": app[2]},
                           "os": {"type": "Linux"}}})
+        self.add(t + timedelta(milliseconds=14), "I", "ACCESS", 20250,
+                 "conn%d" % cid, "Authentication succeeded",
+                 {"mechanism": "SCRAM-SHA-256", "speculative": True,
+                  "principalName": app[3], "authenticationDatabase": "admin",
+                  "remote": "%s:%d" % (ip, port), "extraInfo": {}})
         return cid
 
     def _slow(self, minute: float, template, conn: int):
@@ -172,7 +177,8 @@ class DemoLog:
     def _connection_storm(self, minute: float):
         for i in range(220):
             self._connection(minute + (i % 60) / 3600.0, ip="10.20.9.77",
-                             app=("checkout-api", "nodejs", "6.5.0"))
+                             app=("checkout-api", "nodejs", "6.5.0",
+                                  "svc_checkout"))
 
     def _election(self, minute: float):
         t = self.at(minute)
@@ -209,6 +215,29 @@ class DemoLog:
                  {"message": "checkpoint took 71 seconds to complete",
                   "durationMillis": 71000})
 
+    def _auth_failures(self, minute: float, n: int = 5):
+        for i in range(n):
+            t = self.at(minute + i * 0.3)
+            self.add(t, "I", "ACCESS", 20249, "conn%d" % (self._conn + i),
+                     "Authentication failed",
+                     {"mechanism": "SCRAM-SHA-256",
+                      "principalName": "etl_batch",
+                      "authenticationDatabase": "admin",
+                      "remote": "10.20.11.40:%d" % (51000 + i),
+                      "error": {"code": 18, "codeName": "AuthenticationFailed",
+                                "errmsg": "Authentication failed."}})
+
+    def _replica_state(self):
+        """A steady-state replica set picture so cluster health has input."""
+        t = self.at(0.6)
+        self.add(t, "I", "REPL", 21358, "ReplCoord",
+                 "Replica set state transition",
+                 {"newState": "PRIMARY", "oldState": "SECONDARY"})
+        for i, host in enumerate(("demo-rs1:27017", "demo-rs2:27017"), start=1):
+            self.add(t + timedelta(seconds=i), "I", "REPL", 21215, "ReplCoord",
+                     "Member is in new state",
+                     {"hostAndPort": host, "newState": "SECONDARY"})
+
     def _errors(self, minute: float, n: int = 3):
         for i in range(n):
             t = self.at(minute + i * 0.4)
@@ -220,6 +249,7 @@ class DemoLog:
     # -- build ------------------------------------------------------------
     def build(self) -> List[str]:
         self._startup()
+        self._replica_state()
         for i in range(6):
             self._connection(0.2 + i * 0.05)
 
@@ -246,6 +276,7 @@ class DemoLog:
             self._index_build(mid - 6)
             self._connection_storm(mid)
             self._election(mid + 1)
+            self._auth_failures(mid + 1.2)
             self._errors(mid + 1.5)
             self._slow_checkpoint(mid + 2)
             # a burst of the worst shape right after the election

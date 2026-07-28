@@ -126,6 +126,13 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
     return "\n".join(parts)
 
 
+def _short_ts(iso: str) -> str:
+    """Trim an ISO timestamp to something readable in a table."""
+    if not iso:
+        return "-"
+    return iso.replace("T", " ")[:19]
+
+
 def render_connections(report: ConnectionReport, stats: ParseStats) -> str:
     parts = ["== mdbkit connections ==", render_parse_stats(stats), ""]
     d = report.to_dict()
@@ -133,15 +140,45 @@ def render_connections(report: ConnectionReport, stats: ParseStats) -> str:
         f"accepted: {d['totalAccepted']:,}   ended: {d['totalEnded']:,}   "
         f"peak concurrent (as logged): {d['peakConnectionCount']:,}"
     )
+
     if d["byIp"]:
         parts.append("")
         parts.append(_table(
-            ["source ip", "accepted", "ended"],
-            [(r["ip"], r["accepted"], r["ended"]) for r in d["byIp"][:20]],
+            ["source ip", "accepted", "ended", "first seen", "last seen", "appName"],
+            [(r["ip"], r["accepted"], r["ended"],
+              _short_ts(r["firstSeen"]), _short_ts(r["lastSeen"]),
+              ", ".join(list(r["appNames"])[:2]) or "-")
+             for r in d["byIp"][:20]],
         ))
+
+    if d["byUser"]:
+        parts.append("")
+        parts.append("authenticated users")
+        parts.append(_table(
+            ["user", "auth db", "ok", "failed", "last authenticated", "from"],
+            [(u["user"], u["authDb"] or "-", u["successes"], u["failures"],
+              _short_ts(u["lastSeen"]),
+              ", ".join(list(u["sourceIps"])[:2]) or "-")
+             for u in d["byUser"][:20]],
+        ))
+        failing = [u for u in d["byUser"] if u["failures"]]
+        if failing:
+            parts.append("")
+            for u in failing[:5]:
+                parts.append("  %s: %d failed authentication(s)%s"
+                             % (u["user"], u["failures"],
+                                " — last error: " + u["lastError"]
+                                if u["lastError"] else ""))
+    else:
+        parts.append("")
+        parts.append("No authentication events in this log. Either the "
+                     "deployment has no auth enabled, or the log window "
+                     "contains no new logins (clients reuse connections).")
+
     if d["appNames"]:
         parts.append("")
-        parts.append(_table(["appName", "handshakes"], list(d["appNames"].items())[:15]))
+        parts.append(_table(["appName", "handshakes"],
+                            list(d["appNames"].items())[:15]))
     return "\n".join(parts)
 
 
