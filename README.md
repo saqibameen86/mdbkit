@@ -12,6 +12,25 @@ MongoDB 4.4 switched to structured JSON logging, and the beloved mtools log comm
 
 mdbkit fills that gap: a single, dependency-free CLI that turns structured logs into answers.
 
+## Try it in 30 seconds
+
+No MongoDB required — `mdbkit demo` writes a realistic log with a real
+incident in it:
+
+```bash
+pip install mdbkit
+mdbkit demo --with-extras -o demo.log
+
+mdbkit loginfo demo.log
+mdbkit queries demo.log
+mdbkit triage demo.log --window 0 --no-sysprobe
+mdbkit advise demo.log --indexes indexes.json --schema schema.json
+```
+
+You will see a connection storm, a replica set election, an index build, and
+a collection scan burning 47 million document reads — then the candidate
+index that fixes it.
+
 ## Install
 
 **Recommended on any Linux/Mac/Windows:**
@@ -548,6 +567,85 @@ and metrics, never literal values from your documents.
 
 ---
 
+### `mdbkit demo`
+
+Generates a realistic MongoDB structured log so you can evaluate mdbkit — or
+run a live demo — without a cluster. Output is deterministic for a given
+seed, so a demo behaves identically every time, including on a projector.
+
+| Option | Default | Description |
+|---|---|---|
+| `--scenario` | `mixed` | `healthy`, `incident`, or `mixed` |
+| `--minutes N` | 90 | How much log time to generate |
+| `--seed N` | 7 | Same seed produces byte-identical output |
+| `-o, --out FILE` | stdout | Write to a file |
+| `--with-extras` | off | Also write `indexes.json`, `schema.json` and `explain.json` beside the log |
+
+```bash
+mdbkit demo -o demo.log                          # 90 minutes, mixed
+mdbkit demo --scenario incident --minutes 30 -o incident.log
+mdbkit demo --scenario healthy -o quiet.log      # nothing wrong: the control case
+mdbkit demo | mdbkit queries -                   # straight down a pipe
+```
+
+The `incident` scenario contains an index build, a connection storm from a
+single client, a replica set election, plan-executor errors, a slow
+WiredTiger checkpoint, and a burst of unindexed queries afterwards — the
+shape of a real bad afternoon.
+
+---
+
+### `mdbkit lab`
+
+Starts a **disposable local MongoDB** for testing, reproducing a slow query,
+or rehearsing a demo. This is the only command that starts external
+processes; see [SECURITY.md](SECURITY.md) for exactly how it is bounded.
+
+Requires `mongod` on your `PATH` (and `mongosh` to initiate the replica set
+and seed data). Linux and macOS.
+
+| Action | What it does |
+|---|---|
+| `start` | Create and start a replica set, print the connection string and log paths |
+| `seed` | Insert sample data and run a workload with deliberately interesting queries |
+| `status` | Show ports, pids and whether each node is running |
+| `logs` | Print the log file paths, ready to pipe into other commands |
+| `stop` | Stop the nodes, keep the data |
+| `destroy` | Stop and delete the lab (requires `--yes`) |
+
+| Option | Default | Description |
+|---|---|---|
+| `--dir PATH` | `~/.mdbkit-lab` | Where the lab lives |
+| `--nodes N` | 3 | Replica set size |
+| `--port N` | 28110 | Base port — deliberately far from 27017 |
+| `--slowms N` | 0 | Log every operation, which is what makes the log worth reading |
+| `--standalone` | off | Single node, no replica set |
+| `--docs N` | 50000 | Documents inserted by `seed` |
+| `--yes` | | Confirm `destroy` |
+
+**The full loop:**
+
+```bash
+mdbkit lab start                    # 3-node replica set on 28110-28112
+mdbkit lab seed                     # sample data + a mixed workload
+
+mdbkit queries $(mdbkit lab logs | head -1)
+mdbkit advise  $(mdbkit lab logs | head -1)
+
+mdbkit lab destroy --yes            # remove everything
+```
+
+`seed` runs indexed point lookups alongside deliberately unindexed queries —
+an equality-plus-range-plus-sort with no supporting index, an aggregation
+that scans the collection, and updates whose predicate has no index — so the
+log immediately contains something worth analysing.
+
+**Safety.** The lab binds to `127.0.0.1` only, refuses to use or delete any
+directory it did not create, and never touches a MongoDB it did not start.
+It is a laptop and scratch-VM tool, not a deployment tool.
+
+---
+
 ### `mdbkit export-script {schema|indexes}`
 
 Prints a small `mongosh` script to stdout. **mdbkit never connects to your
@@ -567,12 +665,14 @@ mdbkit export-script schema  > export_schema.js
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
 
-**Shipped in v0.2:** FTDC decoding, incident triage with system metrics,
-query reconstruction (`--as-explain`), and shareable Markdown/HTML reports.
+**Shipped in v0.3:** `demo` log generation and `lab` disposable clusters, on
+top of v0.2's FTDC decoding, incident triage, query reconstruction and
+shareable reports.
 
 Next up:
+* `mdbkit compare before.log after.log` — did the index actually help?
+* Multiple log files and globs in one command, for rotated logs.
 * Per-shape drill-down (`mdbkit queries --shape N` with full detail).
-* `serverStatus` snapshot digest for triage (two snapshots for true rates).
 * Graduating the remaining beta detectors (checkpoints, eviction, flow
   control) once validated against real incident logs — see
   `docs/TESTING-PLAYBOOK.md`. Real logs very welcome.
