@@ -1,0 +1,8 @@
+# Normalise line endings so Windows checkouts stop warning on every add.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.log text eol=lf
+*.json text eol=lf

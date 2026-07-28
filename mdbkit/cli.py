@@ -351,6 +351,104 @@ def cmd_ftdc(args) -> int:
     return 0
 
 
+def cmd_demo(args) -> int:
+    from .demo import DemoLog, write_extras
+    try:
+        log = DemoLog(scenario=args.scenario, minutes=args.minutes,
+                      seed=args.seed)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    lines = log.build()
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        msg = ["wrote %s (%d lines, %s scenario, %d minutes)" % (
+            args.out, len(lines), args.scenario, args.minutes)]
+        if args.with_extras:
+            directory = os.path.dirname(os.path.abspath(args.out)) or "."
+            for path in write_extras(directory):
+                msg.append("wrote %s" % path)
+        msg.append("")
+        msg.append("Try:")
+        msg.append("  mdbkit loginfo %s" % args.out)
+        msg.append("  mdbkit queries %s" % args.out)
+        msg.append("  mdbkit triage %s --window 0 --no-sysprobe" % args.out)
+        if args.with_extras:
+            msg.append("  mdbkit advise %s --indexes indexes.json "
+                       "--schema schema.json" % args.out)
+            msg.append("  mdbkit explain explain.json")
+        print("\n".join(msg), file=sys.stderr)
+    else:
+        for ln in lines:
+            print(ln)
+    return 0
+
+
+def _lab_echo(msg=""):
+    print(msg, file=sys.stderr)
+
+
+def cmd_lab(args) -> int:
+    from . import lab
+    try:
+        if args.lab_action == "start":
+            state = lab.start(directory=args.dir, nodes=args.nodes,
+                              base_port=args.port, slowms=args.slowms,
+                              standalone=args.standalone, echo=_lab_echo)
+            print("")
+            print("lab ready: %s" % lab.connection_string(state))
+            print("directory: %s" % state["dir"])
+            for n in state["nodes"]:
+                print("  node%d  port %d  log %s"
+                      % (n["index"], n["port"], n["log"]))
+            print("")
+            print("Next:")
+            print("  mdbkit lab seed                     # sample data + workload")
+            print("  mdbkit queries %s" % state["nodes"][0]["log"])
+            print("  mdbkit lab destroy                  # remove it all")
+        elif args.lab_action == "status":
+            state = lab.status(args.dir)
+            if not state:
+                print("no lab found in %s" % args.dir)
+                return 0
+            print("lab in %s (created %s)" % (state["dir"], state["createdAt"]))
+            print("connection: %s" % lab.connection_string(state))
+            for n in state["nodes"]:
+                print("  node%d  port %-6d pid %-8s %s"
+                      % (n["index"], n["port"], n.get("pid") or "-",
+                         "running" if n.get("running") else "stopped"))
+        elif args.lab_action == "seed":
+            ok = lab.seed(args.dir, docs=args.docs, echo=_lab_echo)
+            if ok:
+                state = lab.status(args.dir)
+                print("")
+                print("Now analyse what it produced:")
+                print("  mdbkit queries %s" % state["nodes"][0]["log"])
+                print("  mdbkit advise %s" % state["nodes"][0]["log"])
+        elif args.lab_action == "stop":
+            n = lab.stop(args.dir, echo=_lab_echo)
+            print("stopped %d node(s)" % n)
+        elif args.lab_action == "destroy":
+            if not args.yes:
+                print("This deletes %s and all data in it." % args.dir,
+                      file=sys.stderr)
+                print("Re-run with --yes to confirm.", file=sys.stderr)
+                return 1
+            lab.destroy(args.dir, echo=_lab_echo)
+        elif args.lab_action == "logs":
+            state = lab.status(args.dir)
+            if not state:
+                print("no lab found in %s" % args.dir, file=sys.stderr)
+                return 1
+            for path in lab.log_paths(state):
+                print(path)
+    except lab.LabError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_export_script(args) -> int:
     print(SCHEMA_SCRIPT if args.kind == "schema" else INDEXES_SCRIPT)
     return 0
@@ -489,6 +587,46 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_ftdc)
 
+    sp = sub.add_parser("demo",
+                        help="generate a realistic sample log so you can try "
+                             "mdbkit without a MongoDB")
+    sp.add_argument("--scenario", default="mixed",
+                    choices=["healthy", "incident", "mixed"],
+                    help="what the log should contain (default mixed)")
+    sp.add_argument("--minutes", type=int, default=90,
+                    help="how much log time to generate (default 90)")
+    sp.add_argument("--seed", type=int, default=7,
+                    help="deterministic seed — same seed, same log")
+    sp.add_argument("-o", "--out", metavar="FILE",
+                    help="write to a file instead of stdout")
+    sp.add_argument("--with-extras", action="store_true",
+                    help="also write indexes.json, schema.json and "
+                         "explain.json alongside --out")
+    sp.set_defaults(func=cmd_demo)
+
+    sp = sub.add_parser("lab",
+                        help="start a disposable local MongoDB for testing "
+                             "(the only command that runs external processes)")
+    sp.add_argument("lab_action",
+                    choices=["start", "seed", "status", "stop", "destroy",
+                             "logs"])
+    sp.add_argument("--dir", default=None,
+                    help="lab directory (default ~/.mdbkit-lab)")
+    sp.add_argument("--nodes", type=int, default=3,
+                    help="replica set size (default 3)")
+    sp.add_argument("--port", type=int, default=28110,
+                    help="base port (default 28110, deliberately far from 27017)")
+    sp.add_argument("--slowms", type=int, default=0,
+                    help="slow query threshold in ms (default 0 = log every "
+                         "operation, which is what makes the log interesting)")
+    sp.add_argument("--standalone", action="store_true",
+                    help="single node, no replica set")
+    sp.add_argument("--docs", type=int, default=50000,
+                    help="documents to insert for `seed` (default 50000)")
+    sp.add_argument("--yes", action="store_true",
+                    help="confirm destructive actions")
+    sp.set_defaults(func=cmd_lab)
+
     sp = sub.add_parser("export-script",
                         help="print a mongosh script to export schema or indexes")
     sp.add_argument("kind", choices=["schema", "indexes"])
@@ -499,6 +637,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "command", None) == "lab" and not args.dir:
+        from .lab import DEFAULT_DIR
+        args.dir = DEFAULT_DIR
     try:
         return args.func(args)
     except FileNotFoundError as exc:
