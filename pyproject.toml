@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mdbkit"
-version = "0.3.1"
+version = "0.3.0"
 description = "Offline toolkit for MongoDB 4.4+ structured logs: log analysis, slow-query shapes, connection churn, and deterministic index advice. A spiritual successor to mtools' log tools."
 readme = "README.md"
 requires-python = ">=3.8"
