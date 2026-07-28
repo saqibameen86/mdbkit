@@ -29,7 +29,8 @@ from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
 from .analysis import QueryAggregator
-from .parser import ID_CONN_ACCEPTED, ID_STARTUP, LogEntry, ParseStats, iter_entries
+from .parser import (ID_CONN_ACCEPTED, ID_LISTENING, ID_SHUTDOWN,
+                     ID_STARTUP, LogEntry, ParseStats, iter_entries)
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
 DEFAULT_WINDOW_MIN = 60
@@ -104,6 +105,12 @@ class TriageEngine:
         self.index_builds: List = []
         self.log_tz = None
         self.system_index_builds = 0
+        self.self_state = None            # this node's latest role
+        self.self_state_at = None
+        self.member_states = {}           # host -> (state, ts)
+        self.heartbeat_errors = Counter()
+        self.listening = False
+        self.shutdown_at = None
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
@@ -138,6 +145,26 @@ class TriageEngine:
                 if entry.ts is not None:
                     self.collscan_minutes[_minute(entry.ts)] += 1
 
+        if entry.msg_id == ID_LISTENING or "waiting for connections" in msg_l:
+            self.listening = True
+        if entry.msg_id == ID_SHUTDOWN or msg_l.startswith("shutting down"):
+            self.shutdown_at = entry.ts
+
+        if entry.component in ("REPL", "ELECTION", "REPL_HB"):
+            new_state = entry.attr.get("newState")
+            host = entry.attr.get("hostAndPort") or entry.attr.get("host")
+            if new_state and host:
+                self.member_states[str(host)] = (str(new_state), entry.ts)
+            elif new_state and "state transition" in msg_l:
+                self.self_state = str(new_state)
+                self.self_state_at = entry.ts
+            if "heartbeat" in msg_l and (entry.severity in ("W", "E")
+                                         or "error" in msg_l
+                                         or "failed" in msg_l):
+                tgt = str(entry.attr.get("target")
+                          or entry.attr.get("hostAndPort") or "unknown")
+                self.heartbeat_errors[tgt] += 1
+
         if entry.component in ("REPL", "ELECTION"):
             if any(p in msg_l for p in self.ELECTION_EVENT) and \
                     "not starting" not in msg_l:
@@ -168,8 +195,70 @@ class TriageEngine:
             self.evictions += 1
 
     # --------------------------------------------------------- findings ----
+    def _health_finding(self) -> Finding:
+        """Synthesise cluster health from the log alone — no connection.
+
+        Everything here is 'what the log last said', which is the honest
+        limit of an offline tool. It answers the 3am question 'is this node
+        even serving, and what does it think of its peers?'
+        """
+        bits = []
+        role = self.self_state or "unknown"
+        if self.self_state_at:
+            bits.append("this node last reported %s at %s"
+                        % (role, self.self_state_at.strftime("%H:%M:%S")))
+        elif self.self_state:
+            bits.append("this node last reported %s" % role)
+
+        unhealthy = []
+        for host, (state, ts) in sorted(self.member_states.items()):
+            label = "%s = %s" % (host, state)
+            if ts:
+                label += " (at %s)" % ts.strftime("%H:%M:%S")
+            bits.append(label)
+            low = state.lower()
+            if any(w in low for w in ("not reachable", "unhealthy", "down",
+                                      "removed", "rollback", "recovering",
+                                      "startup")):
+                unhealthy.append(host)
+
+        sev = "OK"
+        detail_head = "Serving connections; no problems visible in the log."
+        next_step = ""
+
+        if self.shutdown_at:
+            sev = "CRIT"
+            detail_head = ("A shutdown was logged at %s — this node stopped "
+                           "serving." % self.shutdown_at.strftime("%H:%M:%S"))
+            next_step = "Check whether the process was restarted afterwards."
+        elif unhealthy:
+            sev = "CRIT"
+            detail_head = ("%d member(s) last reported an unhealthy state: %s."
+                           % (len(unhealthy), ", ".join(unhealthy)))
+            next_step = ("Check those hosts directly: process alive, disk, "
+                         "network reachability from this node.")
+        elif self.heartbeat_errors:
+            sev = "WARN"
+            total = sum(self.heartbeat_errors.values())
+            worst = self.heartbeat_errors.most_common(1)[0]
+            detail_head = ("%d heartbeat error(s) in window; most to %s (%d)."
+                           % (total, worst[0], worst[1]))
+            next_step = "Network or peer health between replica set members."
+        elif self.elections:
+            sev = "WARN"
+            detail_head = ("The set re-elected during this window; it may be "
+                           "healthy now but it was not stable.")
+        elif not self.listening and not self.member_states and not self.self_state:
+            sev = "INFO"
+            detail_head = ("Not enough replication detail in this window to "
+                           "judge cluster health.")
+            next_step = ("Widen with --window 0, or point at a log that "
+                         "covers a restart.")
+
+        return Finding(sev, "Cluster health", detail_head, bits, next_step)
+
     def findings(self) -> List[Finding]:
-        out: List[Finding] = []
+        out: List[Finding] = [self._health_finding()]
 
         if self.elections:
             times = [t.strftime("%H:%M:%S") if t else "?" for t, _ in self.elections]
@@ -631,6 +720,21 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
     return out
 
 
+def find_diagnostic_data(dbpath: Optional[str]) -> Optional[str]:
+    """diagnostic.data always lives inside the dbPath, so if we found the
+    dbPath we already know where the metrics are — no need to ask."""
+    if not dbpath:
+        return None
+    candidate = os.path.join(dbpath, "diagnostic.data")
+    if os.path.isdir(candidate):
+        try:
+            if any(n.startswith("metrics.") for n in os.listdir(candidate)):
+                return candidate
+        except OSError:
+            return None
+    return None
+
+
 def run_triage(logfile: str, window_min: Optional[int] = None,
                dbpath: Optional[str] = None, no_sysprobe: bool = False,
                ftdc_path: Optional[str] = None):
@@ -657,8 +761,18 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
         engine.consume(entry)
 
     findings = engine.findings()
+    resolved_dbpath = None
     if not no_sysprobe:
+        resolved_dbpath = dbpath or discover_dbpath(engine.dbpath)[0]
         findings += sysprobe(engine.dbpath, explicit=dbpath)
+    if not ftdc_path:
+        auto = find_diagnostic_data(resolved_dbpath or dbpath or engine.dbpath)
+        if auto:
+            ftdc_path = auto
+            findings.append(Finding(
+                "INFO", "FTDC discovered",
+                "Using %s (found next to the dbPath). Pass --ftdc to override."
+                % auto))
     if ftdc_path:
         try:
             findings += ftdc_findings(ftdc_path, ts_from=cutoff)

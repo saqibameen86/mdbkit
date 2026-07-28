@@ -219,3 +219,97 @@ def test_cli_lab_destroy_requires_confirmation(tmp_path, capsys):
     assert d.exists()                       # nothing removed without --yes
     assert main(["lab", "destroy", "--dir", str(d), "--yes"]) == 0
     assert not d.exists()
+
+
+# ------------------------------------------------ 0.3 connections + health ---
+
+def test_demo_contains_auth_events(tmp_path):
+    from mdbkit.analysis import ConnectionAggregator
+    path, _ = build(tmp_path, scenario="incident", minutes=60)
+    agg = ConnectionAggregator()
+    for e in iter_entries(path):
+        agg.consume(e)
+    d = agg.report.to_dict()
+    users = {u["user"]: u for u in d["byUser"]}
+    assert "svc_orders" in users
+    assert users["svc_orders"]["successes"] > 0
+    assert users["svc_orders"]["lastSeen"]
+    # the deliberately broken account
+    assert users["etl_batch"]["failures"] == 5
+    assert users["etl_batch"]["successes"] == 0
+    assert "AuthenticationFailed" in users["etl_batch"]["lastError"]
+
+
+def test_connections_report_has_first_and_last_seen(tmp_path):
+    from mdbkit.analysis import ConnectionAggregator
+    path, _ = build(tmp_path, minutes=60)
+    agg = ConnectionAggregator()
+    for e in iter_entries(path):
+        agg.consume(e)
+    rows = agg.report.to_dict()["byIp"]
+    assert rows
+    for r in rows:
+        assert r["firstSeen"] and r["lastSeen"]
+        assert r["firstSeen"] <= r["lastSeen"]
+    assert any(r["appNames"] for r in rows)
+
+
+def test_cluster_health_healthy(tmp_path):
+    path, _ = build(tmp_path, scenario="healthy", minutes=40)
+    findings, _s, _c = run_triage(path, window_min=0, no_sysprobe=True)
+    health = next(f for f in findings if f.title == "Cluster health")
+    assert health.severity == "OK"
+    assert any("PRIMARY" in e for e in health.evidence)
+    assert any("SECONDARY" in e for e in health.evidence)
+
+
+def test_cluster_health_flags_unreachable_member(tmp_path):
+    log = tmp_path / "degraded.log"
+    log.write_text("\n".join([
+        json.dumps({"t": {"$date": "2026-07-01T08:00:00.000+04:00"}, "s": "I",
+                    "c": "REPL", "id": 21358, "ctx": "r", "ctxx": 1,
+                    "msg": "Replica set state transition",
+                    "attr": {"newState": "PRIMARY", "oldState": "SECONDARY"}}),
+        json.dumps({"t": {"$date": "2026-07-01T08:05:00.000+04:00"}, "s": "I",
+                    "c": "REPL", "id": 21215, "ctx": "r",
+                    "msg": "Member is in new state",
+                    "attr": {"hostAndPort": "n3:27017",
+                             "newState": "(not reachable/healthy)"}}),
+    ]) + "\n")
+    findings, _s, _c = run_triage(str(log), window_min=0, no_sysprobe=True)
+    health = next(f for f in findings if f.title == "Cluster health")
+    assert health.severity == "CRIT"
+    assert "n3:27017" in health.detail
+
+
+def test_cluster_health_flags_shutdown(tmp_path):
+    log = tmp_path / "down.log"
+    log.write_text(json.dumps({
+        "t": {"$date": "2026-07-01T08:09:00.000+04:00"}, "s": "I",
+        "c": "CONTROL", "id": 23138, "ctx": "signal",
+        "msg": "Shutting down", "attr": {}}) + "\n")
+    findings, _s, _c = run_triage(str(log), window_min=0, no_sysprobe=True)
+    health = next(f for f in findings if f.title == "Cluster health")
+    assert health.severity == "CRIT"
+    assert "shutdown" in health.detail.lower()
+
+
+def test_find_diagnostic_data(tmp_path):
+    from mdbkit.triage import find_diagnostic_data
+    assert find_diagnostic_data(None) is None
+    assert find_diagnostic_data(str(tmp_path)) is None
+    dd = tmp_path / "diagnostic.data"
+    dd.mkdir()
+    assert find_diagnostic_data(str(tmp_path)) is None   # no metrics.* yet
+    (dd / "metrics.2026-07-01T00-00-00Z-00000").write_bytes(b"x")
+    assert find_diagnostic_data(str(tmp_path)) == str(dd)
+
+
+def test_cli_connections_shows_users(tmp_path, capsys):
+    from mdbkit.cli import main
+    path, _ = build(tmp_path, scenario="incident", minutes=30)
+    assert main(["connections", path]) == 0
+    out = capsys.readouterr().out
+    assert "authenticated users" in out
+    assert "etl_batch" in out
+    assert "last authenticated" in out

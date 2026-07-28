@@ -194,6 +194,8 @@ mdbkit triage mongod.log --no-sysprobe        # analyzing a log copied off-host
 **Defaults to the last 60 minutes of log time**, because triage is for
 incidents happening now or just finished. In one command:
 
+- **cluster health** — this node's replica set role, every peer's last known
+  state, heartbeat failures, and whether the node is still serving
 - restarts, error clusters, election/stepdown events
 - connection storms — with the peak minute and the top source IPs
 - slow-query volume and the peak minute, so you know *when* it hurt
@@ -206,8 +208,15 @@ incidents happening now or just finished. In one command:
 When run on the database host, mdbkit finds `dbPath` automatically — from the
 log's startup line, or the running `mongod` process, or `/etc/mongod.conf`,
 or common defaults — so the disk check works even when the current log has no
-startup event. All probing is stdlib-only (`/proc`, `statvfs`); no shell-outs,
-nothing leaves the machine.
+startup event. **`diagnostic.data` lives inside the dbPath, so it is picked up
+automatically too**: you only need `--ftdc` to point somewhere else, such as a
+directory copied off another host. All probing is stdlib-only (`/proc`,
+`statvfs`); no shell-outs, nothing leaves the machine.
+
+Cluster health is derived entirely from the log — no connection to the
+database. It reports what the node last said about itself and its peers, which
+is the honest limit of an offline tool, and enough to answer "is this node
+serving, and what does it think of the others?"
 
 Read-only: it never connects to the database, and every finding ends with a
 next step for a human to review. Detectors marked beta are pattern-matched and
@@ -314,12 +323,37 @@ mdbkit queries mongod.log --min-ms 500 --json
 
 ### `mdbkit connections <log>`
 
-Connection churn: totals, peak concurrent count, per-source-IP breakdown, and
-the client applications and drivers seen.
+Connection churn and **who authenticated**: totals, peak concurrent count,
+per-source-IP breakdown with first/last seen, the client applications and
+drivers, and a per-user table.
 
 | Option | Description |
 |---|---|
 | `--json` | Machine-readable output |
+
+```bash
+mdbkit connections mongod.log
+```
+
+```
+source ip   accepted  ended  first seen           last seen            appName
+----------  --------  -----  -------------------  -------------------  ------------
+10.20.9.77  220       0      2026-07-01 08:49:30  2026-07-01 08:49:30  checkout-api
+10.20.4.11  4         1      2026-07-01 08:00:15  2026-07-01 09:29:30  OrderService
+
+authenticated users
+user          auth db  ok   failed  last authenticated   from
+------------  -------  ---  ------  -------------------  -----------
+svc_checkout  admin    221  0       2026-07-01 08:49:30  10.20.9.77
+etl_batch     admin    0    5       2026-07-01 08:51:54  10.20.11.40
+
+  etl_batch: 5 failed authentication(s) — last error: AuthenticationFailed
+```
+
+This answers the question that starts most access incidents: *did that
+account connect, from where, and when last?* If the log shows no
+authentication events at all, mdbkit says so — either auth is disabled, or
+the window contains no new logins because clients are reusing connections.
 
 ---
 

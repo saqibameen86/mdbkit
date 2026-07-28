@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .parser import (
+    ID_AUTH_FAIL,
+    ID_AUTH_OK,
+    ID_AUTH_OK_ALT,
     ID_BUILD_INFO,
     ID_CLIENT_METADATA,
     ID_CONN_ACCEPTED,
@@ -349,12 +352,41 @@ def _ip_of(remote: str) -> str:
 
 
 @dataclass
+class UserActivity:
+    """What the log knows about one authenticated principal."""
+    user: str
+    auth_db: str = ""
+    successes: int = 0
+    failures: int = 0
+    first_seen: Optional[object] = None
+    last_seen: Optional[object] = None
+    ips: Counter = field(default_factory=Counter)
+    apps: Counter = field(default_factory=Counter)
+    last_error: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "user": self.user, "authDb": self.auth_db,
+            "successes": self.successes, "failures": self.failures,
+            "firstSeen": self.first_seen.isoformat() if self.first_seen else None,
+            "lastSeen": self.last_seen.isoformat() if self.last_seen else None,
+            "sourceIps": dict(self.ips.most_common()),
+            "appNames": dict(self.apps.most_common()),
+            "lastError": self.last_error,
+        }
+
+
+@dataclass
 class ConnectionReport:
     accepted: Counter = field(default_factory=Counter)
     ended: Counter = field(default_factory=Counter)
     app_names: Counter = field(default_factory=Counter)
     drivers: Counter = field(default_factory=Counter)
     peak_count: int = 0
+    last_seen: Dict[str, object] = field(default_factory=dict)   # ip -> ts
+    first_seen: Dict[str, object] = field(default_factory=dict)
+    ip_apps: defaultdict = field(default_factory=lambda: defaultdict(Counter))
+    users: Dict[str, UserActivity] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -362,38 +394,116 @@ class ConnectionReport:
             "totalEnded": sum(self.ended.values()),
             "peakConnectionCount": self.peak_count,
             "byIp": [
-                {"ip": ip, "accepted": n, "ended": self.ended.get(ip, 0)}
+                {"ip": ip, "accepted": n, "ended": self.ended.get(ip, 0),
+                 "appNames": dict(self.ip_apps.get(ip, Counter()).most_common(3)),
+                 "firstSeen": (self.first_seen[ip].isoformat()
+                               if self.first_seen.get(ip) else None),
+                 "lastSeen": (self.last_seen[ip].isoformat()
+                              if self.last_seen.get(ip) else None)}
                 for ip, n in self.accepted.most_common()
             ],
+            "byUser": [u.to_dict() for u in sorted(
+                self.users.values(),
+                key=lambda x: (x.successes + x.failures), reverse=True)],
             "appNames": dict(self.app_names.most_common()),
             "drivers": dict(self.drivers.most_common()),
         }
 
 
 class ConnectionAggregator:
+    """Connection churn, plus who authenticated and when.
+
+    'Did that user ever connect, and when last?' is one of the first
+    questions during an access incident, and the answer is in the log.
+    """
+
+    AUTH_OK_TEXT = ("authentication succeeded", "successfully authenticated")
+    AUTH_FAIL_TEXT = ("authentication failed",)
+
     def __init__(self):
         self.report = ConnectionReport()
+        self._conn_ip: Dict[str, str] = {}   # ctx -> ip, to attribute apps
+
+    def _touch_ip(self, ip: str, ts):
+        if ts is None or not ip:
+            return
+        r = self.report
+        if ip not in r.first_seen:
+            r.first_seen[ip] = ts
+        r.last_seen[ip] = ts
+
+    def _user(self, name: str) -> UserActivity:
+        u = self.report.users.get(name)
+        if u is None:
+            u = self.report.users[name] = UserActivity(user=name)
+        return u
 
     def consume(self, entry: LogEntry):
         attr = entry.attr
+        msg_l = entry.msg.lower()
+
         if entry.msg_id == ID_CONN_ACCEPTED:
-            self.report.accepted[_ip_of(attr.get("remote", ""))] += 1
+            ip = _ip_of(attr.get("remote", ""))
+            self.report.accepted[ip] += 1
+            self._touch_ip(ip, entry.ts)
+            if entry.attr.get("connectionId") is not None:
+                self._conn_ip["conn%s" % attr.get("connectionId")] = ip
             self.report.peak_count = max(
-                self.report.peak_count, int(attr.get("connectionCount", 0) or 0)
-            )
+                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
         elif entry.msg_id == ID_CONN_ENDED:
-            self.report.ended[_ip_of(attr.get("remote", ""))] += 1
+            ip = _ip_of(attr.get("remote", ""))
+            self.report.ended[ip] += 1
+            self._touch_ip(ip, entry.ts)
             self.report.peak_count = max(
-                self.report.peak_count, int(attr.get("connectionCount", 0) or 0)
-            )
+                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
         elif entry.msg_id == ID_CLIENT_METADATA:
             doc = attr.get("doc", {}) or {}
             app = (doc.get("application") or {}).get("name")
+            ip = _ip_of(attr.get("remote", "")) or self._conn_ip.get(entry.ctx, "")
             if app:
                 self.report.app_names[app] += 1
+                if ip:
+                    self.report.ip_apps[ip][app] += 1
             driver = (doc.get("driver") or {}).get("name")
             if driver:
                 self.report.drivers[driver] += 1
+            self._touch_ip(ip, entry.ts)
+        elif (entry.msg_id in (ID_AUTH_OK, ID_AUTH_OK_ALT)
+              or any(t in msg_l for t in self.AUTH_OK_TEXT)):
+            self._auth(entry, ok=True)
+        elif entry.msg_id == ID_AUTH_FAIL or any(
+                t in msg_l for t in self.AUTH_FAIL_TEXT):
+            self._auth(entry, ok=False)
+
+    def _auth(self, entry: LogEntry, ok: bool):
+        attr = entry.attr
+        name = (attr.get("principalName") or attr.get("user")
+                or attr.get("principal") or "")
+        if not name:
+            return
+        u = self._user(str(name))
+        u.auth_db = str(attr.get("authenticationDatabase")
+                        or attr.get("db") or u.auth_db)
+        ip = _ip_of(str(attr.get("remote") or attr.get("client") or ""))
+        if ip:
+            u.ips[ip] += 1
+            app = self.report.ip_apps.get(ip)
+            if app:
+                for a_name, n in app.items():
+                    u.apps[a_name] += 0 if u.apps.get(a_name) else n
+        if entry.ts is not None:
+            if u.first_seen is None:
+                u.first_seen = entry.ts
+            u.last_seen = entry.ts
+        if ok:
+            u.successes += 1
+        else:
+            u.failures += 1
+            err = attr.get("error")
+            if isinstance(err, dict):
+                u.last_error = str(err.get("codeName") or err.get("errmsg") or "")
+            elif err:
+                u.last_error = str(err)[:80]
 
 
 # ---------------------------------------------------------------------------
