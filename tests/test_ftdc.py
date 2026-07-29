@@ -318,3 +318,57 @@ def test_streaming_stats_without_keeping_values(tmp_path):
     assert s.values == []          # nothing retained
     assert s.vmin == 9 and s.vmax == 12 and s.last == 9
     assert r.summary()["series"]["conns.current"]["max"] == 12
+
+
+def test_curated_covers_the_beta_detector_metrics():
+    """Checkpoint duration, application-thread eviction and flow control are
+    not reliably present in the mongod log (checkpoint timing is LOGV2_DEBUG
+    level 4 on modern versions), so FTDC must carry them."""
+    from mdbkit.ftdc import CURATED
+    labels = {lb for lb, _p, _k in CURATED}
+    for needed in ("checkpoint.lastMs", "evict.appThreadPages",
+                   "flowControl.isLagged", "flowControl.waitMicros"):
+        assert needed in labels, needed
+    paths = {p for _lb, p, _k in CURATED}
+    assert any("transaction checkpoint most recent time" in p for p in paths)
+    assert any("pages evicted by application threads" in p for p in paths)
+    assert any(p.startswith("serverStatus.flowControl.") for p in paths)
+
+
+def test_ftdc_findings_flag_checkpoint_and_flow_control(tmp_path):
+    """A chunk carrying an 80s checkpoint and an engaged flow control must
+    produce WARN findings without any log at all."""
+    import struct, zlib
+    from mdbkit.triage import ftdc_findings
+
+    ref = enc_doc([
+        ("start", 0),
+        ("serverStatus", {
+            "wiredTiger": {
+                "transaction": {
+                    "transaction checkpoint most recent time (msecs)": 80000},
+                "cache": {"pages evicted by application threads": 0},
+            },
+            "flowControl": {"isLagged": 1, "timeAcquiringMicros": 0},
+        }),
+    ])
+    parsed, _ = parse_document(ref)
+    leaves = numeric_metrics(parsed)
+    base = [v for _, v in leaves]
+    deltas = []
+    for m, (_path, _v) in enumerate(leaves):
+        for _ in range(2):
+            deltas.append(0)
+    payload = ref + struct.pack("<II", len(leaves), 2) + rle_varint(deltas)
+    blob = struct.pack("<I", len(payload)) + zlib.compress(payload)
+    d = tmp_path / "diagnostic.data"
+    d.mkdir()
+    (d / "metrics.2026-07-01T00-00-00Z-00000").write_bytes(
+        enc_doc([("_id", 1782000000000), ("type", 1), ("data", blob)]))
+
+    findings = ftdc_findings(str(d))
+    titles = {f.title: f for f in findings}
+    assert "Checkpoints (FTDC)" in titles
+    assert titles["Checkpoints (FTDC)"].severity == "WARN"
+    assert "80.0s" in titles["Checkpoints (FTDC)"].detail
+    assert titles["Flow control engaged (FTDC)"].severity == "WARN"

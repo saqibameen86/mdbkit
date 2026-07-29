@@ -11,6 +11,13 @@ setlocal EnableDelayedExpansion
 
 set REPO=https://github.com/saqibameen86/mdbkit.git
 
+REM --- your git identity ---------------------------------------
+REM IMPORTANT: GIT_EMAIL decides who GitHub credits for each commit.
+REM Find your exact address at https://github.com/settings/emails
+REM (the "...@users.noreply.github.com" one), and paste it below.
+set GIT_NAME=Saqib Ameen Subhan
+set GIT_EMAIL=saqibameen86@users.noreply.github.com
+
 echo.
 echo === mdbkit publish ===
 echo.
@@ -38,6 +45,11 @@ if not exist .git (
   git init -q
 )
 
+REM identity: without this, commits get credited to whoever owns the
+REM email that happens to be configured on this machine
+git config user.name "%GIT_NAME%"
+git config user.email "%GIT_EMAIL%"
+
 REM branch must be main
 git branch -M main
 
@@ -47,6 +59,7 @@ git remote add origin %REPO%
 
 echo       branch: main
 echo       origin: %REPO%
+echo       author: %GIT_NAME% ^<%GIT_EMAIL%^>
 echo.
 
 REM --- step 2: commit ----------------------------------------

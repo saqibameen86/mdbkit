@@ -325,7 +325,7 @@ class TriageEngine:
         if slow_cp:
             worst = max(d for _, d in slow_cp)
             out.append(Finding(
-                "WARN", "Slow WiredTiger checkpoints",
+                "WARN", "Slow WiredTiger checkpoints (log)",
                 "%d checkpoint(s) over 60s (worst %.1fs). Usually disk I/O "
                 "saturation or a large dirty cache." % (
                     len(slow_cp), worst / 1000.0),
@@ -691,6 +691,41 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
                 next_step="" if sev == "INFO" else
                 "Queueing means the server ran out of capacity — correlate "
                 "with the slow-query peak above."))
+
+    # Checkpoint / eviction / flow control are measured here rather than in
+    # the log: mongod does not log checkpoint duration at default verbosity,
+    # and eviction pressure has no log line at all. FTDC records all three.
+    cp = reader.series.get("checkpoint.lastMs")
+    if cp and cp.vmax is not None:
+        worst = cp.vmax / 1000.0
+        sev = "WARN" if worst >= 60 else "INFO"
+        out.append(Finding(
+            sev, "Checkpoints (FTDC)",
+            "Longest checkpoint in window %.1fs." % worst,
+            next_step="" if sev == "INFO" else
+            "Sustained long checkpoints usually mean disk saturation or a "
+            "large dirty cache; correlate with disk metrics."))
+
+    evict = reader.rate("evict.appThreadPages")
+    if evict is not None and evict > 0:
+        sev = "WARN" if evict >= 1 else "INFO"
+        out.append(Finding(
+            sev, "Cache eviction pressure (FTDC)",
+            "Application threads evicted ~%.1f pages/s. When user operations "
+            "have to evict, the cache is not keeping up." % evict,
+            next_step="" if sev == "INFO" else
+            "Compare cache used vs configured above; consider a larger "
+            "WiredTiger cache or reducing the working set."))
+
+    lagged = reader.series.get("flowControl.isLagged")
+    fc_wait = reader.rate("flowControl.waitMicros")
+    if lagged and lagged.vmax:
+        out.append(Finding(
+            "WARN", "Flow control engaged (FTDC)",
+            "The primary throttled writes because the majority-commit point "
+            "lagged%s." % ("; ~%.0f ms/s spent waiting" % (fc_wait / 1000.0)
+                           if fc_wait else ""),
+            next_step="Check secondary health and replication lag."))
 
     mem = reader.series.get("mem.residentMB")
     if mem and mem.values:

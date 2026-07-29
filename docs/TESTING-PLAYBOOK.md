@@ -18,9 +18,9 @@ regression test.
 | Hot collections, COLLSCAN volume | validated |
 | Index builds | validated |
 | Cluster health | validated on synthetic + real state transitions |
-| Slow checkpoints | **beta** — needs scenario 4 |
-| Cache eviction pressure | **beta** — needs scenario 4 |
-| Flow control | **beta** — needs scenario 5 |
+| Slow checkpoints | now measured from **FTDC**, not the log — needs scenario 4 to confirm |
+| Cache eviction pressure | now measured from **FTDC** — needs scenario 4 to confirm |
+| Flow control | now measured from **FTDC** — needs scenario 5 to confirm |
 | FTDC decoder | spec-correct and round-trip tested, **never run against a real `diagnostic.data`** — scenario 6 |
 
 ## Setup
@@ -76,6 +76,13 @@ for i in $(seq 250); do mongosh --port 28110 --quiet --eval 1 & done; wait
 Expect: `mdbkit triage` reports a storm minute with the right source IP, and
 `mdbkit connections` shows the churn.
 
+> **Why these moved to FTDC.** MongoDB's own source shows checkpoint timing is
+> logged at `LOGV2_DEBUG` level 4 and via `LOGV2_FOR_RECOVERY`, so it does not
+> appear in a default log at all; application-thread eviction has no log line
+> whatsoever. Both are recorded in `diagnostic.data` every second. Scenarios 4
+> and 5 therefore check the **FTDC** numbers, and the log-based detectors
+> remain only as corroboration.
+
 ## Scenario 4 — Slow checkpoints and cache eviction  ← needed
 
 Start a lab with a deliberately small cache so WiredTiger has to work:
@@ -88,9 +95,18 @@ date
 mdbkit lab seed --docs 400000        # sustained write pressure
 ```
 
-Expect: `WiredTiger message` lines mentioning checkpoints and eviction.
-Collect the log even if triage reports nothing — a negative result tells us
-the patterns are wrong, which is exactly what needs fixing.
+Then check the metrics rather than the log:
+
+```bash
+mdbkit ftdc summary ~/.mdbkit-lab/node0/data/diagnostic.data --all \
+  --metric checkpoint.lastMs --metric evict.appThreadPages
+mdbkit triage $(mdbkit lab logs | head -1) --window 0
+```
+
+Expect `checkpoint.lastMs` to climb and `evict.appThreadPages` to become
+non-zero under pressure. Collect the whole `diagnostic.data` directory even if
+nothing is flagged — a negative result tells us the metric names differ on
+your version, which is exactly what needs fixing.
 
 ## Scenario 5 — Flow control  ← needed
 
@@ -104,7 +120,15 @@ mongosh --port 28110 --eval 'for (let i=0;i<500000;i++) db.getSiblingDB("shop").
 kill -CONT <pid of node1> <pid of node2>
 ```
 
-Expect: "Flow control is engaged" style messages on the primary.
+Then:
+
+```bash
+mdbkit ftdc summary ~/.mdbkit-lab/node0/data/diagnostic.data --all \
+  --metric flowControl.isLagged --metric flowControl.waitMicros
+```
+
+Expect `flowControl.isLagged` to reach 1 and the wait time to climb during the
+SIGSTOP window.
 
 ## Scenario 6 — FTDC against real diagnostic.data  ← the important one
 

@@ -816,17 +816,26 @@ mdbkit export-script schema  > export_schema.js
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
 
-**Shipped in v0.3:** `demo` log generation and `lab` disposable clusters, on
-top of v0.2's FTDC decoding, incident triage, query reconstruction and
-shareable reports.
+**Shipped in v0.4:** `compare`, rotated-log globbing, per-shape drill-down —
+on top of v0.3's `demo` and `lab`, and v0.2's FTDC decoding, incident triage,
+query reconstruction and shareable reports.
 
-Next up:
-* `mdbkit compare before.log after.log` — did the index actually help?
-* Multiple log files and globs in one command, for rotated logs.
-* Per-shape drill-down (`mdbkit queries --shape N` with full detail).
-* Graduating the remaining beta detectors (checkpoints, eviction, flow
-  control) once validated against real incident logs — see
-  `docs/TESTING-PLAYBOOK.md`. Real logs very welcome.
+Next up, roughly in order:
+
+* **Sharded clusters.** `mongos` logs are a different shape, and the classic
+  sharded failure — a query with no shard key fanning out to every shard — is
+  visible in the log. Also chunk migrations, balancer windows and jumbo
+  chunks. Would come with `mdbkit lab --sharded` so it can be tested.
+* **Startup configuration audit.** mongod logs warnings at startup about
+  transparent huge pages, readahead, ulimits, NUMA and filesystem choice.
+  These are classic production misconfigurations and they are already in
+  your log — nothing new needs collecting.
+* **Redundant index detection** from `indexes.json` alone: an index on
+  `{a: 1}` is redundant when `{a: 1, b: 1}` exists. Purely offline, no
+  connection, no `$indexStats` needed.
+* **Confirming the FTDC-based checkpoint, eviction and flow-control
+  detectors** against real `diagnostic.data` — see
+  `docs/TESTING-PLAYBOOK.md`. Real logs and metrics very welcome.
 
 mdbkit is validated against real-world structured logs (tens of thousands of
 lines) in addition to its synthetic test fixtures.

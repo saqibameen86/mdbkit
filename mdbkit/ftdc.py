@@ -421,6 +421,28 @@ CURATED: List[Tuple[str, str, str]] = [
     ("tickets.writeAvail",
      "serverStatus.wiredTiger.concurrentTransactions.write.available", "gauge"),
     ("mem.residentMB", "serverStatus.mem.resident", "gauge"),
+    # Checkpoint pressure. mongod does not log checkpoint duration at default
+    # verbosity on modern versions (those calls are LOGV2_DEBUG level 4), so
+    # FTDC is the authoritative source rather than the log.
+    ("checkpoint.lastMs",
+     "serverStatus.wiredTiger.transaction.transaction checkpoint most recent time (msecs)",
+     "gauge"),
+    ("checkpoint.totalMs",
+     "serverStatus.wiredTiger.transaction.transaction checkpoint total time (msecs)",
+     "counter"),
+    # Eviction done by application threads means the cache could not keep up
+    # and user operations are paying for it — the real eviction-pressure signal.
+    ("evict.appThreadPages",
+     "serverStatus.wiredTiger.cache.pages evicted by application threads",
+     "counter"),
+    ("evict.modifiedPages",
+     "serverStatus.wiredTiger.cache.modified pages evicted", "counter"),
+    # Flow control: the primary throttling writes because secondaries lag.
+    ("flowControl.isLagged", "serverStatus.flowControl.isLagged", "gauge"),
+    ("flowControl.laggedCount",
+     "serverStatus.flowControl.isLaggedCount", "counter"),
+    ("flowControl.waitMicros",
+     "serverStatus.flowControl.timeAcquiringMicros", "counter"),
     ("mem.virtualMB", "serverStatus.mem.virtual", "gauge"),
     ("sys.cpu.userMs", "systemMetrics.cpu.user_ms", "counter"),
     ("sys.cpu.systemMs", "systemMetrics.cpu.system_ms", "counter"),

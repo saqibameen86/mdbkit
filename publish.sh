@@ -4,6 +4,9 @@
 set -euo pipefail
 
 REPO="https://github.com/saqibameen86/mdbkit.git"
+# GIT_EMAIL decides who GitHub credits. Check https://github.com/settings/emails
+GIT_NAME="Saqib Ameen Subhan"
+GIT_EMAIL="saqibameen86@users.noreply.github.com"
 
 echo
 echo "=== mdbkit publish ==="
@@ -17,6 +20,8 @@ echo
 
 echo "[1/5] Preparing git..."
 [ -d .git ] || { echo "      initialising repository"; git init -q; }
+git config user.name "$GIT_NAME"
+git config user.email "$GIT_EMAIL"
 git branch -M main
 git remote remove origin 2>/dev/null || true
 git remote add origin "$REPO"
