@@ -13,7 +13,7 @@ REM ============================================================
 setlocal
 
 set GIT_NAME=Saqib Ameen Subhan
-set GIT_EMAIL=saqibameen86@users.noreply.github.com
+set GIT_EMAIL=288828588+saqibameen86@users.noreply.github.com
 set WRONG_EMAIL=saqib@users.noreply.github.com
 
 echo.

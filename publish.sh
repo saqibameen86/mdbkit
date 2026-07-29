@@ -6,7 +6,7 @@ set -euo pipefail
 REPO="https://github.com/saqibameen86/mdbkit.git"
 # GIT_EMAIL decides who GitHub credits. Check https://github.com/settings/emails
 GIT_NAME="Saqib Ameen Subhan"
-GIT_EMAIL="saqibameen86@users.noreply.github.com"
+GIT_EMAIL="288828588+saqibameen86@users.noreply.github.com"
 
 echo
 echo "=== mdbkit publish ==="
