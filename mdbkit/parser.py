@@ -154,3 +154,46 @@ PRE_44_HINT = (
     "pre-4.4 MongoDB log (plain text format). mdbkit targets MongoDB 4.4+ "
     "structured logs; for older logs, the original mtools still works."
 )
+
+
+def expand_paths(patterns) -> list:
+    """Resolve a list of paths/globs into an ordered file list.
+
+    Rotated logs are the normal case on a real server (mongod.log,
+    mongod.log.1.gz, ...), so every command accepts several files or a
+    glob and reads them as one stream. Files are ordered by name, which
+    matches MongoDB's own rotation naming.
+    """
+    import glob as _glob
+    import os
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    out = []
+    for pattern in patterns:
+        if pattern == "-":
+            out.append(pattern)
+            continue
+        if any(ch in pattern for ch in "*?["):
+            matches = sorted(_glob.glob(pattern))
+            if not matches:
+                raise FileNotFoundError("no files matched %r" % pattern)
+            out.extend(matches)
+        else:
+            out.append(pattern)
+    # De-duplicate while preserving order.
+    seen = set()
+    ordered = []
+    for p in out:
+        real = os.path.abspath(p) if p != "-" else p
+        if real in seen:
+            continue
+        seen.add(real)
+        ordered.append(p)
+    return ordered
+
+
+def iter_entries_multi(paths, stats: "ParseStats" = None):
+    """Iterate entries across several log files as a single stream."""
+    for path in expand_paths(paths):
+        for entry in iter_entries(path, stats):
+            yield entry

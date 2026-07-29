@@ -334,3 +334,117 @@ def render_ftdc_timeline(reader, step: int = 60) -> str:
     parts.append("")
     parts.append("Each row is the peak within a %ds bucket." % step)
     return "\n".join(parts)
+
+
+# -------------------------------------------------------------- compare ----
+
+def _pct_str(v: float) -> str:
+    if v == 0:
+        return "0%"
+    return "%+.0f%%" % v
+
+
+def render_compare(result, stats_before, stats_after, limit: int = 15) -> str:
+    parts = ["== mdbkit compare (did it help?) =="]
+    parts.append("before: %s lines   after: %s lines" % (
+        format(stats_before.parsed, ","), format(stats_after.parsed, ",")))
+
+    total_pct = result.to_dict()["totalChangePct"]
+    verdict = ("slow-query time DOWN %.0f%%" % abs(total_pct) if total_pct < 0
+               else "slow-query time UP %.0f%%" % total_pct if total_pct > 0
+               else "slow-query time unchanged")
+    parts.append("%s  (%s -> %s across compared shapes)" % (
+        verdict, _ms(result.before_total_ms), _ms(result.after_total_ms)))
+
+    buckets = [("improved", "IMPROVED"), ("regressed", "REGRESSED"),
+               ("new", "NEW"), ("gone", "GONE")]
+    counts = {name: len(result.by_status(name)) for name, _ in buckets}
+    parts.append("shapes: %d improved, %d regressed, %d new, %d gone, "
+                 "%d unchanged" % (
+                     counts["improved"], counts["regressed"], counts["new"],
+                     counts["gone"], len(result.by_status("unchanged"))))
+    parts.append("")
+
+    shown = 0
+    for status, label in buckets:
+        items = result.by_status(status)
+        if not items:
+            continue
+        parts.append("%s" % label)
+        for d in items:
+            if shown >= limit:
+                break
+            shown += 1
+            if d.before and d.after:
+                note = []
+                if d.plan_improved:
+                    note.append("COLLSCAN -> index")
+                if d.plan_regressed:
+                    note.append("index -> COLLSCAN")
+                if d.sort_fixed:
+                    note.append("in-memory sort gone")
+                extra = ("  [%s]" % ", ".join(note)) if note else ""
+                parts.append("  %s %s" % (d.ns, d.shape[:64]))
+                parts.append("    mean %s -> %s (%s)   scan %s -> %s%s" % (
+                    _ms(d.before.mean_ms), _ms(d.after.mean_ms),
+                    _pct_str(d.mean_pct),
+                    ("%.0f:1" % d.before.scan_ratio) if d.before.n_returned else "-",
+                    ("%.0f:1" % d.after.scan_ratio) if d.after.n_returned else "-",
+                    extra))
+            elif d.after:
+                parts.append("  %s %s" % (d.ns, d.shape[:64]))
+                parts.append("    not in the before log; now %dx, mean %s%s" % (
+                    d.after.count, _ms(d.after.mean_ms),
+                    "  [COLLSCAN]" if d.after.collscan else ""))
+            else:
+                parts.append("  %s %s" % (d.ns, d.shape[:64]))
+                parts.append("    was %dx at mean %s; absent from the after log" % (
+                    d.before.count, _ms(d.before.mean_ms)))
+        parts.append("")
+
+    if shown < len([d for d in result.deltas if d.status != "unchanged"]):
+        parts.append("(--limit %d shown; use --limit 0 for all)" % limit)
+    parts.append("Shapes seen fewer than the --min-count threshold are ignored, "
+                 "so a quiet log does not read as a regression.")
+    return "\n".join(parts)
+
+
+def render_shape_detail(s, stats) -> str:
+    """Everything known about one query shape."""
+    parts = ["== mdbkit queries — shape detail ==", render_parse_stats(stats), ""]
+    parts.append("namespace : %s" % s.shape.ns)
+    parts.append("operation : %s" % s.shape.operation)
+    parts.append("shape     : %s" % s.shape.pretty())
+    parts.append("")
+    parts.append("occurrences   : %d" % s.count)
+    parts.append("total time    : %s" % _ms(s.total_ms))
+    parts.append("mean / max    : %s / %s" % (_ms(s.mean_ms), _ms(s.max_ms)))
+    parts.append("docs examined : %s" % format(s.docs_examined, ","))
+    parts.append("docs returned : %s" % format(s.n_returned, ","))
+    if s.n_returned:
+        parts.append("scan ratio    : %.0f examined per document returned"
+                     % s.scan_ratio)
+    parts.append("keys examined : %s" % format(s.keys_examined, ","))
+    parts.append("")
+    if s.plan_summaries:
+        parts.append("plans observed")
+        for plan, n in s.plan_summaries.most_common():
+            parts.append("  %-40s %dx" % (plan[:40], n))
+        parts.append("")
+    flags = []
+    if s.collscan:
+        flags.append("COLLSCAN — no index used for at least one execution")
+    if s.in_memory_sort:
+        flags.append("in-memory SORT — results sorted after retrieval")
+    if flags:
+        parts.append("flags")
+        for f in flags:
+            parts.append("  %s" % f)
+        parts.append("")
+    if s.app_names:
+        parts.append("client applications")
+        for app, n in s.app_names.most_common(5):
+            parts.append("  %-30s %dx" % (app, n))
+        parts.append("")
+    parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
+    return "\n".join(parts)

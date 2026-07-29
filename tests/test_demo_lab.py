@@ -313,3 +313,170 @@ def test_cli_connections_shows_users(tmp_path, capsys):
     assert "authenticated users" in out
     assert "etl_batch" in out
     assert "last authenticated" in out
+
+
+# ------------------------------------------------------ 0.4: compare etc ---
+
+def test_compare_detects_the_index_win(tmp_path):
+    """The headline use case: COLLSCAN becomes an index scan and the mean
+    duration collapses. compare must call that improved."""
+    import json as _json
+    from mdbkit.compare import aggregate_file, compare
+
+    before_lines = DemoLog(scenario="mixed", minutes=40, seed=5).build()
+    (tmp_path / "before.log").write_text("\n".join(before_lines) + "\n")
+
+    after = []
+    for ln in before_lines:
+        d = _json.loads(ln)
+        a = d.get("attr") or {}
+        if a.get("ns") == "shop.orders" and a.get("planSummary") == "COLLSCAN":
+            a["planSummary"] = "IXSCAN { status: 1, createdAt: -1 }"
+            a["docsExamined"] = a.get("nreturned", 0)
+            a.pop("hasSortStage", None)
+            a["durationMillis"] = max(3, int(a["durationMillis"] * 0.02))
+        after.append(_json.dumps(d, separators=(",", ":")))
+    (tmp_path / "after.log").write_text("\n".join(after) + "\n")
+
+    b, _ = aggregate_file([str(tmp_path / "before.log")])
+    a, _ = aggregate_file([str(tmp_path / "after.log")])
+    result = compare(b, a)
+
+    improved = result.by_status("improved")
+    assert improved, "the index fix should register as an improvement"
+    d = next(x for x in improved if x.ns == "shop.orders")
+    assert d.plan_improved
+    assert d.sort_fixed
+    assert d.mean_pct < -50
+    assert result.to_dict()["totalChangePct"] < 0
+    assert not result.by_status("regressed")
+
+
+def test_compare_detects_a_regression(tmp_path):
+    import json as _json
+    from mdbkit.compare import aggregate_file, compare
+    before_lines = DemoLog(scenario="mixed", minutes=40, seed=9).build()
+    (tmp_path / "b.log").write_text("\n".join(before_lines) + "\n")
+    worse = []
+    for ln in before_lines:
+        d = _json.loads(ln)
+        a = d.get("attr") or {}
+        if a.get("ns") == "shop.users":
+            a["planSummary"] = "COLLSCAN"
+            a["durationMillis"] = a.get("durationMillis", 100) * 12
+        worse.append(_json.dumps(d, separators=(",", ":")))
+    (tmp_path / "a.log").write_text("\n".join(worse) + "\n")
+    b, _ = aggregate_file([str(tmp_path / "b.log")])
+    a, _ = aggregate_file([str(tmp_path / "a.log")])
+    result = compare(b, a)
+    regressed = result.by_status("regressed")
+    assert any(d.ns == "shop.users" and d.plan_regressed for d in regressed)
+
+
+def test_compare_identical_logs_show_no_change(tmp_path):
+    from mdbkit.compare import aggregate_file, compare
+    path, _ = build(tmp_path, minutes=40)
+    b, _ = aggregate_file([path])
+    a, _ = aggregate_file([path])
+    result = compare(b, a)
+    assert not result.by_status("improved")
+    assert not result.by_status("regressed")
+    assert not result.by_status("new")
+    assert not result.by_status("gone")
+
+
+def test_compare_ns_filter_and_min_count(tmp_path):
+    from mdbkit.compare import aggregate_file, compare
+    path, _ = build(tmp_path, minutes=40)
+    shapes, _ = aggregate_file([path])
+    result = compare(shapes, shapes, ns="shop.orders")
+    assert all(d.ns == "shop.orders" for d in result.deltas)
+    strict = compare(shapes, shapes, min_count=10_000)
+    assert strict.deltas == []
+
+
+def test_cli_compare(tmp_path, capsys):
+    from mdbkit.cli import main
+    p1, _ = build(tmp_path, minutes=20, seed=1)
+    p2 = tmp_path / "after.log"
+    p2.write_text("\n".join(DemoLog(minutes=20, seed=1).build()) + "\n")
+    assert main(["compare", p1, "--after", str(p2)]) == 0
+    out = capsys.readouterr().out
+    assert "did it help" in out
+    assert main(["compare", p1, "--after", str(p2), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "shapes" in data and "totalChangePct" in data
+
+
+# ------------------------------------------------- multi-file / globbing ---
+
+def test_expand_paths_glob_and_dedup(tmp_path):
+    from mdbkit.parser import expand_paths
+    for name in ("mongod.log", "mongod.log.1", "mongod.log.2"):
+        (tmp_path / name).write_text("{}\n")
+    got = expand_paths([str(tmp_path / "mongod.log*")])
+    assert len(got) == 3
+    assert got == sorted(got)                      # deterministic order
+    dup = expand_paths([str(tmp_path / "mongod.log"),
+                        str(tmp_path / "mongod.log")])
+    assert len(dup) == 1                           # de-duplicated
+    assert expand_paths("-") == ["-"]
+    with pytest.raises(FileNotFoundError):
+        expand_paths([str(tmp_path / "nothing*")])
+
+
+def test_rotated_logs_read_as_one_stream(tmp_path):
+    from mdbkit.parser import ParseStats, iter_entries_multi
+    a = tmp_path / "mongod.log.1"
+    b = tmp_path / "mongod.log"
+    a.write_text("\n".join(DemoLog(minutes=10, seed=1).build()) + "\n")
+    b.write_text("\n".join(DemoLog(minutes=10, seed=2).build()) + "\n")
+    one = ParseStats()
+    list(iter_entries_multi([str(a)], one))
+    both = ParseStats()
+    list(iter_entries_multi([str(tmp_path / "mongod.log*")], both))
+    assert both.parsed > one.parsed
+    assert both.unparsed == 0
+
+
+def test_cli_accepts_multiple_files(tmp_path, capsys):
+    from mdbkit.cli import main
+    a = tmp_path / "mongod.log.1"
+    b = tmp_path / "mongod.log"
+    a.write_text("\n".join(DemoLog(minutes=10, seed=1).build()) + "\n")
+    b.write_text("\n".join(DemoLog(minutes=10, seed=2).build()) + "\n")
+    assert main(["loginfo", str(a), str(b)]) == 0
+    assert main(["queries", str(tmp_path / "mongod.log*")]) == 0
+    assert main(["triage", str(tmp_path / "mongod.log*"),
+                 "--window", "0", "--no-sysprobe"]) == 0
+
+
+# ------------------------------------------------------ shape drill-down ---
+
+def test_shape_detail(tmp_path, capsys):
+    from mdbkit.cli import main
+    path, _ = build(tmp_path, minutes=40)
+    assert main(["queries", path, "--shape", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "shape detail" in out
+    assert "plans observed" in out
+    assert "client applications" in out
+    assert "scan ratio" in out
+
+
+def test_shape_out_of_range_is_an_error(tmp_path, capsys):
+    from mdbkit.cli import main
+    path, _ = build(tmp_path, minutes=20)
+    assert main(["queries", path, "--shape", "999"]) == 2
+    assert "out of range" in capsys.readouterr().err
+
+
+def test_shape_stats_track_apps_and_times(tmp_path):
+    path, _ = build(tmp_path, minutes=40)
+    agg = QueryAggregator()
+    for e in iter_entries(path):
+        agg.consume(e)
+    s = agg.results()[0]
+    assert s.app_names
+    assert s.first_ts is not None and s.last_ts is not None
+    assert s.to_dict()["appNames"]

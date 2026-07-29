@@ -1,274 +1,266 @@
 # mdbkit
 
-**An offline toolkit for MongoDB structured logs — log analysis, slow-query shapes, connection churn, and deterministic index advice.**
+[![CI](https://github.com/saqibameen86/mdbkit/actions/workflows/ci.yml/badge.svg)](https://github.com/saqibameen86/mdbkit/actions)
+[![PyPI](https://img.shields.io/pypi/v/mdbkit.svg)](https://pypi.org/project/mdbkit/)
+[![Python](https://img.shields.io/pypi/pyversions/mdbkit.svg)](https://pypi.org/project/mdbkit/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A spiritual successor to [mtools](https://github.com/rueckstiess/mtools)' log tools (`mloginfo`, `mlogfilter`) for the structured JSON log format MongoDB has used since 4.4 — the format mtools never supported. Built for DBAs and ops engineers running self-managed MongoDB 4.4 / 5.0 / 6.0 / 7.0 / 8.0.
+**An offline toolkit for MongoDB structured logs** — slow-query analysis,
+deterministic index advice, incident triage, and diagnostic-data decoding.
+For MongoDB 4.4 – 8.0, from the terminal, without connecting to anything.
 
-> **Privacy by design: mdbkit never makes a network call.** It reads log files (or stdin) and writes to stdout. No telemetry, no phoning home, no cloud. Your logs never leave your machine. It is safe to run on air-gapped database hosts.
+A spiritual successor to mtools' log tools, which never learned to read the
+JSON log format introduced in 4.4.
 
-## Why
+```
+namespace    op         count  cumMs  docsEx      scan     plan           shape
+shop.events  aggregate  29     3.2m   25,810,000  98889:1  COLLSCAN+SORT  {tenantId:eq, ts:gte} sort:{ts:-1}
+shop.orders  find       48     1.4m   6,000,000   2976:1   COLLSCAN+SORT  {status:eq, createdAt:gt}
+shop.users   find       31     3.7s   31          1:1      IXSCAN{email}  {email:eq}
+```
 
-MongoDB 4.4 switched to structured JSON logging, and the beloved mtools log commands stopped working — the issue has been open since 2020. Meanwhile, index recommendations from MongoDB's Performance Advisor require a paid Atlas tier or Cloud/Ops Manager. If you run Community Edition on your own infrastructure, you're back to reading raw JSON logs with `grep` and `jq`.
+Two of those need an index. One is already fine. That distinction is the
+whole point.
 
-mdbkit fills that gap: a single, dependency-free CLI that turns structured logs into answers.
+---
 
-## Try it in 30 seconds
+## Try it right now — no MongoDB required
 
-No MongoDB required — `mdbkit demo` writes a realistic log with a real
-incident in it:
+`mdbkit demo` writes a realistic log containing a real incident, so you can
+evaluate the tool in about a minute without touching a cluster:
 
 ```bash
 pip install mdbkit
-mdbkit demo --with-extras -o demo.log
 
-mdbkit loginfo demo.log
-mdbkit queries demo.log
-mdbkit triage demo.log --window 0 --no-sysprobe
+mdbkit demo --with-extras -o demo.log     # a log + indexes.json, schema.json, explain.json
+
+mdbkit loginfo demo.log                   # what is in this log?
+mdbkit queries demo.log                   # which query shapes cost the most?
+mdbkit triage demo.log --window 0         # what went wrong, and when?
+mdbkit connections demo.log               # who connected, and did anyone fail to?
 mdbkit advise demo.log --indexes indexes.json --schema schema.json
+mdbkit explain explain.json               # read a saved explain plan
 ```
 
-You will see a connection storm, a replica set election, an index build, and
-a collection scan burning 47 million document reads — then the candidate
-index that fixes it.
+The generated log contains a connection storm from one client, a replica set
+election, an index build, five failed logins from a service account, and an
+aggregation burning 25 million document reads to return 261 documents — then
+`advise` tells you which index fixes it.
+
+Output is deterministic: the same `--seed` always produces the same log, so a
+demo behaves identically every time. Scenarios are `incident`, `healthy` (the
+control case — useful for seeing what "nothing wrong" looks like) and `mixed`.
+
+Ready for a real server? Jump to [the workflows](#the-four-questions-it-answers).
+
+---
+
+## Is it safe to run on a production server?
+
+This is the right question to ask of any tool someone hands you. The honest
+answer, and how to check it yourself.
+
+**What mdbkit never does:**
+
+| | |
+|---|---|
+| Connect to your database | Analysis commands read **files**. There is no driver, no URI, no connection. |
+| Send anything anywhere | There is no network code at all. No telemetry, no update check, no crash reporting. |
+| Change anything | It is strictly read-only. Where an action would help, it **prints the command** for you to review and run. |
+| Execute what it reads | Log lines and explain files are parsed as data with `json.loads`. Nothing is ever evaluated. |
+| Pull in dependencies | Zero runtime dependencies. Nothing in the supply chain but the Python standard library. |
+
+**Verify it yourself in 60 seconds** — this is a small, dependency-free
+codebase specifically so that you can:
+
+```bash
+# 1. No network, no shell-outs, no eval anywhere in the analysis code
+pip show -f mdbkit | head -3
+grep -rn "socket\|urllib\|requests\|http\|eval(\|exec(" $(python -c "import mdbkit,os;print(os.path.dirname(mdbkit.__file__))")
+
+# 2. Confirm it has no dependencies
+pip show mdbkit | grep Requires
+
+# 3. Watch it make no connections while it runs (Linux)
+strace -f -e trace=network mdbkit queries mongod.log 2>&1 | grep -c socket
+```
+
+The grep returns nothing for every analysis module. The only file that starts
+a process is `lab.py`, which exists to create a *throwaway test cluster* and
+is documented as an explicit exception below.
+
+**What it does read:** the log file you point it at; optionally
+`diagnostic.data` (metrics only, never documents); optionally `indexes.json`
+and `schema.json` that **you** generate with scripts mdbkit prints for you to
+inspect first. On the database host it also reads `/proc` and calls `statvfs`
+for disk and memory figures — nothing that leaves the machine.
+
+**What leaves your machine: nothing.** There is no server to send it to.
+
+**Still cautious?** That is reasonable. Run `mdbkit demo` first and see what
+the output looks like on synthetic data, or `mdbkit lab` to try it against a
+disposable local cluster before you point it at anything real. Both exist for
+exactly this reason.
+
+Full detail: [SECURITY.md](SECURITY.md).
+
+---
 
 ## Install
 
-**Recommended on any Linux/Mac/Windows:**
+**Most systems:**
 ```bash
 pip install mdbkit
 ```
 
 **Ubuntu 20.04 / Debian / Amazon Linux 2 (Python 3.8 hosts):**
 ```bash
-# Step 1: install pipx (manages isolated Python tool environments)
-sudo apt install pipx        # Ubuntu/Debian
-# or: sudo dnf install pipx  # RHEL/Rocky/Amazon Linux
-
-# Step 2: install mdbkit
+sudo apt install pipx        # or: sudo dnf install pipx
 pipx install mdbkit
-
-# Step 3: if pipx is not on your PATH yet
 pipx ensurepath && source ~/.bashrc
 ```
 
-**If you get "externally-managed-environment" on modern Ubuntu (23.04+):**
+**Modern Ubuntu/Debian complaining about "externally-managed-environment":**
 ```bash
 pip install mdbkit --break-system-packages
 ```
 
-**Air-gapped database hosts (no internet access):**
+**Air-gapped database hosts:**
 ```bash
-# On a connected machine, download the wheel file
-pip download mdbkit -d ./wheels
-
-# Copy the ./wheels folder to the database host, then run
+pip download mdbkit -d ./wheels          # on a connected machine
+# copy ./wheels across, then:
 pip install --no-index --find-links ./wheels mdbkit
 ```
 
-**Upgrading to a newer version:**
+**Upgrading:**
 ```bash
-pip install --upgrade mdbkit      # if installed with pip
-pipx upgrade mdbkit               # if installed with pipx
-mdbkit --version                  # confirm
-```
-mdbkit never updates itself and never checks for updates — it makes no network
-calls at all. Upgrades are always explicit.
-
-Requires Python 3.8+. Zero runtime dependencies — safe to install on production hosts.
-
-> mdbkit is a Python package distributed via PyPI. It is **not** available
-> via `apt install`, `dnf install`, or `yum install` — use `pip` or `pipx`.
-
-## Quick start
-
-```bash
-# Overall log summary: versions, restarts, connection counts, error/warning totals
-mdbkit loginfo /var/log/mongodb/mongod.log
-
-# Slow queries grouped by query shape (literals stripped), ranked by total time
-mdbkit queries mongod.log
-mdbkit queries mongod.log --sort scanRatio --limit 10 --json
-
-# Columns: cumMs = time summed across ALL occurrences of that shape (not one
-# query); docsEx = documents examined; scan = examined per doc returned;
-# plan = the plan MongoDB chose (COLLSCAN / IXSCAN{fields} / +SORT)
-
-# Connection churn by source IP, appName, and driver
-mdbkit connections mongod.log
-
-# Filter raw log lines (output stays valid logv2 JSON — chainable)
-mdbkit filter mongod.log --slow 500 --component COMMAND --ns shop.orders
-mdbkit filter mongod.log --severity E --last 20      # 20 most recent errors
-mdbkit filter mongod.log --slow 200 --limit 50       # first 50 matches only
-
-# Time ranges — with or without a timezone offset
-mdbkit filter mongod.log --from 2026-07-01T08:00:00+04:00 --to 2026-07-01T09:00:00+04:00
-mdbkit filter mongod.log --from 2026-07-01T08:00:00Z     # UTC
-mdbkit filter mongod.log --from 2026-07-01T08:00:00      # log's own timezone
-mdbkit filter mongod.log --from 2026-07-01 | mdbkit queries -
-
-# Rotated/compressed logs work directly
-mdbkit queries mongod.log.2.gz
+pip install --upgrade mdbkit             # or: pipx upgrade mdbkit
+mdbkit --version
 ```
 
-### Step 1 — Export your indexes and schema (recommended)
+Requires Python 3.8+. mdbkit never updates itself and never checks for
+updates — upgrades are always explicit.
 
-mdbkit never connects to your database directly. Instead it prints small
-`mongosh` scripts you run yourself, so you can inspect exactly what they do
-before running them. The exports contain **field names and types only — no
-document values.**
+> mdbkit is a Python package on PyPI. It is **not** in `apt`/`dnf`/`yum`.
 
-**Generate the export scripts:**
+---
+
+## The four questions it answers
+
+Every command reads files or stdin and accepts several files or a glob, so
+rotated logs work as one stream: `mdbkit queries "mongod.log*"`.
+
+### 1. Why is my database slow?
+
 ```bash
+mdbkit queries mongod.log                       # shapes ranked by total time
+mdbkit queries mongod.log --sort scanRatio      # worst examined:returned first
+mdbkit queries mongod.log --shape 1             # full detail on one shape
+```
+
+`cumMs` is time summed across **all** occurrences of a shape, not one query.
+`scan` is documents examined per document returned — `1:1` is healthy,
+`98889:1` is a missing index. `plan` shows what MongoDB actually chose.
+
+### 2. What index would fix it?
+
+```bash
+# Optional but much sharper: export what already exists.
 mdbkit export-script indexes > export_indexes.js
 mdbkit export-script schema  > export_schema.js
-```
 
-**Run them against your database** (replace with your actual host, port, and credentials):
-```bash
-# Basic (local, no auth):
-mongosh --quiet "mongodb://localhost/yourdb" export_indexes.js > indexes.json
-mongosh --quiet "mongodb://localhost/yourdb" export_schema.js  > schema.json
-
-# With authentication (typical production setup):
-mongosh --quiet \
-  --host your_db_host \
-  --port 27017 \
-  --username your_username \
-  --password your_password \
+mongosh --quiet --host your_db_host --port 27017 \
+  --username your_username --password your_password \
   --authenticationDatabase admin \
-  --eval "$(cat export_indexes.js)" > indexes.json
+  --eval "$(cat export_indexes.js)" > indexes.json      # repeat for schema
 
-mongosh --quiet \
-  --host your_db_host \
-  --port 27017 \
-  --username your_username \
-  --password your_password \
-  --authenticationDatabase admin \
-  --eval "$(cat export_schema.js)" > schema.json
-```
-
-> In these examples, replace `yourdb` with your actual database name (e.g. `shop`, `myapp`).
-> The `--authenticationDatabase` is usually `admin` unless you use per-db auth.
-
-### Step 2 — Run index advice
-
-```bash
-# Basic (without index/schema context — still useful, but lower confidence):
-mdbkit advise mongod.log
-
-# Full (with context — sharper recommendations):
-mdbkit advise mongod.log --indexes indexes.json --schema schema.json
-
-# Focus on one collection (recommended for large logs):
 mdbkit advise mongod.log --indexes indexes.json --schema schema.json --ns shop.orders
 ```
 
-Sample output:
-```
-[1] shop.orders  —  confidence: HIGH
-    query shape : {createdAt:gt, status:eq} sort:{createdAt:-1}
-    candidate   : { status: 1, createdAt: -1 }
-    evidence    : COLLSCAN observed in planSummary
-    evidence    : examined 251,400 docs to return 73 (3444:1)
-    caveat      : Every index adds write and storage overhead ...
-    validate    : Re-run the query with .explain('executionStats') ...
-```
+Every recommendation states the evidence it reasoned from, a confidence
+level, the caveats, and how to validate it. It says *candidate*, not
+*command*, and it never tells you to drop an index.
 
-With `--indexes`, mdbkit checks candidates against your existing indexes —
-flagging when an existing index should already cover the query (it flags, never
-auto-drops). With `--schema`, it warns about array (multikey) fields,
-low-cardinality booleans, and field-name typos, and adjusts confidence
-accordingly.
-
-### Incident triage (beta)
+### 3. What happened at 3am?
 
 ```bash
-mdbkit triage /var/log/mongodb/mongod.log     # last 60 minutes (default)
-mdbkit triage mongod.log --window 30          # last 30 minutes
-mdbkit triage mongod.log --window 0           # whole file
-mdbkit triage mongod.log --dbpath /data/db    # if auto-discovery misses it
-mdbkit triage mongod.log --no-sysprobe        # analyzing a log copied off-host
+mdbkit triage /var/log/mongodb/mongod.log       # last 60 minutes by default
+mdbkit triage mongod.log --window 0             # the whole file
+mdbkit triage mongod.log --report incident.html # something to attach to a ticket
 ```
 
-**Defaults to the last 60 minutes of log time**, because triage is for
-incidents happening now or just finished. In one command:
+Cluster health, elections, connection storms, hot collections, index builds,
+error clusters, slow-query peaks — plus disk, memory, CPU and FTDC metrics
+when run on the database host. Every finding ends with the next command to
+run.
 
-- **cluster health** — this node's replica set role, every peer's last known
-  state, heartbeat failures, and whether the node is still serving
-- restarts, error clusters, election/stepdown events
-- connection storms — with the peak minute and the top source IPs
-- slow-query volume and the peak minute, so you know *when* it hurt
-- COLLSCAN share of slow operations (the missing-index signal)
-- the hot collection plus its top three query shapes inline
-- index-build activity (a common cause of surprise load)
-- slow checkpoints, cache eviction pressure, flow control
-- disk / memory / CPU load, and the running mongod's RSS and uptime
-
-When run on the database host, mdbkit finds `dbPath` automatically — from the
-log's startup line, or the running `mongod` process, or `/etc/mongod.conf`,
-or common defaults — so the disk check works even when the current log has no
-startup event. **`diagnostic.data` lives inside the dbPath, so it is picked up
-automatically too**: you only need `--ftdc` to point somewhere else, such as a
-directory copied off another host. All probing is stdlib-only (`/proc`,
-`statvfs`); no shell-outs, nothing leaves the machine.
-
-Cluster health is derived entirely from the log — no connection to the
-database. It reports what the node last said about itself and its peers, which
-is the honest limit of an offline tool, and enough to answer "is this node
-serving, and what does it think of the others?"
-
-Read-only: it never connects to the database, and every finding ends with a
-next step for a human to review. Detectors marked beta are pattern-matched and
-clearly labeled while broader validation is pending.
-
-### Explain-plan analysis
-
-Got a slow query in hand rather than a log? Save its explain output and ask
-mdbkit what's wrong:
+### 4. Did my change actually help?
 
 ```bash
-# in mongosh:  EJSON.stringify(db.orders.find({...}).sort({...}).explain("executionStats"))
-mdbkit explain explain.json
+mdbkit compare before.log --after after.log
 ```
 
-You get the plan chain (`SORT -> COLLSCAN`), the examined/returned math, plain-
-English verdicts (full collection scan, blocking in-memory sort, weakly
-selective index, covered query), and — when the plan needs help — the same
-evidence-backed candidate index the advisor would produce. Works with find and
-aggregate explains, classic and SBE (6.0+) plans, and sharded winning plans.
+```
+slow-query time DOWN 32%  (6.0m -> 4.1m across compared shapes)
+shapes: 1 improved, 0 regressed, 0 new, 0 gone, 4 unchanged
 
-### Design principles
-
-* **Deterministic.** Same log in, same advice out. Rules, not AI. Every
-  recommendation shows its evidence and its rule of reasoning.
-* **Candidates, not commands.** mdbkit never tells you to blindly run
-  `createIndex`, and never advises dropping an index.
-* **Honest about uncertainty.** Shapes seen once are labeled low-confidence;
-  `$or`, `$regex`, `$in` and low-selectivity operators carry explicit caveats.
-* **Offline, always.** No network code exists in this codebase.
-
-## What it reads
-
-Any MongoDB 4.4+ structured log: `mongod.log`, `mongos` logs, rotated `.gz`
-files, or stdin (`-`). Slow-query lines (`"msg":"Slow query"`) are logged by
-default for operations over `slowms` (100 ms); lower `slowms` or enable
-profiling level 1 to capture more:
-
-```js
-db.setProfilingLevel(1, { slowms: 50 })
+IMPROVED
+  shop.orders {createdAt:gt, status:eq} sort:{createdAt:-1}
+    mean 1.7s -> 33ms (-98%)   scan 2976:1 -> 1:1  [COLLSCAN -> index, in-memory sort gone]
 ```
 
-Pre-4.4 plain-text logs are detected and politely refused — for those, the
-original mtools still works.
+The natural follow-up to `advise`: you created the index, a day passed, and
+this tells you whether it worked.
+
+**Bonus — who connected?**
+
+```bash
+mdbkit connections mongod.log
+```
+
+Per-IP churn with first/last seen, plus an authenticated-users table showing
+successful and failed logins per account and when each last authenticated —
+the question that starts most access incidents.
+
+---
+
+## Trying it against a real cluster
+
+`mdbkit lab` starts a **disposable local MongoDB** so you can test against a
+real server without touching anything that matters.
+
+```bash
+mdbkit lab start                    # 3-node replica set on 127.0.0.1:28110-28112
+mdbkit lab seed                     # 50k documents + a deliberately mixed workload
+mdbkit queries $(mdbkit lab logs | head -1)
+mdbkit lab destroy --yes            # remove it entirely
+```
+
+It binds to localhost only, uses ports far from 27017 so it can never be
+confused with a real deployment, and refuses to touch any directory it did
+not create. It is the one command that starts external processes — see
+[SECURITY.md](SECURITY.md).
+
+Full options and more examples: [`mdbkit lab`](#mdbkit-lab) in the reference.
+
+---
 
 ## Command reference
 
 Every command reads files or stdin and writes to stdout. `--help` works on any
 command (`mdbkit queries --help`). Global: `mdbkit --version`.
 
-All commands that read a log accept a path to a `.log` file, a rotated `.gz`
-file, or `-` for stdin.
+All commands that read a log accept one or more paths, a shell glob, a
+rotated `.gz` file, or `-` for stdin. Several files are read as a single
+stream in filename order, which matches MongoDB's rotation naming:
+
+```bash
+mdbkit queries mongod.log                       # one file
+mdbkit queries mongod.log.1 mongod.log          # explicit list
+mdbkit queries "mongod.log*"                    # glob (quote it)
+mdbkit queries /var/log/mongodb/mongod.log.*.gz # compressed archives
+cat mongod.log | mdbkit queries -               # stdin
+```
 
 ---
 
@@ -317,6 +309,33 @@ query with different parameters is counted once.
 mdbkit queries mongod.log
 mdbkit queries mongod.log --sort scanRatio --limit 10
 mdbkit queries mongod.log --min-ms 500 --json
+mdbkit queries "mongod.log*"              # rotated logs as one stream
+mdbkit queries mongod.log --shape 1       # drill into the worst offender
+```
+
+`--shape N` expands one row of the table:
+
+```
+namespace : shop.events
+shape     : {tenantId:eq, ts:gte} sort:{ts:-1}
+
+occurrences   : 29
+total time    : 3.2m
+mean / max    : 6.6s / 8.9s
+docs examined : 25,810,000
+docs returned : 261
+scan ratio    : 98889 examined per document returned
+
+plans observed
+  COLLSCAN                                 29x
+
+flags
+  COLLSCAN — no index used for at least one execution
+  in-memory SORT — results sorted after retrieval
+
+client applications
+  ReportWorker                   15x
+  OrderService                   7x
 ```
 
 ---
@@ -669,6 +688,66 @@ mdbkit advise  $(mdbkit lab logs | head -1)
 mdbkit lab destroy --yes            # remove everything
 ```
 
+**`mdbkit lab logs`** prints the log file path of every node, one per line,
+so it composes with the other commands instead of you hunting for paths:
+
+```bash
+mdbkit lab logs
+# /home/you/.mdbkit-lab/node0/mongod.log
+# /home/you/.mdbkit-lab/node1/mongod.log
+# /home/you/.mdbkit-lab/node2/mongod.log
+
+mdbkit queries $(mdbkit lab logs | head -1)     # just the primary
+mdbkit triage  $(mdbkit lab logs)               # all three as one stream
+mdbkit loginfo $(mdbkit lab logs | sed -n 2p)   # a specific secondary
+```
+
+**A single node**, when you do not need replication — faster to start and it
+does not require `mongosh`:
+
+```bash
+mdbkit lab start --standalone
+mdbkit lab seed --docs 5000
+mdbkit queries $(mdbkit lab logs)
+mdbkit lab destroy --yes
+```
+
+**Several labs side by side**, for example to compare two MongoDB versions or
+keep one running while you break another:
+
+```bash
+mdbkit lab start --dir ~/lab-a --port 28110
+mdbkit lab start --dir ~/lab-b --port 28210 --standalone
+
+mdbkit lab status --dir ~/lab-a
+mdbkit lab destroy --dir ~/lab-b --yes
+```
+
+**Pause without losing data** — `stop` leaves the data directory intact so
+you can start again later; only `destroy` deletes anything:
+
+```bash
+mdbkit lab stop                     # nodes down, data kept
+mdbkit lab start                    # back up with the same data
+mdbkit lab status                   # ports, pids, running or not
+```
+
+**A complete before/after experiment**, which is what `lab` is really for:
+
+```bash
+mdbkit lab start && mdbkit lab seed
+cp $(mdbkit lab logs | head -1) before.log
+
+mongosh --port 28110 --eval \
+  'db.getSiblingDB("shop").orders.createIndex({status:1, createdAt:-1})'
+
+mdbkit lab seed                     # run the workload again with the index
+cp $(mdbkit lab logs | head -1) after.log
+
+mdbkit compare before.log --after after.log
+mdbkit lab destroy --yes
+```
+
 `seed` runs indexed point lookups alongside deliberately unindexed queries —
 an equality-plus-range-plus-sort with no supporting index, an aggregation
 that scans the collection, and updates whose predicate has no index — so the
@@ -677,6 +756,44 @@ log immediately contains something worth analysing.
 **Safety.** The lab binds to `127.0.0.1` only, refuses to use or delete any
 directory it did not create, and never touches a MongoDB it did not start.
 It is a laptop and scratch-VM tool, not a deployment tool.
+
+---
+
+### `mdbkit compare BEFORE --after AFTER`
+
+Diffs query shapes between two logs and reports what improved, what
+regressed, and what is new. The natural follow-up to `advise`: you created an
+index, a day passed, and this answers whether it worked.
+
+| Option | Default | Description |
+|---|---|---|
+| `--after FILE...` | required | The log(s) from after the change |
+| `--ns NAMESPACE` | all | Compare only one namespace |
+| `--min-count N` | 3 | Ignore shapes seen fewer than N times, so noise in a quiet log does not read as a regression |
+| `--min-ms N` | 0 | Ignore operations faster than this |
+| `--limit N` | 15 | Shapes to print (`0` = all) |
+| `--include-system` | off | Include internal `admin`/`config`/`local` namespaces |
+| `--report FILE` | | Write a shareable `.md` or `.html` report |
+| `--json` | | Machine-readable output |
+
+```bash
+mdbkit compare before.log --after after.log
+mdbkit compare before.log --after after.log --ns shop.orders
+mdbkit compare "old/mongod.log*" --after "new/mongod.log*" --report change.html
+```
+
+```
+slow-query time DOWN 32%  (6.0m -> 4.1m across compared shapes)
+shapes: 1 improved, 0 regressed, 0 new, 0 gone, 4 unchanged
+
+IMPROVED
+  shop.orders {createdAt:gt, status:eq} sort:{createdAt:-1}
+    mean 1.7s -> 33ms (-98%)   scan 2976:1 -> 1:1  [COLLSCAN -> index, in-memory sort gone]
+```
+
+A shape counts as improved or regressed on a plan change (COLLSCAN becoming
+an index scan, or the reverse), on an in-memory sort disappearing, or on mean
+duration moving by more than 20%.
 
 ---
 

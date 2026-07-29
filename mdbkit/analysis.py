@@ -201,11 +201,21 @@ class ShapeStats:
     collscan: bool = False
     in_memory_sort: bool = False
     plan_summaries: Counter = field(default_factory=Counter)
+    app_names: Counter = field(default_factory=Counter)
+    first_ts: object = None
+    last_ts: object = None
     example: str = ""
 
     def add(self, entry: LogEntry):
         attr = entry.attr
         self.count += 1
+        app = attr.get("appName")
+        if app:
+            self.app_names[str(app)] += 1
+        if entry.ts is not None:
+            if self.first_ts is None:
+                self.first_ts = entry.ts
+            self.last_ts = entry.ts
         self.durations.append(int(attr.get("durationMillis", 0) or 0))
         self.docs_examined += int(attr.get("docsExamined", 0) or 0)
         self.keys_examined += int(attr.get("keysExamined", 0) or 0)
@@ -270,6 +280,9 @@ class ShapeStats:
             "collscan": self.collscan,
             "inMemorySort": self.in_memory_sort,
             "planSummaries": dict(self.plan_summaries),
+            "appNames": dict(self.app_names.most_common()),
+            "firstSeen": self.first_ts.isoformat() if self.first_ts else None,
+            "lastSeen": self.last_ts.isoformat() if self.last_ts else None,
         }
 
 

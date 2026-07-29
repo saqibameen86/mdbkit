@@ -30,7 +30,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .analysis import QueryAggregator
 from .parser import (ID_CONN_ACCEPTED, ID_LISTENING, ID_SHUTDOWN,
-                     ID_STARTUP, LogEntry, ParseStats, iter_entries)
+                     ID_STARTUP, LogEntry, ParseStats, iter_entries,
+                     iter_entries_multi)
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
 DEFAULT_WINDOW_MIN = 60
@@ -745,17 +746,18 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
     if window_min is None:
         window_min = DEFAULT_WINDOW_MIN
 
+    paths = logfile if isinstance(logfile, list) else [logfile]
     cutoff = None
-    if window_min and logfile != "-":
+    if window_min and paths != ["-"]:
         pre = ParseStats()
-        for _ in iter_entries(logfile, pre):
+        for _ in iter_entries_multi(paths, pre):
             pass
         if pre.last_ts:
             cutoff = pre.last_ts - timedelta(minutes=window_min)
 
     stats = ParseStats()
     engine = TriageEngine()
-    for entry in iter_entries(logfile, stats):
+    for entry in iter_entries_multi(paths, stats):
         if cutoff and entry.ts and entry.ts < cutoff:
             continue
         engine.consume(entry)

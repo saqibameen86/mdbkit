@@ -14,7 +14,8 @@ from . import __version__
 from .advisor import advise, load_indexes, load_schema
 from .analysis import ConnectionAggregator, QueryAggregator, SummaryAggregator
 from .filtering import Filter, parse_when
-from .parser import PRE_44_HINT, ParseStats, iter_entries
+from .parser import (PRE_44_HINT, ParseStats, expand_paths, iter_entries,
+                     iter_entries_multi)
 from .render import (
     dump_json,
     render_connections,
@@ -34,7 +35,7 @@ def cmd_loginfo(args) -> int:
     _warn_large_file(args.logfile)
     stats = ParseStats()
     agg = SummaryAggregator()
-    for entry in iter_entries(args.logfile, stats):
+    for entry in iter_entries_multi(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
     if args.json:
@@ -52,7 +53,7 @@ def cmd_queries(args) -> int:
     stats = ParseStats()
     agg = QueryAggregator(min_ms=args.min_ms,
                           include_system=getattr(args, "include_system", False))
-    for entry in iter_entries(args.logfile, stats):
+    for entry in iter_entries_multi(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
     results = agg.results(sort_by=args.sort, limit=args.limit)
@@ -60,6 +61,18 @@ def cmd_queries(args) -> int:
         print("note: excluded %d internal operation(s) on admin/config/local "
               "(--include-system to show them)" % agg.skipped_system,
               file=sys.stderr)
+    if getattr(args, "shape", None):
+        from .render import render_shape_detail
+        idx = args.shape - 1
+        if idx < 0 or idx >= len(results):
+            print("error: --shape %d is out of range (1..%d)"
+                  % (args.shape, len(results)), file=sys.stderr)
+            return 2
+        if args.json:
+            print(dump_json(results[idx].to_dict()))
+        else:
+            print(render_shape_detail(results[idx], stats))
+        return 0
     if args.report:
         from .report import Report, stamp
         rep = Report("MongoDB slow query analysis", stamp())
@@ -86,7 +99,7 @@ def cmd_queries(args) -> int:
 def cmd_connections(args) -> int:
     stats = ParseStats()
     agg = ConnectionAggregator()
-    for entry in iter_entries(args.logfile, stats):
+    for entry in iter_entries_multi(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
     if args.json:
@@ -132,7 +145,7 @@ def cmd_filter(args) -> int:
     shown = 0
     tail = deque(maxlen=args.last) if args.last else None
 
-    for entry in iter_entries(args.logfile, stats):
+    for entry in iter_entries_multi(args.logfile, stats):
         if not flt.matches(entry):
             continue
         matched += 1
@@ -161,12 +174,17 @@ def cmd_filter(args) -> int:
     return 0
 
 
-def _warn_large_file(logfile: str) -> None:
-    """Warn when a log file is large so users know to be patient."""
-    if logfile == "-":
+def _warn_large_file(logfile) -> None:
+    """Warn when the input is large so users know to be patient."""
+    paths = logfile if isinstance(logfile, list) else [logfile]
+    paths = [p for p in paths if p != "-"]
+    if not paths:
         return
     try:
-        mb = os.path.getsize(logfile) / 1024 / 1024
+        mb = sum(os.path.getsize(p) for p in paths) / 1024 / 1024
+        if len(paths) > 1:
+            print("note: reading %d files as one stream" % len(paths),
+                  file=sys.stderr)
         if mb > 500:
             print(f"note: {logfile} is {mb:.0f} MB — analysis may take several "
                   f"minutes. Ctrl-C to abort.", file=sys.stderr)
@@ -182,7 +200,7 @@ def cmd_advise(args) -> int:
     stats = ParseStats()
     agg = QueryAggregator(min_ms=args.min_ms,
                           include_system=getattr(args, "include_system", False))
-    for entry in iter_entries(args.logfile, stats):
+    for entry in iter_entries_multi(args.logfile, stats):
         agg.consume(entry)
     _warn_if_pre44(stats)
     indexes = load_indexes(args.indexes) if args.indexes else None
@@ -351,6 +369,42 @@ def cmd_ftdc(args) -> int:
     return 0
 
 
+def cmd_compare(args) -> int:
+    from .compare import aggregate_file, compare
+    from .render import render_compare
+    _warn_large_file(args.before)
+    _warn_large_file(args.after)
+    try:
+        before, sb = aggregate_file(args.before, min_ms=args.min_ms,
+                                    include_system=args.include_system)
+        after, sa = aggregate_file(args.after, min_ms=args.min_ms,
+                                   include_system=args.include_system)
+    except FileNotFoundError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    result = compare(before, after, min_count=args.min_count, ns=args.ns)
+    if args.json:
+        print(dump_json(result.to_dict()))
+    elif args.report:
+        from .report import Report, stamp
+        rep = Report("MongoDB before/after comparison", stamp())
+        rows = []
+        for d in result.deltas:
+            if d.status == "unchanged":
+                continue
+            rows.append([d.ns, d.status, d.shape[:60],
+                         round(d.before.mean_ms) if d.before else "-",
+                         round(d.after.mean_ms) if d.after else "-",
+                         "%+.0f%%" % d.mean_pct if d.before and d.after else "-"])
+        rep.table("Query shapes", ["namespace", "status", "shape",
+                                   "mean before (ms)", "mean after (ms)",
+                                   "change"], rows)
+        print("wrote %s" % rep.write(args.report), file=sys.stderr)
+    else:
+        print(render_compare(result, sb, sa, limit=args.limit))
+    return 0
+
+
 def cmd_demo(args) -> int:
     from .demo import DemoLog, write_extras
     try:
@@ -468,7 +522,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
-        sp.add_argument("logfile", help="path to mongod/mongos log (.log or .gz), or '-' for stdin")
+        sp.add_argument("logfile", nargs="+",
+                        help="mongod/mongos log file(s) or a glob (.log, .gz), "
+                             "or '-' for stdin. Rotated logs are read as one "
+                             "stream, e.g. \"mongod.log*\"")
         sp.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
     sp = sub.add_parser("loginfo", help="overall log summary (versions, restarts, counts)")
@@ -489,6 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "not your workload)")
     sp.add_argument("--report", metavar="FILE",
                     help="write a shareable .md or .html report instead")
+    sp.add_argument("--shape", type=int, metavar="N",
+                    help="show full detail for shape N from the table "
+                         "(plans, clients, timings, scan ratio)")
     sp.set_defaults(func=cmd_queries)
 
     sp = sub.add_parser("connections", help="connection churn by source IP and app")
@@ -496,7 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_connections)
 
     sp = sub.add_parser("filter", help="stream matching raw log lines (chainable)")
-    sp.add_argument("logfile")
+    sp.add_argument("logfile", nargs="+",
+                    help="log file(s) or a glob, or '-' for stdin")
     sp.add_argument("--component", help="e.g. COMMAND, NETWORK, REPL")
     sp.add_argument("--severity", help="I, W, E, F")
     sp.add_argument("--ns", help="exact namespace, e.g. shop.orders")
@@ -548,7 +609,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="one-command incident snapshot (beta): elections, "
                              "storms, hot collections, errors + local disk/"
                              "memory/load probes")
-    sp.add_argument("logfile", help="mongod log (.log or .gz), or '-'")
+    sp.add_argument("logfile", nargs="+",
+                    help="mongod log file(s) or a glob, or '-' for stdin")
     sp.add_argument("--window", type=int, metavar="MINUTES",
                     help="analyze only the last N minutes of log time "
                          "(default: whole file)")
@@ -586,6 +648,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_ftdc)
+
+    sp = sub.add_parser("compare",
+                        help="diff two logs: did the index actually help?")
+    sp.add_argument("before", nargs="+",
+                    help="log file(s) from before the change")
+    sp.add_argument("--after", nargs="+", required=True,
+                    help="log file(s) from after the change")
+    sp.add_argument("--ns", metavar="NAMESPACE",
+                    help="only compare this namespace")
+    sp.add_argument("--min-count", type=int, default=3,
+                    help="ignore shapes seen fewer than N times in a log "
+                         "(default 3, so noise is not read as a regression)")
+    sp.add_argument("--min-ms", type=int, default=0,
+                    help="ignore operations faster than this")
+    sp.add_argument("--limit", type=int, default=15,
+                    help="shapes to print (default 15, 0 = all)")
+    sp.add_argument("--include-system", action="store_true",
+                    help="include internal admin/config/local namespaces")
+    sp.add_argument("--report", metavar="FILE",
+                    help="write a shareable .md or .html report instead")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_compare)
 
     sp = sub.add_parser("demo",
                         help="generate a realistic sample log so you can try "
