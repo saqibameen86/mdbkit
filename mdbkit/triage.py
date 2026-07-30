@@ -112,6 +112,7 @@ class TriageEngine:
         self.heartbeat_errors = Counter()
         self.listening = False
         self.shutdown_at = None
+        self.log_host = None
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
@@ -121,6 +122,8 @@ class TriageEngine:
         msg_l = entry.msg.lower()
         wt_msg = str(entry.attr.get("message", "")) if entry.attr else ""
 
+        if entry.msg_id == ID_STARTUP and entry.attr.get("host"):
+            self.log_host = str(entry.attr.get("host")).split(":")[0]
         if entry.msg_id == ID_STARTUP:
             self.startups.append(entry.ts)
             self.dbpath = entry.attr.get("dbPath") or self.dbpath
@@ -451,24 +454,42 @@ def _read(path: str, limit: int = 65536) -> str:
         return ""
 
 
-def find_mongod() -> Optional[Tuple[int, List[str]]]:
-    """Locate a running mongod by reading /proc — no shell-outs."""
+def find_mongods() -> List[Tuple[int, List[str]]]:
+    """Locate every running mongod by reading /proc — no shell-outs.
+
+    Returning all of them matters: a host can run a shard and a config
+    server, or several test instances. Silently picking the first one found
+    means analysing the wrong deployment's dbPath.
+    """
+    out: List[Tuple[int, List[str]]] = []
     if not os.path.isdir("/proc"):
-        return None
+        return out
     try:
-        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        pids = sorted(int(d) for d in os.listdir("/proc") if d.isdigit())
     except OSError:
-        return None
+        return out
     for pid in pids:
-        cmdline = _read("/proc/%s/cmdline" % pid, 8192)
+        cmdline = _read("/proc/%d/cmdline" % pid, 8192)
         if not cmdline:
             continue
         argv = [a for a in cmdline.split("\0") if a]
         if argv and os.path.basename(argv[0]) == "mongod":
-            try:
-                return int(pid), argv
-            except ValueError:
-                continue
+            out.append((pid, argv))
+    return out
+
+
+def find_mongod() -> Optional[Tuple[int, List[str]]]:
+    """First running mongod, or None. Kept for callers that want one."""
+    found = find_mongods()
+    return found[0] if found else None
+
+
+def port_from_argv(argv: List[str]) -> Optional[str]:
+    for i, a in enumerate(argv):
+        if a == "--port" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--port="):
+            return a.split("=", 1)[1]
     return None
 
 
@@ -512,9 +533,12 @@ def discover_dbpath(from_log: Optional[str]) -> Tuple[Optional[str], str]:
     """Resolve dbPath through a fallback chain. Returns (path, how)."""
     if from_log and os.path.isdir(from_log):
         return from_log, "startup line in log"
-    found = find_mongod()
-    if found:
-        _pid, argv = found
+    running = find_mongods()
+    if len(running) > 1:
+        # Ambiguous: do not guess which deployment the caller means.
+        return None, "multiple mongod processes"
+    if running:
+        _pid, argv = running[0]
         candidate = dbpath_from_argv(argv)
         if candidate and os.path.isdir(candidate):
             return candidate, "running mongod process"
@@ -533,6 +557,21 @@ def sysprobe(dbpath_from_log: Optional[str],
              explicit: Optional[str] = None) -> List[Finding]:
     """Local OS probes. Stdlib only, no shell-outs, all failures soft."""
     out: List[Finding] = []
+    running = find_mongods()
+    if len(running) > 1 and not explicit:
+        rows = []
+        for pid, argv in running[:6]:
+            rows.append("pid %d%s%s" % (
+                pid,
+                "  port %s" % port_from_argv(argv) if port_from_argv(argv) else "",
+                "  dbPath %s" % dbpath_from_argv(argv)
+                if dbpath_from_argv(argv) else ""))
+        out.append(Finding(
+            "INFO", "Multiple mongod processes",
+            "%d mongod processes are running here, so mdbkit did not guess "
+            "which one this log belongs to." % len(running), rows,
+            "Pass --dbpath /path/to/that/instance to include disk and "
+            "metrics checks."))
     if explicit:
         dbpath, how = explicit, "--dbpath"
     else:
@@ -756,6 +795,19 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
     return out
 
 
+def local_hostname() -> Optional[str]:
+    """This machine's name, read from the kernel — no socket calls."""
+    try:
+        return os.uname()[1].split(".")[0]
+    except AttributeError:
+        pass
+    for path in ("/etc/hostname",):
+        val = _read(path, 256)
+        if val:
+            return val.strip().split(".")[0]
+    return None
+
+
 def find_diagnostic_data(dbpath: Optional[str]) -> Optional[str]:
     """diagnostic.data always lives inside the dbPath, so if we found the
     dbPath we already know where the metrics are — no need to ask."""
@@ -773,7 +825,8 @@ def find_diagnostic_data(dbpath: Optional[str]) -> Optional[str]:
 
 def run_triage(logfile: str, window_min: Optional[int] = None,
                dbpath: Optional[str] = None, no_sysprobe: bool = False,
-               ftdc_path: Optional[str] = None):
+               ftdc_path: Optional[str] = None, oslog=None,
+               ftdc_cap_minutes: int = 240):
     """Analyze the last `window_min` minutes of log time (default 60).
 
     window_min=0 analyzes the whole file.
@@ -803,18 +856,85 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
         resolved_dbpath = dbpath or discover_dbpath(engine.dbpath)[0]
         findings += sysprobe(engine.dbpath, explicit=dbpath)
     if not ftdc_path:
-        auto = find_diagnostic_data(resolved_dbpath or dbpath or engine.dbpath)
-        if auto:
-            ftdc_path = auto
+        # Only auto-discover local metrics when the log actually belongs to
+        # this machine. Correlating one host's log with another host's
+        # metrics produces confident, wrong answers.
+        here = local_hostname()
+        log_host = engine.log_host
+        foreign = bool(here and log_host and here.lower() != log_host.lower())
+        if foreign:
             findings.append(Finding(
-                "INFO", "FTDC discovered",
-                "Using %s (found next to the dbPath). Pass --ftdc to override."
-                % auto))
+                "INFO", "Metrics not collected",
+                "This log is from '%s' but you are running on '%s', so local "
+                "diagnostic.data was not used — it would describe a different "
+                "server." % (log_host, here),
+                next_step="If you copied the metrics too, pass "
+                          "--ftdc /path/to/diagnostic.data"))
+        else:
+            auto = find_diagnostic_data(resolved_dbpath or dbpath
+                                        or engine.dbpath)
+            if auto:
+                ftdc_path = auto
+                findings.append(Finding(
+                    "INFO", "FTDC discovered",
+                    "Using %s (found next to the dbPath). Pass --ftdc to "
+                    "override." % auto))
     if ftdc_path:
         try:
-            findings += ftdc_findings(ftdc_path, ts_from=cutoff)
+            # Bound the decode even when the log's window does not overlap
+            # the metrics, so an unrelated diagnostic.data can never turn
+            # into a multi-minute full-history decode.
+            floor = None
+            if ftdc_cap_minutes:
+                from .ftdc import ftdc_files, iter_documents, chunk_timestamp
+                newest = None
+                for f in ftdc_files(ftdc_path):
+                    for doc in iter_documents(f):
+                        if doc.get("type") == 1:
+                            t = chunk_timestamp(doc)
+                            if t and (newest is None or t > newest):
+                                newest = t
+                if newest:
+                    floor = newest - timedelta(minutes=ftdc_cap_minutes)
+            effective = cutoff
+            if floor and (effective is None or effective < floor):
+                effective = floor
+            findings += ftdc_findings(ftdc_path, ts_from=effective)
         except Exception as exc:  # never let metrics break log triage
             findings.append(Finding("INFO", "FTDC unavailable", str(exc)[:200]))
+    # OS-level events. The mongod log cannot record its own OOM kill: the
+    # process is gone before it can write anything. That answer lives here.
+    from . import oslog as OS
+    os_paths = list(oslog) if oslog else []
+    if not os_paths and not no_sysprobe:
+        os_paths = OS.discover()
+        if os_paths:
+            findings.append(Finding(
+                "INFO", "System log", "Also scanned %s."
+                % ", ".join(os_paths)))
+    if os_paths:
+        try:
+            events = OS.scan(os_paths, ts_from=cutoff)
+            for g in OS.summarize(events):
+                when = (" (last at %s)" % g["last"].strftime("%H:%M:%S")
+                        if g["last"] else "")
+                detail = "%s %d occurrence(s)%s." % (
+                    g["explanation"] or g["kind"], g["count"], when)
+                if g["processes"]:
+                    detail += " Processes: %s." % ", ".join(g["processes"])
+                findings.append(Finding(
+                    g["severity"], "System: %s" % g["kind"], detail,
+                    g["examples"][:2],
+                    "This explains an unexplained restart in the mongod log "
+                    "above." if g["kind"] == "oom-kill" else ""))
+        except OSError:
+            pass
+    elif not no_sysprobe and OS.uses_journald():
+        findings.append(Finding(
+            "INFO", "System log not read",
+            "This host uses journald, and mdbkit does not run commands for "
+            "you.", [], OS.JOURNAL_HINT.replace("\n  ", " ")))
+
     findings.sort(key=lambda f: SEV_ORDER.get(f.severity, 9))
     return findings, stats, cutoff
 

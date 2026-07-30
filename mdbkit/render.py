@@ -272,30 +272,61 @@ def render_ftdc_summary(reader, file_count: int) -> str:
                      "present — try `mdbkit ftdc export` to see raw metrics.")
         return "\n".join(parts)
 
-    rows = []
+    # Gauges and counters are summarised differently: a gauge's min/avg/max
+    # is meaningful, a cumulative counter's is not.
+    gauges, counters = [], []
     for label in sorted(reader.series):
+        if label.startswith("_"):
+            continue
         s = reader.series[label]
         st = s.stats()
         if not st:
             continue
-        rate = reader.rate(label) if s.kind == "counter" else None
-        rows.append((
-            label,
-            _human(st["min"], label),
-            _human(st["avg"], label),
-            _human(st["max"], label),
-            _human(st["last"], label),
-            "%.1f/s" % rate if rate is not None else "-",
-        ))
-    parts.append(_table(["metric", "min", "avg", "max", "last", "rate"], rows))
+        if st.get("cumulative"):
+            rate = reader.rate(label)
+            counters.append((
+                label,
+                _human(label, st.get("change")) if st.get("change") is not None else "-",
+                ("%.1f/s" % rate) if rate is not None else "-",
+                _human(label, st.get("last"))))
+        else:
+            gauges.append((label, _human(label, st["min"]),
+                           _human(label, st["avg"]), _human(label, st["max"]),
+                           _human(label, st["last"])))
+
+    if gauges:
+        parts.append("current values (min / average / max over the window)")
+        parts.append(_table(["metric", "min", "avg", "max", "last"], gauges))
+        parts.append("")
+    if counters:
+        parts.append("activity (counters are cumulative since server start, "
+                     "so this is the change across the window)")
+        parts.append(_table(["metric", "change in window", "per second",
+                             "counter now"], counters))
+        parts.append("")
 
     pct = reader.cache_pct()
     if pct is not None:
+        parts.append("WiredTiger cache peaked at %.1f%% of configured size."
+                     % pct)
+
+    disks = reader.disks()
+    if disks:
         parts.append("")
-        parts.append("WiredTiger cache peak: %.0f%% of configured maximum" % pct)
-    parts.append("")
-    parts.append("FTDC is MongoDB's own always-on recorder: these numbers were "
-                 "already on disk, no monitoring agent required.")
+        parts.append("disk activity")
+        parts.append(_table(
+            ["device", "utilisation", "operations", "ops/sec", "avg wait"],
+            [(dev, "%.1f%%" % d["utilPct"], format(d["ops"], ","),
+              d["opsPerSec"] if d["opsPerSec"] is not None else "-",
+              ("%.1f ms" % d["avgWaitMs"]) if d["avgWaitMs"] is not None else "-")
+             for dev, d in sorted(disks.items())]))
+
+    lag = reader.series.get("repl.lagMs")
+    if lag and lag.vmax is not None:
+        parts.append("")
+        parts.append("Replication: widest gap between member optimes was "
+                     "%.1fs (average %.1fs)."
+                     % (lag.vmax / 1000.0, (lag.total / lag.n) / 1000.0))
     return "\n".join(parts)
 
 
@@ -448,3 +479,61 @@ def render_shape_detail(s, stats) -> str:
         parts.append("")
     parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------- oslog ----
+
+def render_oslog(groups, scanned, stats_note: str = "") -> str:
+    parts = ["== mdbkit oslog: what the operating system saw =="]
+    parts.append("scanned: %s" % ", ".join(scanned))
+    if stats_note:
+        parts.append(stats_note)
+    parts.append("")
+    if not groups:
+        parts.append("Nothing of database interest found — no OOM kills, "
+                     "file-descriptor limits, I/O errors or service "
+                     "restarts in this file.")
+        return "\n".join(parts)
+    counts = {}
+    for g in groups:
+        counts[g["severity"]] = counts.get(g["severity"], 0) + 1
+    parts.append("findings: %s" % ", ".join(
+        "%d %s" % (n, s.lower()) for s, n in sorted(counts.items())))
+    parts.append("")
+    for g in groups:
+        when = ""
+        if g["last"]:
+            when = "  last at %s" % g["last"].strftime("%Y-%m-%d %H:%M:%S")
+        parts.append("[%s] %s — %d occurrence(s)%s"
+                     % (g["severity"], g["kind"], g["count"], when))
+        if g["explanation"]:
+            parts.append("        %s" % g["explanation"])
+        if g["processes"]:
+            parts.append("        processes: %s" % ", ".join(g["processes"]))
+        for ex in g["examples"][:2]:
+            parts.append("        > %s" % ex[:160])
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+# --------------------------------------------------------- serverstatus ----
+
+def render_serverstatus(checks) -> str:
+    parts = ["== mdbkit serverstatus =="]
+    counts = {}
+    for c in checks:
+        counts[c.severity] = counts.get(c.severity, 0) + 1
+    order = ["CRIT", "WARN", "OK", "INFO"]
+    parts.append("checks: %s" % ", ".join(
+        "%d %s" % (counts[s], s.lower()) for s in order if s in counts))
+    parts.append("")
+    ranked = sorted(checks, key=lambda c: order.index(c.severity)
+                    if c.severity in order else 9)
+    for c in ranked:
+        parts.append("[%s] %s: %s" % (c.severity, c.title, c.detail))
+        for e in c.evidence:
+            parts.append("        - %s" % e)
+        if c.next_step:
+            parts.append("        next: %s" % c.next_step)
+        parts.append("")
+    return "\n".join(parts).rstrip()

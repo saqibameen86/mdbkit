@@ -242,7 +242,11 @@ def cmd_triage(args) -> int:
     from .triage import render_triage, run_triage
     findings, stats, cutoff = run_triage(
         args.logfile, window_min=args.window, dbpath=args.dbpath,
-        no_sysprobe=args.no_sysprobe, ftdc_path=args.ftdc)
+        no_sysprobe=args.no_sysprobe, ftdc_path=args.ftdc,
+        oslog=getattr(args, "oslog", None))
+    if getattr(args, "only", None):
+        keep = {s.strip().upper() for s in args.only.split(",")}
+        findings = [f for f in findings if f.severity in keep]
     _warn_if_pre44(stats)
     if args.report:
         from .report import Report, stamp
@@ -263,6 +267,9 @@ def cmd_triage(args) -> int:
         }))
     else:
         print(render_triage(findings, stats, cutoff))
+    if getattr(args, "exit_code", False):
+        sev = {f.severity for f in findings}
+        return 2 if "CRIT" in sev else (1 if "WARN" in sev else 0)
     return 0
 
 
@@ -366,6 +373,65 @@ def cmd_ftdc(args) -> int:
                 vals = reader.series[lb].values
                 row.append(vals[i] if i < len(vals) else "")
             writer.writerow(row)
+    return 0
+
+
+def cmd_oslog(args) -> int:
+    from . import oslog as OS
+    from .render import render_oslog
+    paths = args.logfile if args.logfile else OS.discover()
+    if not paths:
+        if OS.uses_journald():
+            print("error: no readable text system log found.\n  " +
+                  OS.JOURNAL_HINT, file=sys.stderr)
+        else:
+            print("error: no system log given and none found in %s"
+                  % ", ".join(OS.COMMON_OSLOGS), file=sys.stderr)
+        return 2
+    try:
+        events = OS.scan(paths)
+    except OSError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    groups = OS.summarize(events)
+    if args.json:
+        print(dump_json({"scanned": list(paths), "findings": [
+            {**g, "first": g["first"].isoformat() if g["first"] else None,
+             "last": g["last"].isoformat() if g["last"] else None}
+            for g in groups]}))
+    else:
+        print(render_oslog(groups, list(paths)))
+    if args.exit_code:
+        return 2 if any(g["severity"] == "CRIT" for g in groups) else (
+            1 if any(g["severity"] == "WARN" for g in groups) else 0)
+    return 0
+
+
+def cmd_serverstatus(args) -> int:
+    from . import serverstatus as SS
+    from .render import render_serverstatus
+    try:
+        doc = SS.load(args.statusfile)
+        after = SS.load(args.after) if args.after else None
+    except (OSError, ValueError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        print("  Produce a dump with: mdbkit export-script serverstatus",
+              file=sys.stderr)
+        return 2
+    checks = SS.analyze(doc, after)
+    if args.json:
+        print(dump_json({"checks": [c.to_dict() for c in checks]}))
+    elif args.report:
+        from .report import Report, stamp
+        rep = Report("MongoDB serverStatus digest", stamp())
+        rep.table("Checks", ["severity", "check", "detail"],
+                  [[c.severity, c.title, c.detail] for c in checks])
+        print("wrote %s" % rep.write(args.report), file=sys.stderr)
+    else:
+        print(render_serverstatus(checks))
+    if args.exit_code:
+        sev = {c.severity for c in checks}
+        return 2 if "CRIT" in sev else (1 if "WARN" in sev else 0)
     return 0
 
 
@@ -504,6 +570,10 @@ def cmd_lab(args) -> int:
 
 
 def cmd_export_script(args) -> int:
+    if args.kind == "serverstatus":
+        from .scripts import SERVERSTATUS
+        print(SERVERSTATUS)
+        return 0
     print(SCHEMA_SCRIPT if args.kind == "schema" else INDEXES_SCRIPT)
     return 0
 
@@ -619,7 +689,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip local disk/memory/load probes")
     sp.add_argument("--ftdc", metavar="PATH",
                     help="diagnostic.data directory — adds CPU, memory, cache "
-                         "and connection metrics from MongoDB's own recorder")
+                         "and connection metrics from MongoDB's own recorder. "
+                         "Auto-discovered when the log came from this host")
+    sp.add_argument("--oslog", nargs="+", metavar="FILE",
+                    help="system log(s) to correlate (/var/log/syslog, "
+                         "/var/log/messages, or captured journalctl output). "
+                         "Reveals OOM kills and file-descriptor limits that "
+                         "the mongod log cannot record")
+    sp.add_argument("--only", metavar="LEVELS",
+                    help="show only these severities, e.g. --only CRIT,WARN")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 2 if any CRIT finding, 1 if any WARN, else 0 "
+                         "— for cron and monitoring wrappers")
     sp.add_argument("--report", metavar="FILE",
                     help="write a shareable report instead of terminal output "
                          "(.md or .html; self-contained, no external assets)")
@@ -648,6 +729,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_ftdc)
+
+    sp = sub.add_parser("oslog",
+                        help="scan a system log for OOM kills, fd limits, "
+                             "I/O errors and service restarts")
+    sp.add_argument("logfile", nargs="*",
+                    help="system log file(s); defaults to /var/log/syslog "
+                         "or /var/log/messages when readable")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 2 on CRIT, 1 on WARN, else 0")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_oslog)
+
+    sp = sub.add_parser("serverstatus",
+                        help="digest a saved db.adminCommand({serverStatus:1}) "
+                             "dump: tickets, cache, queues, connections")
+    sp.add_argument("statusfile", help="saved serverStatus JSON")
+    sp.add_argument("--after", metavar="FILE",
+                    help="a second dump taken later; turns cumulative "
+                         "counters into true rates")
+    sp.add_argument("--report", metavar="FILE",
+                    help="write a shareable .md or .html report instead")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 2 on CRIT, 1 on WARN, else 0")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_serverstatus)
 
     sp = sub.add_parser("compare",
                         help="diff two logs: did the index actually help?")
@@ -713,7 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("export-script",
                         help="print a mongosh script to export schema or indexes")
-    sp.add_argument("kind", choices=["schema", "indexes"])
+    sp.add_argument("kind", choices=["schema", "indexes", "serverstatus"])
     sp.set_defaults(func=cmd_export_script)
 
     return p

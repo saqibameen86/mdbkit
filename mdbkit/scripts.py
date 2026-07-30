@@ -67,3 +67,17 @@ db.getCollectionNames().filter(c => !c.startsWith("system.")).forEach(coll => {
 });
 print(JSON.stringify(out));
 """
+
+
+SERVERSTATUS = """// mdbkit export-script serverstatus
+// Save the output and analyse it offline:
+//   mongosh --quiet --host HOST --port PORT \\
+//     --username USER --password PASS --authenticationDatabase admin \\
+//     --eval "$(cat export_serverstatus.js)" > status.json
+//   mdbkit serverstatus status.json
+//
+// For true rates instead of lifetime averages, take two dumps a minute
+// apart and compare:
+//   mdbkit serverstatus before.json --after after.json
+JSON.stringify(db.adminCommand({ serverStatus: 1 }));
+"""

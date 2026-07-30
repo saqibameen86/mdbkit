@@ -356,7 +356,16 @@ def decode_chunk(doc: dict, wanted_paths: Optional[set] = None
         wanted_idx = None
         keep = list(range(metric_count))
     else:
-        keep = [i for i, p in enumerate(paths) if p in wanted_paths]
+        exact = {p for p in wanted_paths if "*" not in p}
+        globs = [p.split("*") for p in wanted_paths if "*" in p]
+        def _want(path: str) -> bool:
+            if path in exact:
+                return True
+            for pre, suf in globs:
+                if path.startswith(pre) and path.endswith(suf):
+                    return True
+            return False
+        keep = [i for i, p in enumerate(paths) if _want(p)]
         wanted_idx = set(keep)
         if not keep:
             return Chunk(ts=_to_dt(doc.get("_id", 0) or 0), paths=[], rows=[])
@@ -448,7 +457,18 @@ CURATED: List[Tuple[str, str, str]] = [
     ("sys.cpu.systemMs", "systemMetrics.cpu.system_ms", "counter"),
     ("sys.cpu.iowaitMs", "systemMetrics.cpu.iowait_ms", "counter"),
     ("sys.mem.availableKB", "systemMetrics.memory.MemAvailable_kb", "gauge"),
-    ("repl.lagSeconds", "replSetGetStatus.members.0.optimeDate", "gauge"),
+    # NOTE: members.N.optimeDate is an absolute epoch-milliseconds value, not
+    # a lag. Exposing it directly produced numbers like 1785398555000, which
+    # read as nonsense. Real lag is derived below as the spread across
+    # members, which is what an operator actually wants.
+    ("_repl.memberOptime", "replSetGetStatus.members.*.optimeDate", "gauge"),
+    # Disk performance. Device names vary, so these are wildcard paths and the
+    # reader derives utilisation and await from them.
+    ("_disk.ioTimeMs", "systemMetrics.disks.*.io_time_ms", "counter"),
+    ("_disk.reads", "systemMetrics.disks.*.reads", "counter"),
+    ("_disk.writes", "systemMetrics.disks.*.writes", "counter"),
+    ("_disk.readTimeMs", "systemMetrics.disks.*.read_time_ms", "counter"),
+    ("_disk.writeTimeMs", "systemMetrics.disks.*.write_time_ms", "counter"),
 ]
 
 
@@ -492,8 +512,19 @@ class Series:
         self.last_ts = t1
 
     def stats(self) -> Dict[str, float]:
+        """Summary appropriate to the metric kind.
+
+        Counters in serverStatus are cumulative since process start, so
+        min/avg/max of the raw value says nothing useful — the minimum is
+        just whatever the counter read when the window opened. For those we
+        report the change across the window instead.
+        """
         if not self.n:
             return {}
+        if self.kind == "counter":
+            delta = (self.last - self.first) if (
+                self.last is not None and self.first is not None) else None
+            return {"change": delta, "last": self.last, "cumulative": True}
         return {"min": self.vmin, "max": self.vmax,
                 "avg": self.total / float(self.n), "last": self.last}
 
@@ -539,11 +570,23 @@ class FtdcReader:
         return self._paths
 
     def _plan_for(self, paths: List[str]) -> List[Tuple[str, str, str]]:
-        """Map the chunk's path list onto (label, kind, index)."""
+        """Map the chunk's path list onto (label, kind, index).
+
+        Wildcard curated paths expand to one entry per matching column, with
+        the wildcard segment appended to the label — so
+        systemMetrics.disks.*.io_time_ms becomes _disk.ioTimeMs[sda].
+        """
         index = {p: i for i, p in enumerate(paths)}
         chosen = []
         for label, path, kind in CURATED:
             if self.wanted and label not in self.wanted:
+                continue
+            if "*" in path:
+                pre, suf = path.split("*", 1)
+                for i, p in enumerate(paths):
+                    if p.startswith(pre) and p.endswith(suf):
+                        mid = p[len(pre):len(p) - len(suf)] if suf else p[len(pre):]
+                        chosen.append(("%s[%s]" % (label, mid), kind, i))
                 continue
             if path in index:
                 chosen.append((label, kind, index[path]))
@@ -619,6 +662,26 @@ class FtdcReader:
             self.first_ts = t0
         self.last_ts = t1
 
+        # Derived: replication lag as the spread of member optimes within
+        # each sample. Absolute optimes are meaningless on their own; the
+        # gap between the furthest-ahead and furthest-behind member is the
+        # number an operator cares about.
+        optime_cols = [idx for label, _k, idx in plan
+                       if label.startswith("_repl.memberOptime[")]
+        if len(optime_cols) >= 2:
+            rows = [chunk.rows[i] for i in optime_cols]
+            lag = []
+            for j in range(n):
+                vals = [r[j] for r in rows if j < len(r) and r[j]]
+                if len(vals) >= 2:
+                    lag.append(max(vals) - min(vals))
+            if lag:
+                s = self.series.get("repl.lagMs")
+                if s is None:
+                    s = self.series["repl.lagMs"] = Series(
+                        "repl.lagMs", "derived", "gauge")
+                s.observe(lag, t0, t1)
+
         emit = {} if self.on_chunk else None
         for label, kind, idx in plan:
             vals = chunk.rows[idx]
@@ -648,6 +711,42 @@ class FtdcReader:
         span = (s.last_ts - s.first_ts).total_seconds() or 1.0
         return (s.last - s.first) / span
 
+    def disks(self) -> Dict[str, dict]:
+        """Per-device utilisation and average service time.
+
+        io_time_ms is milliseconds during which the device had I/O in
+        flight, so its rate of change is utilisation. Dividing total service
+        time by operation count gives the average wait an operation saw.
+        """
+        out: Dict[str, dict] = {}
+        for label, s in self.series.items():
+            if not label.startswith("_disk.") or "[" not in label:
+                continue
+            metric, dev = label[6:].split("[", 1)
+            dev = dev.rstrip("]")
+            entry = out.setdefault(dev, {})
+            if s.first is not None and s.last is not None:
+                entry[metric] = s.last - s.first
+            entry.setdefault("_span", 0.0)
+            if s.first_ts and s.last_ts:
+                entry["_span"] = max(entry["_span"],
+                                     (s.last_ts - s.first_ts).total_seconds())
+        result = {}
+        for dev, e in out.items():
+            span = e.get("_span") or 0.0
+            if span <= 0:
+                continue
+            io_ms = e.get("ioTimeMs", 0)
+            ops = (e.get("reads", 0) or 0) + (e.get("writes", 0) or 0)
+            svc_ms = (e.get("readTimeMs", 0) or 0) + (e.get("writeTimeMs", 0) or 0)
+            result[dev] = {
+                "utilPct": round(min(100.0, 100.0 * io_ms / (span * 1000.0)), 1),
+                "ops": ops,
+                "opsPerSec": round(ops / span, 1) if span else None,
+                "avgWaitMs": round(svc_ms / ops, 1) if ops else None,
+            }
+        return result
+
     def cache_pct(self) -> Optional[float]:
         used = self.series.get("cache.usedBytes")
         mx = self.series.get("cache.maxBytes")
@@ -664,6 +763,8 @@ class FtdcReader:
             "series": {},
         }
         for label, s in sorted(self.series.items()):
+            if label.startswith("_"):
+                continue          # internal inputs to derived metrics
             entry = s.stats()
             if s.kind == "counter":
                 r = self.rate(label)
@@ -673,4 +774,7 @@ class FtdcReader:
         pct = self.cache_pct()
         if pct is not None:
             out["cachePeakPct"] = round(pct, 1)
+        disks = self.disks()
+        if disks:
+            out["disks"] = disks
         return out

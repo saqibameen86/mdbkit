@@ -212,6 +212,32 @@ IMPROVED
 The natural follow-up to `advise`: you created the index, a day passed, and
 this tells you whether it worked.
 
+### 5. Why did it die? (and what does serverStatus say?)
+
+```bash
+mdbkit oslog /var/log/syslog                  # OOM kills, fd limits, I/O errors
+mdbkit triage mongod.log --oslog /var/log/syslog
+```
+
+A mongod log cannot record its own OOM kill — the process is gone before it
+can write anything. The system log has the answer in one line, and `triage`
+will correlate it with the unexplained restart.
+
+```bash
+mdbkit export-script serverstatus > export_serverstatus.js
+mongosh --quiet --host HOST --eval "$(cat export_serverstatus.js)" > status.json
+mdbkit serverstatus status.json
+```
+
+```
+[CRIT] Concurrency tickets: Exhausted tickets queue every new operation,
+       which looks like slowness with no slow query to blame.
+        - read: 1 of 128 free (1%)
+[CRIT] WiredTiger cache: Above 80% WiredTiger evicts in the background;
+       above 95% application threads are made to evict.
+        - 31.0 GiB of 32.0 GiB used (96.9%)
+```
+
 **Bonus — who connected?**
 
 ```bash
@@ -221,6 +247,68 @@ mdbkit connections mongod.log
 Per-IP churn with first/last seen, plus an authenticated-users table showing
 successful and failed logins per account and when each last authenticated —
 the question that starts most access incidents.
+
+---
+
+## Running it on a schedule
+
+mdbkit is deterministic, offline and read-only, which makes it well suited to
+a cron job. It deliberately **cannot send anything anywhere** — there is no
+network code and never will be. So mdbkit produces the verdict and your own
+script does the talking.
+
+The primitive that makes this work is `--exit-code`:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Nothing above INFO |
+| `1` | At least one WARN |
+| `2` | At least one CRIT |
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/mdbkit-watch.sh — hourly health check
+set -uo pipefail
+
+LOG=/var/log/mongodb/mongod.log
+OUT=$(mktemp)
+
+mdbkit triage "$LOG" --window 60 --oslog /var/log/syslog \
+       --only CRIT,WARN --exit-code > "$OUT" 2>&1
+STATUS=$?
+
+if [ "$STATUS" -ge 2 ]; then
+    # CRIT: wake someone up. Your channel, your call — mdbkit stays offline.
+    curl -sf -X POST -H 'Content-type: application/json' \
+         --data "{\"text\": \"MongoDB CRIT on $(hostname)\n\`\`\`$(cat "$OUT")\`\`\`\"}" \
+         "$SLACK_WEBHOOK_URL"
+elif [ "$STATUS" -eq 1 ]; then
+    mail -s "MongoDB warnings on $(hostname)" dba@example.com < "$OUT"
+fi
+
+rm -f "$OUT"
+```
+
+```cron
+# hourly triage; only speaks up when something is wrong
+0 * * * * /usr/local/bin/mdbkit-watch.sh
+
+# daily slow-query digest, kept for trend comparison
+30 6 * * * mdbkit queries /var/log/mongodb/mongod.log \
+             --report /var/log/mdbkit/$(date +\%F).html
+```
+
+Because the reports are dated, `compare` turns them into a trend:
+
+```bash
+mdbkit compare /var/log/mongodb/mongod.log.1 --after /var/log/mongodb/mongod.log
+```
+
+Two things worth knowing. `--only CRIT,WARN` keeps the mail short, and a run
+that finds nothing prints almost nothing — so a silent cron job means a
+healthy database rather than a broken script. And because every command is
+read-only and never connects to the database, running this hourly on a
+production host costs one log read and no risk.
 
 ---
 
@@ -759,6 +847,90 @@ It is a laptop and scratch-VM tool, not a deployment tool.
 
 ---
 
+### `mdbkit oslog [FILE...]`
+
+Scans a system log for the things that affect a database process: OOM kills,
+file-descriptor limits, segmentation faults, filesystem and I/O errors,
+read-only remounts, conntrack exhaustion, and systemd service exits.
+
+With no argument it reads `/var/log/syslog` or `/var/log/messages` if they are
+readable.
+
+| Option | Description |
+|---|---|
+| `--exit-code` | Exit 2 on CRIT, 1 on WARN, else 0 |
+| `--json` | Machine-readable output |
+
+```bash
+mdbkit oslog                                  # whichever system log exists
+mdbkit oslog /var/log/messages
+mdbkit oslog /var/log/syslog.1 /var/log/syslog
+```
+
+**On journald systems** there is no text log to read, and mdbkit does not run
+commands on your behalf. It tells you what to capture instead:
+
+```bash
+journalctl -k --since '4 hours ago' > kern.log
+journalctl -u mongod --since '4 hours ago' >> kern.log
+mdbkit oslog kern.log
+```
+
+The same file can be handed to `triage --oslog`, which correlates it with the
+mongod log — so an unexplained restart at 09:14 lines up with the OOM kill
+that caused it.
+
+---
+
+### `mdbkit serverstatus FILE [--after FILE]`
+
+Digests a saved `db.adminCommand({serverStatus: 1})` dump. That command
+returns several hundred fields; this reports the handful that explain a
+struggling server.
+
+| Option | Description |
+|---|---|
+| `--after FILE` | A second dump taken later — turns cumulative counters into true rates |
+| `--report FILE` | Write a shareable `.md` or `.html` report |
+| `--exit-code` | Exit 2 on CRIT, 1 on WARN, else 0 |
+| `--json` | Machine-readable output |
+
+```bash
+mdbkit export-script serverstatus > export_serverstatus.js
+
+mongosh --quiet --host HOST --port PORT \
+  --username USER --password PASS --authenticationDatabase admin \
+  --eval "$(cat export_serverstatus.js)" > status.json
+
+mdbkit serverstatus status.json
+```
+
+What it checks: **concurrency tickets** (exhaustion queues every operation and
+looks like slowness with no slow query to blame), **WiredTiger cache** against
+the 80% background-eviction and 95% application-thread-eviction thresholds,
+**dirty cache**, **application-thread eviction**, **connection headroom**,
+**queued readers and writers**, **assertions**, **flow control**, replication
+role and process memory. Ticket layout is read from either
+`wiredTiger.concurrentTransactions` (pre-7.0) or `queues.execution` (7.0+).
+
+**Two dumps give true rates.** Almost everything in serverStatus is cumulative
+since process start, so a single dump only yields lifetime averages:
+
+```bash
+mongosh ... > before.json ; sleep 60 ; mongosh ... > after.json
+mdbkit serverstatus before.json --after after.json
+```
+
+```
+[INFO] Operation counters: Measured over 60 seconds between the two dumps.
+        - query    742,000 in 60s  (12366.7/sec)
+```
+
+That is real current load. The same counter read from one dump would have
+reported 2,127/sec — the average since the server started ten days ago.
+
+---
+
 ### `mdbkit compare BEFORE --after AFTER`
 
 Diffs query shapes between two logs and reports what improved, what
@@ -830,9 +1002,11 @@ Next up, roughly in order:
   transparent huge pages, readahead, ulimits, NUMA and filesystem choice.
   These are classic production misconfigurations and they are already in
   your log — nothing new needs collecting.
-* **Redundant index detection** from `indexes.json` alone: an index on
-  `{a: 1}` is redundant when `{a: 1, b: 1}` exists. Purely offline, no
-  connection, no `$indexStats` needed.
+* **Index usage candidates.** Prefix-redundant indexes (an index on `{a: 1}`
+  when `{a: 1, b: 1}` exists) are worth *examining*, but static analysis is
+  not sufficient grounds to drop one — the planner may still be choosing it.
+  So mdbkit will flag candidates and print an `$indexStats` script to confirm
+  real usage first, never a drop recommendation.
 * **Confirming the FTDC-based checkpoint, eviction and flow-control
   detectors** against real `diagnostic.data` — see
   `docs/TESTING-PLAYBOOK.md`. Real logs and metrics very welcome.
