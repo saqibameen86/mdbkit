@@ -30,7 +30,7 @@ whole point.
 evaluate the tool in about a minute without touching a cluster:
 
 ```bash
-pip install mdbkit
+pip install mdbkit          # macOS has no pip by default — see Install below
 
 mdbkit demo --with-extras -o demo.log     # a log + indexes.json, schema.json, explain.json
 
@@ -108,7 +108,47 @@ Full detail: [SECURITY.md](SECURITY.md).
 
 ## Install
 
-**Most systems:**
+### macOS
+
+macOS ships no `pip` and no `pipx`, so `pip install` fails out of the box.
+Pick whichever of these matches your setup.
+
+**With Homebrew (recommended — keeps mdbkit in its own environment):**
+```bash
+brew install pipx
+pipx ensurepath          # then open a new terminal window
+pipx install mdbkit
+```
+
+**Without Homebrew, using the Python that comes with macOS:**
+```bash
+python3 --version        # accept the Command Line Tools prompt if it appears
+python3 -m pip install --user mdbkit
+```
+
+Then put the install location on your `PATH` — macOS does not do this for
+you:
+```bash
+echo 'export PATH="$HOME/Library/Python/'"$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"'/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+mdbkit --version
+```
+
+**If you use uv:**
+```bash
+uv tool install mdbkit
+```
+
+**If pip reports `externally-managed-environment`**, add
+`--break-system-packages`, or use the pipx route above, which avoids the
+problem entirely.
+
+Do not install with `sudo`. mdbkit is a user-level CLI and needs no
+elevated privileges — not to install, and not to run.
+
+### Linux
+
+**Most distributions:**
 ```bash
 pip install mdbkit
 ```
@@ -125,14 +165,29 @@ pipx ensurepath && source ~/.bashrc
 pip install mdbkit --break-system-packages
 ```
 
-**Air-gapped database hosts:**
+### Windows
+
+```powershell
+py -m pip install mdbkit
+py -m mdbkit --version
+```
+
+If `mdbkit` is not recognised as a command afterwards, the Scripts directory
+is not on your `PATH`; `py -m mdbkit` works regardless.
+
+### Air-gapped database hosts
+
 ```bash
 pip download mdbkit -d ./wheels          # on a connected machine
 # copy ./wheels across, then:
 pip install --no-index --find-links ./wheels mdbkit
 ```
 
-**Upgrading:**
+Zero runtime dependencies means this is a single wheel — nothing else to
+resolve.
+
+### Upgrading
+
 ```bash
 pip install --upgrade mdbkit             # or: pipx upgrade mdbkit
 mdbkit --version
