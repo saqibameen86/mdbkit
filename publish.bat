@@ -65,9 +65,23 @@ if errorlevel 1 (
 echo.
 
 echo [4/5] Building...
+REM Some Pythons refuse installs into the base environment, so keep the
+REM build tools in a private venv beside the project. Created once, reused.
+set BUILDPY=python
+python -c "import build, twine" >nul 2>&1
+if errorlevel 1 (
+  if not exist .venv\Scripts\python.exe (
+    echo       creating .venv for build tools ^(one time only^)
+    python -m venv .venv
+  )
+  echo       installing build and twine into .venv
+  .venv\Scripts\python -m pip install --quiet --upgrade pip build twine
+  set BUILDPY=.venv\Scripts\python
+)
+echo       using: !BUILDPY!
 if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
-python -m build
+!BUILDPY! -m build
 if errorlevel 1 (
   echo ERROR: build failed. Try:  python -m pip install --upgrade build
   goto :end
@@ -76,7 +90,7 @@ echo.
 
 echo [5/5] Uploading !VERSION! to PyPI...
 echo       paste your pypi- token at the prompt ^(it stays invisible^)
-python -m twine upload dist/mdbkit-!VERSION!*
+!BUILDPY! -m twine upload dist/mdbkit-!VERSION!*
 if errorlevel 1 (
   echo.
   echo ERROR: upload failed. If it says "File already exists", this version

@@ -14,6 +14,9 @@ echo
 
 [ -f pyproject.toml ] || { echo "ERROR: run this from inside the mdbkit folder"; exit 1; }
 
+# This script needs bash. `sh publish.sh` on macOS runs it in POSIX mode.
+[ -n "${BASH_VERSION:-}" ] || { echo "ERROR: run with  bash publish.sh  (or ./publish.sh)"; exit 1; }
+
 VERSION=$(python3 -c "import re,io;print(re.search(r'^version = \"(.*?)\"', io.open('pyproject.toml',encoding='utf-8').read(), re.M).group(1))")
 echo "Version to publish: $VERSION"
 echo
@@ -39,12 +42,28 @@ git push --force origin main
 echo
 
 echo "[4/5] Building..."
+
+# Homebrew and system Pythons are "externally managed" (PEP 668), so build
+# and twine cannot be installed into them. Keep a small private venv beside
+# the project instead — created once, reused forever, never committed.
+BUILDPY="python3"
+if ! python3 -c "import build, twine" >/dev/null 2>&1; then
+  if [ ! -x .venv/bin/python ]; then
+    echo "      creating .venv for build tools (one time only)"
+    python3 -m venv .venv
+  fi
+  echo "      installing build and twine into .venv"
+  .venv/bin/python -m pip install --quiet --upgrade pip build twine
+  BUILDPY=".venv/bin/python"
+fi
+echo "      using: $BUILDPY"
+
 rm -rf dist build
-python3 -m build
+"$BUILDPY" -m build
 echo
 
 echo "[5/5] Uploading $VERSION to PyPI..."
-python3 -m twine upload dist/mdbkit-"$VERSION"*
+"$BUILDPY" -m twine upload dist/mdbkit-"$VERSION"*
 
 cat <<EOF
 
