@@ -108,6 +108,25 @@ Full detail: [SECURITY.md](SECURITY.md).
 
 ## Install
 
+### Linux
+
+**Most distributions:**
+```bash
+pip install mdbkit
+```
+
+**Ubuntu 20.04 / Debian / Amazon Linux 2 (Python 3.8 hosts):**
+```bash
+sudo apt install pipx        # or: sudo dnf install pipx
+pipx install mdbkit
+pipx ensurepath && source ~/.bashrc
+```
+
+**Modern Ubuntu/Debian complaining about "externally-managed-environment":**
+```bash
+pip install mdbkit --break-system-packages
+```
+
 ### macOS
 
 macOS ships no `pip` and no `pipx`, so `pip install` fails out of the box.
@@ -146,25 +165,6 @@ problem entirely.
 Do not install with `sudo`. mdbkit is a user-level CLI and needs no
 elevated privileges — not to install, and not to run.
 
-### Linux
-
-**Most distributions:**
-```bash
-pip install mdbkit
-```
-
-**Ubuntu 20.04 / Debian / Amazon Linux 2 (Python 3.8 hosts):**
-```bash
-sudo apt install pipx        # or: sudo dnf install pipx
-pipx install mdbkit
-pipx ensurepath && source ~/.bashrc
-```
-
-**Modern Ubuntu/Debian complaining about "externally-managed-environment":**
-```bash
-pip install mdbkit --break-system-packages
-```
-
 ### Windows
 
 ```powershell
@@ -188,9 +188,39 @@ resolve.
 
 ### Upgrading
 
+Use whichever matches how you installed it.
+
 ```bash
-pip install --upgrade mdbkit             # or: pipx upgrade mdbkit
+# Linux — installed with pip
+pip install --upgrade mdbkit
+
+# Linux — installed with pipx
+pipx upgrade mdbkit
+
+# macOS — installed with pipx (Homebrew route)
+pipx upgrade mdbkit
+
+# macOS — installed with python3 -m pip --user
+python3 -m pip install --user --upgrade mdbkit
+
+# macOS / Linux — installed with uv
+uv tool upgrade mdbkit
+
+# Windows
+py -m pip install --upgrade mdbkit
+```
+
+Then confirm:
+```bash
 mdbkit --version
+```
+
+**If the version has not changed**, pip is serving a cached index. Force it:
+
+```bash
+pipx install --force mdbkit                          # pipx
+pip install --upgrade --no-cache-dir mdbkit          # pip
+py -m pip install --upgrade --no-cache-dir mdbkit    # Windows
 ```
 
 Requires Python 3.8+. mdbkit never updates itself and never checks for
