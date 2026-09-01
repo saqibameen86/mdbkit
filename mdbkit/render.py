@@ -230,13 +230,20 @@ def render_recommendations(recs: List[Recommendation], stats: ParseStats,
 
 # ----------------------------------------------------------------- FTDC ----
 
-def _human(n: float, label: str = "") -> str:
+def _human(n, label: str = "") -> str:
     """Format an FTDC value, honouring the unit implied by its label.
 
     Only byte-valued metrics get binary-prefix formatting; a metric already
     expressed in KB or MB must not be re-scaled as if it were bytes.
+
+    Tolerant of odd input on purpose: a display helper must never be the
+    thing that takes down a whole command.
     """
-    low = label.lower()
+    if n is None:
+        return "-"
+    if not isinstance(n, (int, float)):
+        return str(n)
+    low = str(label).lower()
     if low.endswith("bytes"):
         if n >= 2 ** 30:
             return "%.1f GiB" % (n / 2 ** 30)
@@ -286,13 +293,13 @@ def render_ftdc_summary(reader, file_count: int) -> str:
             rate = reader.rate(label)
             counters.append((
                 label,
-                _human(label, st.get("change")) if st.get("change") is not None else "-",
+                _human(st.get("change"), label) if st.get("change") is not None else "-",
                 ("%.1f/s" % rate) if rate is not None else "-",
-                _human(label, st.get("last"))))
+                _human(st.get("last"), label)))
         else:
-            gauges.append((label, _human(label, st["min"]),
-                           _human(label, st["avg"]), _human(label, st["max"]),
-                           _human(label, st["last"])))
+            gauges.append((label, _human(st["min"], label),
+                           _human(st["avg"], label), _human(st["max"], label),
+                           _human(st["last"], label)))
 
     if gauges:
         parts.append("current values (min / average / max over the window)")
