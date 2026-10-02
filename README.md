@@ -412,6 +412,35 @@ Per-IP churn with first/last seen, plus an authenticated-users table showing
 successful and failed logins per account and when each last authenticated —
 the question that starts most access incidents.
 
+### 7. Is this host running too many mongods for its memory?
+
+```bash
+mdbkit host /var/log/mongodb            # every instance's log under here
+```
+
+```
+== mdbkit host: 8 instance(s) on vm ==
+last 1440 minutes of each log | 7.8 GiB RAM (this machine)
+
+[CRIT] Cache sizes vs RAM: WiredTiger caches add up to 11.8 GiB, 150% of 7.8 GiB RAM (this machine).
+[CRIT] Instances that crashed: 1 instance(s) started after an unclean stop (crash, kill -9 or OOM kill).
+        - vm:29021: 1 unclean start(s)
+[WARN] Default cache size on a shared host: 3 of 8 instances run with the default WiredTiger cache (cacheSizeGB not set). [...]
+
+instance  set   version  role        cache    starts  crashes  slow ops  slow time  waiting  worst  first issue
+--------  ----  -------  ----------  -------  ------  -------  --------  ---------  -------  -----  --------------------------
+vm:29021  rs02  8.0.32   SECONDARY   256 MiB  2       1        0         -          -        CRIT   Process start(s) in window
+vm:29030  -     8.0.32   standalone  512 MiB  1       0        9         472ms      0%       WARN   Collection scans
+vm:29010  rs01  8.0.32   PRIMARY     3.4 GiB  1       0        3         271ms      0%       WARN   Collection scans
+[...]
+```
+
+For hosts that run many mongods side by side, typically one member of each
+of many replica sets. The usual failure is that every instance was left on
+the default WiredTiger cache, which assumes the machine is its alone; the
+caches add up to several times the RAM and the OOM killer picks off
+instances. (Output above is from a real 8-instance test host.)
+
 ---
 
 ## Running it on a schedule
@@ -814,21 +843,65 @@ shutdown was clean, so mdbkit can tell even when the crash happened before
 the log you are reading begins. The first election of a newly initiated
 replica set is reported as INFO, not as instability.
 
-**Hosts running several mongods.** Run mdbkit once per instance, on that
-instance's own log; don't pass several instances' logs in one command,
-because several files are read as one stream (that is for the rotated logs of
-one instance, or the members of one replica set). When several mongods run on
-the host, `triage` uses the pid and dbPath in the log's startup line to pick
+**Hosts running several mongods.** `triage` reads one instance's log; don't
+pass several instances' logs to it, because several files are read as one
+stream (that is for the rotated logs of one instance, or the members of one
+replica set). For the whole host at once, use [`mdbkit host`](#mdbkit-host-logs).
+When several mongods run on the host, `triage` uses the pid and dbPath the
+log records (in its startup line, or at the top of a rotated file) to pick
 the right process for its memory, uptime and disk checks, and when
 `--oslog` shows an OOM kill it says whether the killed pid was this
 instance or another one.
 
+---
+
+### `mdbkit host <logs...>`
+
+One host running many mongod instances: one line per instance, and checks
+that only make sense for the host as a whole.
+
+| Option | Default | Description |
+|---|---|---|
+| `--window N` | 1440 | Analyze the last N minutes of each log; `0` = whole logs |
+| `--ram SIZE` | | The host's memory (`64G`, `65536M`) when the logs were copied off it. On the host it is read from `/proc` |
+| `--oslog FILE...` | | System log(s): each OOM kill is matched to the instance it killed |
+| `--limit N` | all | Show only the N worst instances |
+| `--exit-code` | | Exit 2 on CRIT, 1 on WARN, else 0 |
+| `--json` | | Machine-readable output |
+
 ```bash
-for log in /var/log/mongodb/*/mongod.log; do
-  echo "== $log"
-  mdbkit triage "$log" --only CRIT,WARN
-done
+mdbkit host /var/log/mongodb                          # finds every *.log* below
+mdbkit host /var/log/mongodb --oslog /var/log/syslog  # who did the OOM killer hit?
+mdbkit host "/mnt/copied/db7/*/mongod.log*" --ram 256G --limit 15
 ```
+
+Give it files, globs or directories (searched three levels deep, never into
+a data directory). Files are grouped into instances by the host and port the
+log records, so rotated files join their instance even though they have no
+startup line.
+
+**Per instance:** replica set, version, role, WiredTiger cache size, starts
+and crashes (unclean stops), slow operations and their total time, the share
+of that time spent waiting (8.0+), and its worst finding from the same
+detectors `triage` uses.
+
+**For the host:**
+
+- **Cache sizes vs RAM.** Each instance's cache comes from its own log
+  ("Opening WiredTiger" states the size, even when it is the default). The
+  total is compared with the RAM: WARN above 60%, CRIT above 85%. These are
+  rules of thumb: MongoDB's single-instance default is about half the RAM,
+  leaving the rest to the OS file cache and each process's connections,
+  sorts and aggregations.
+- **Default cache on a shared host.** Instances without `cacheSizeGB` each
+  assume the whole machine is theirs.
+- **Crashes** across all instances, and with `--oslog`, every OOM kill
+  matched to the instance it hit by pid.
+- **Startup warnings counted across instances.** Kernel and limit settings
+  belong to the host, so "Open-file limit is too low: 54 of 54 instances" is
+  one fix, not 54.
+- **On the host itself:** instances with a log but no running mongod, and
+  running mongods whose logs were not given.
 
 ---
 
@@ -1259,6 +1332,11 @@ mdbkit export-script serverstatus > export_serverstatus.js
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
 
+**Shipped in v0.7:** `mdbkit host`, for hosts running many mongods: one
+line per instance, cache sizes added up against RAM, crashes and OOM kills
+per instance, startup warnings counted across instances. Rotated logs are
+tied to their process.
+
 **Shipped in v0.6.1:** tested against real MongoDB 7.0, 8.0, 8.3 and 9.0
 servers, with the bugs that turned up fixed; crash vs clean restart
 detection; correct behaviour on hosts running many mongods.
@@ -1273,10 +1351,6 @@ shareable reports.
 
 Next up, roughly in order:
 
-* **Hosts running many mongods.** One line per instance (health, restarts,
-  slow time, startup warnings), the WiredTiger cache sizes of every instance
-  added up against the host's RAM (54 instances on default settings would
-  each claim about half of it), and each OOM kill matched to its instance.
 * **Sharded clusters.** `mongos` logs are a different shape, and the classic
   sharded failure — a query with no shard key fanning out to every shard — is
   visible in the log. Also chunk migrations, balancer windows and jumbo

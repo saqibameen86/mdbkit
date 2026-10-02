@@ -55,9 +55,13 @@ implementing a design doc in this folder MUST honor these principles.
   double-counted updates on 8.0 and earlier, Long counters in the serverStatus
   export, export scripts defaulting to the `test` database, FTDC timeline
   helper columns) plus multi-instance host handling and crash detection.
-* **v0.7 (next)** — hosts running many mongods (per-instance overview, cache
-  sizes vs RAM, OOM kill per instance); then sharded clusters with
-  `mdbkit lab --sharded`; `$indexStats`-based index usage candidates.
+* **v0.7 (shipped)** — `mdbkit host`: hosts running many mongods
+  (per-instance overview, cache sizes vs RAM, crashes and OOM kills per
+  instance, startup warnings across instances), tested on a real
+  eight-instance host.
+* **v0.8 (next)** — sharded clusters: mongos logs, scatter-gather queries,
+  migrations and the balancer, with `mdbkit lab --sharded`; then
+  `$indexStats`-based index usage candidates.
 * **Later / separate product** — GUI control plane, continuous backup
   health, scheduling (the commercial platform). The CLI stays free and
   fully functional forever; it is the trust anchor, not a crippled demo.

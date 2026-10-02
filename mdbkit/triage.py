@@ -38,6 +38,17 @@ AUDIT_IDS = frozenset(_AUDIT_KNOWN)
 # "mongod startup complete", whose attr says whether the previous shutdown
 # was clean. Logged by 7.0.43, 8.0.32, 8.3.11 and 9.0.2.
 ID_STARTUP_COMPLETE = 8423403
+# Re-logged at the top of every file after a log rotation: pid (as a
+# string), port and host; and the startup options (with storage.dbPath).
+ID_PROCESS_DETAILS = 20721
+ID_OPTIONS = 21951
+
+
+def dbpath_of_options(entry: LogEntry) -> Optional[str]:
+    opts = entry.attr.get("options")
+    storage = opts.get("storage") if isinstance(opts, dict) else None
+    path = storage.get("dbPath") if isinstance(storage, dict) else None
+    return text(path) or None
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
 DEFAULT_WINDOW_MIN = 60
@@ -168,6 +179,14 @@ class TriageEngine:
             if isinstance(flag, bool):
                 self.start_clean[-1] = flag
                 self.start_reported[-1] = True
+        if entry.msg_id == ID_PROCESS_DETAILS:
+            # A rotated log has no startup line; this says which process
+            # (pid) and port wrote it.
+            self.note_pid(entry)
+            if entry.attr.get("host") and not self.log_host:
+                self.log_host = text(entry.attr.get("host")).split(":")[0]
+        elif entry.msg_id == ID_OPTIONS and not self.dbpath:
+            self.dbpath = dbpath_of_options(entry)
         if entry.msg_id == ID_STARTUP:
             self.start_clean.append(self._shutdown_pending)
             self.start_reported.append(False)
@@ -235,7 +254,10 @@ class TriageEngine:
 
         if entry.component == "INDEX" and any(p in msg_l for p in self.INDEX_BUILD):
             ns = str(entry.attr.get("namespace") or entry.attr.get("ns") or "")
-            if QueryAggregator.is_system_ns(ns):
+            # Every new collection gets an _id index built inline, and a
+            # secondary logs it as collections replicate; that is not an
+            # index build anyone started.
+            if QueryAggregator.is_system_ns(ns) or entry.attr.get("index") == "_id_":
                 self.system_index_builds += 1
             else:
                 self.index_builds.append((entry.ts, entry.msg, ns))
@@ -775,7 +797,7 @@ def dbpath_from_argv(argv: List[str]) -> Optional[str]:
 def discover_dbpath(from_log: Optional[str]) -> Tuple[Optional[str], str]:
     """Resolve dbPath through a fallback chain. Returns (path, how)."""
     if from_log and os.path.isdir(from_log):
-        return from_log, "startup line in log"
+        return from_log, "recorded in the log"
     running = find_mongods()
     if len(running) > 1:
         # Ambiguous: do not guess which deployment the caller means.
@@ -848,7 +870,7 @@ def sysprobe(dbpath_from_log: Optional[str],
                 "%d mongod processes are running here; this log belongs to "
                 "pid %d (matched by %s), so only that one is reported." % (
                     len(running), found[0],
-                    "the pid in its startup line" if found[0] in (log_pids or [])
+                    "the pid the log records" if found[0] in (log_pids or [])
                     else "its dbPath")))
         else:
             rows = []
@@ -1171,7 +1193,7 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
         pre = ParseStats()
         early: List[LogEntry] = []
         for e in iter_entries_multi(paths, pre):
-            if e.msg_id == ID_STARTUP:
+            if e.msg_id in (ID_STARTUP, ID_PROCESS_DETAILS, ID_OPTIONS):
                 early.append(e)
         if pre.last_ts:
             cutoff = pre.last_ts - timedelta(minutes=window_min)
@@ -1184,6 +1206,9 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
         # The process that wrote the log may have started before the
         # window; its pid and dbPath still identify it on this host.
         for e in early:
+            if e.msg_id == ID_OPTIONS:
+                engine.dbpath = engine.dbpath or dbpath_of_options(e)
+                continue
             engine.note_pid(e)
             engine.dbpath = text(e.attr.get("dbPath")) or engine.dbpath
     for entry in iter_entries_multi(paths, stats):

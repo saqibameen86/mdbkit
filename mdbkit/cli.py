@@ -499,6 +499,29 @@ def cmd_audit(args) -> int:
     return 0
 
 
+def cmd_host(args) -> int:
+    from .host import render_host, run_host, worst_severity
+
+    def progress(done, total):
+        if total > 3:
+            print("\rreading instance %d/%d" % (done, total),
+                  end="" if done < total else "\n", file=sys.stderr)
+    try:
+        rep = run_host(args.logs, window_min=args.window, ram=args.ram,
+                       oslog=args.oslog, progress=progress)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        print(dump_json(rep.to_dict()))
+    else:
+        print(render_host(rep, limit=args.limit))
+    if args.exit_code:
+        sev = worst_severity(rep)
+        return 2 if sev == "CRIT" else (1 if sev == "WARN" else 0)
+    return 0
+
+
 def cmd_compare(args) -> int:
     from .compare import aggregate_file, compare
     from .render import render_compare
@@ -804,6 +827,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="exit 2 on CRIT, 1 on WARN, else 0")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("host",
+                        help="a host running many mongods: one line per "
+                             "instance, cache sizes vs RAM, crashes, OOM kills")
+    sp.add_argument("logs", nargs="+", metavar="LOG",
+                    help="every instance's log: files, globs, or directories "
+                         "(searched three levels deep, e.g. /var/log/mongodb)")
+    sp.add_argument("--window", type=NON_NEG, default=1440, metavar="MINUTES",
+                    help="analyze the last N minutes of each log "
+                         "(default 1440 = 24h; 0 = whole logs)")
+    sp.add_argument("--ram", metavar="SIZE",
+                    help="the host's memory, e.g. 64G, when the logs were "
+                         "copied off it (on the host it is read from /proc)")
+    sp.add_argument("--oslog", nargs="+", metavar="FILE",
+                    help="system log(s) to match OOM kills to instances")
+    sp.add_argument("--limit", type=NON_NEG, default=0, metavar="N",
+                    help="show only the N worst instances (default all)")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 2 on CRIT, 1 on WARN, else 0")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_host)
 
     sp = sub.add_parser("oslog",
                         help="scan a system log for OOM kills, fd limits, "

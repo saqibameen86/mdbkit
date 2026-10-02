@@ -3,7 +3,7 @@
 ## Design posture
 
 Every **analysis** command — `loginfo`, `queries`, `connections`, `filter`,
-`advise`, `explain`, `triage`, `audit`, `ftdc`, `oslog`, `serverstatus`,
+`advise`, `explain`, `triage`, `host`, `audit`, `ftdc`, `oslog`, `serverstatus`,
 `compare`, `demo`, `export-script` — is safe to run on a production database
 host:
 
