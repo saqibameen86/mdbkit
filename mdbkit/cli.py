@@ -407,7 +407,8 @@ def cmd_ftdc(args) -> int:
                                  "values": v.values}
                              for k, v in reader.series.items()}))
         else:
-            print(render_ftdc_timeline(reader, args.step))
+            print(render_ftdc_timeline(reader, args.step,
+                                       show_internal=bool(args.metric)))
     else:  # export
         import csv as _csv
         labels = sorted(reader.series)

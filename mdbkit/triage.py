@@ -28,13 +28,16 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
-from .analysis import QueryAggregator
+from .analysis import BatchDedup, QueryAggregator
 from .audit import KNOWN as _AUDIT_KNOWN
 from .parser import (ID_CONN_ACCEPTED, ID_LISTENING, ID_SHUTDOWN,
                      ID_SLOW_IN_PROGRESS, ID_STARTUP, LogEntry, ParseStats,
                      iter_entries, iter_entries_multi, num, text)
 
 AUDIT_IDS = frozenset(_AUDIT_KNOWN)
+# "mongod startup complete", whose attr says whether the previous shutdown
+# was clean. Logged by 7.0.43, 8.0.32, 8.3.11 and 9.0.2.
+ID_STARTUP_COMPLETE = 8423403
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
 DEFAULT_WINDOW_MIN = 60
@@ -83,6 +86,8 @@ def _ms(v: float) -> str:
 class TriageEngine:
     """Single-pass log consumer feeding all detectors."""
 
+    EVICTION_PRESSURE = ("cache stuck", "eviction stuck", "unable to reach eviction goal",
+                         "application thread", "cache full", "cache overflow")
     ELECTION_EVENT = ("starting an election", "election succeeded",
                       "stepping down", "stepped down")
     ELECTION_STATE = ("member is in new state", "replica set state transition",
@@ -91,12 +96,16 @@ class TriageEngine:
 
     def __init__(self):
         self.qagg = QueryAggregator()
+        self.dedup = BatchDedup()
         self.startups: List = []
         self.errors: Counter = Counter()
         self.error_examples: Dict = {}
         self.conn_minutes: Counter = Counter()
         self.conn_ips: defaultdict = defaultdict(Counter)
         self.elections: List = []
+        self.pids: List[int] = []    # this log's mongod, one pid per start
+        self.pid_starts: List = []   # (startup time, pid)
+        self.initiated_at = None     # replSetInitiate: a brand-new set
         self.state_changes: List = []
         self.checkpoints: List = []
         self.evictions = 0
@@ -108,6 +117,10 @@ class TriageEngine:
         self.slow_total = 0
         self.index_builds: List = []
         self.log_tz = None
+        self.last_seen = None
+        self.seen = 0                # entries consumed
+        self.history_before_start = 0
+        self.at_file_start = True    # the window begins at the log's start
         self.system_index_builds = 0
         self.self_state = None            # this node's latest role
         self.self_state_at = None
@@ -116,12 +129,23 @@ class TriageEngine:
         self.listening = False
         self.listening_at = None
         self.shutdown_at = None
+        self.start_clean: List[bool] = []   # per startup: was it a clean restart?
+        self.start_reported: List[bool] = []  # ...as stated by mongod itself
+        self._shutdown_pending = False
         self.log_host = None
         self.in_progress: List = []       # 8.3+ "Slow in-progress query"
         self.audit_entries: List[LogEntry] = []
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
+        self.seen += 1
+        if not self.startups and entry.msg_id != ID_STARTUP and \
+                entry.ctx != "main":
+            # mongod writes a few lines from its "main" thread before
+            # "MongoDB starting"; anything else means the log has history.
+            self.history_before_start += 1
+        if entry.ts is not None:
+            self.last_seen = entry.ts
         if self.log_tz is None and entry.ts is not None:
             self.log_tz = entry.ts.tzinfo
         self.qagg.consume(entry)
@@ -135,9 +159,22 @@ class TriageEngine:
             self.audit_entries.append(entry)
         if entry.msg_id == ID_SLOW_IN_PROGRESS:
             self.in_progress.append(entry)
+        if entry.msg_id == ID_STARTUP_COMPLETE and self.start_clean:
+            # mongod says itself whether the previous shutdown was clean,
+            # even when that shutdown is in an older, rotated log.
+            summary = entry.attr.get("Summary of time elapsed")
+            flag = summary.get("Startup from clean shutdown?") \
+                if isinstance(summary, dict) else None
+            if isinstance(flag, bool):
+                self.start_clean[-1] = flag
+                self.start_reported[-1] = True
         if entry.msg_id == ID_STARTUP:
+            self.start_clean.append(self._shutdown_pending)
+            self.start_reported.append(False)
+            self._shutdown_pending = False
             self.startups.append(entry.ts)
             self.dbpath = text(entry.attr.get("dbPath")) or self.dbpath
+            self.note_pid(entry)
         elif entry.severity in ("E", "F"):
             key = (entry.component, entry.msg)
             self.errors[key] += 1
@@ -149,7 +186,7 @@ class TriageEngine:
             remote = str(entry.attr.get("remote", "")).rsplit(":", 1)[0]
             self.conn_ips[m][remote] += 1
 
-        if entry.is_slow_query and not (
+        if entry.is_slow_query and not self.dedup.is_duplicate(entry) and not (
                 not self.qagg.include_system
                 and QueryAggregator.is_system_ns(str(entry.attr.get("ns", "")))):
             self.slow_total += 1
@@ -165,6 +202,7 @@ class TriageEngine:
             self.listening_at = entry.ts
         if entry.msg_id == ID_SHUTDOWN or msg_l.startswith("shutting down"):
             self.shutdown_at = entry.ts
+            self._shutdown_pending = True
 
         if entry.component in ("REPL", "ELECTION", "REPL_HB"):
             new_state = entry.attr.get("newState")
@@ -182,6 +220,8 @@ class TriageEngine:
                 self.heartbeat_errors[tgt] += 1
 
         if entry.component in ("REPL", "ELECTION"):
+            if "replsetinitiate admin command received" in msg_l:
+                self.initiated_at = entry.ts
             if any(p in msg_l for p in self.ELECTION_EVENT) and \
                     "not starting" not in msg_l:
                 self.elections.append((entry.ts, entry.msg))
@@ -208,8 +248,15 @@ class TriageEngine:
                 dur = int(m.group(1)) * 1000 if m else None
             self.checkpoints.append((entry.ts, dur))
 
-        if "eviction" in msg_l or "eviction" in wt_msg.lower():
-            self.evictions += 1
+        text_l = msg_l + " " + wt_msg.lower()
+        if "evict" in text_l or any(p in text_l for p in self.EVICTION_PRESSURE):
+            # Routine lines ("starting eviction threads" at every 8.x startup,
+            # eviction settings in the WiredTiger config string) say nothing
+            # about pressure. Count warnings/errors and the phrases
+            # WiredTiger uses when eviction is actually struggling.
+            if entry.severity in ("W", "E", "F") or any(
+                    p in text_l for p in self.EVICTION_PRESSURE):
+                self.evictions += 1
 
     # --------------------------------------------------------- findings ----
     def _health_finding(self) -> Finding:
@@ -271,7 +318,7 @@ class TriageEngine:
             detail_head = ("%d heartbeat error(s) in window; most to %s (%d)."
                            % (total, worst[0], worst[1]))
             next_step = "Network or peer health between replica set members."
-        elif self.elections:
+        elif self._unplanned_elections():
             sev = "WARN"
             detail_head = ("The set re-elected during this window; it may be "
                            "healthy now but it was not stable.")
@@ -284,33 +331,129 @@ class TriageEngine:
 
         return Finding(sev, "Cluster health", detail_head, bits, next_step)
 
+    def note_pid(self, entry: LogEntry) -> None:
+        pid = int(num(entry.attr.get("pid"), 0))
+        if pid > 0 and pid not in self.pids:
+            self.pids.append(pid)
+            self.pid_starts.append((entry.ts, pid))
+
+    def pid_at(self, when) -> Optional[int]:
+        """The pid this log's mongod had at `when`, if the log shows it."""
+        best = None
+        if when is not None and when.tzinfo is None:
+            # syslog has no zone; read it in the log's zone (same host).
+            for ts, _pid in self.pid_starts:
+                if ts is not None and ts.tzinfo is not None:
+                    when = when.replace(tzinfo=ts.tzinfo)
+                    break
+        if when is not None and self.last_seen is not None:
+            # A process killed shortly after its last log line is the normal
+            # shape of an OOM kill; much later, it may have restarted since.
+            limit = self.last_seen
+            if limit.tzinfo is None and when.tzinfo is not None:
+                limit = limit.replace(tzinfo=when.tzinfo)
+            elif limit.tzinfo is not None and when.tzinfo is None:
+                when = when.replace(tzinfo=limit.tzinfo)
+            if when > limit + timedelta(minutes=10):
+                return None
+        for ts, pid in self.pid_starts:
+            if ts is not None and ts.tzinfo is None and when is not None \
+                    and when.tzinfo is not None:
+                ts = ts.replace(tzinfo=when.tzinfo)
+            if ts is not None and when is not None and ts <= when:
+                if best is None or ts >= best[0]:
+                    best = (ts, pid)
+        return best[1] if best else None
+
+    def _unplanned_elections(self) -> List:
+        """Elections other than the first one of a newly initiated set."""
+        if self.initiated_at is None:
+            return list(self.elections)
+        settle = self.initiated_at + timedelta(seconds=120)
+        return [(t, m) for t, m in self.elections
+                if t is None or t < self.initiated_at or t > settle]
+
     def findings(self) -> List[Finding]:
         out: List[Finding] = [self._health_finding()]
 
-        if self.elections:
-            times = [t.strftime("%H:%M:%S") if t else "?" for t, _ in self.elections]
+        elections = self._unplanned_elections()
+        if elections:
+            times = [t.strftime("%H:%M:%S") if t else "?" for t, _ in elections]
             out.append(Finding(
                 "CRIT", "Replica set instability",
                 "%d election/stepdown event(s) at %s." % (
-                    len(self.elections), ", ".join(times[:6])),
-                [m for _, m in self.elections[:6]],
+                    len(elections), ", ".join(times[:6])),
+                [m for _, m in elections[:6]],
                 "Correlate with connection storms and slow checkpoints below; "
                 "check node health and network at those timestamps.",
                 beta=True))
+        elif self.elections:
+            out.append(Finding(
+                "INFO", "Replica set created",
+                "The set was initiated at %s and elected its first primary "
+                "straight after. That is how a new replica set starts, not "
+                "instability." % self.initiated_at.strftime("%H:%M:%S"),
+                [m for _, m in self.elections[:4]], beta=True))
         else:
             out.append(Finding("OK", "Replica set",
                                "No election or stepdown messages in window.",
                                beta=True))
 
-        if self.startups:
-            ts = [t.strftime("%H:%M:%S") if t else "?" for t in self.startups]
+        log_begins_with_start = (len(self.startups) == 1 and self.at_file_start
+                                 and self.history_before_start == 0)
+        if log_begins_with_start and self.start_reported[:1] == [True] \
+                and self.start_clean[:1] == [False]:
+            t = self.startups[0]
             out.append(Finding(
-                "CRIT" if len(self.startups) > 1 else "WARN",
-                "Process start(s) in window",
-                "mongod startup marker seen %dx (at %s). Unplanned restarts "
-                "are incidents." % (len(self.startups), ", ".join(ts[:5])),
-                next_step="If unexpected, find out why it stopped: "
-                          "mdbkit oslog /var/log/syslog (OOM kills, fd limits)."))
+                "CRIT", "Started after a crash",
+                "The log begins with mongod starting at %s, and mongod reported "
+                "that its previous shutdown was not clean: it crashed or was "
+                "killed (kill -9, OOM killer) before this log began." % (
+                    t.strftime("%H:%M:%S") if t else "?"),
+                next_step="Find out why it stopped: mdbkit oslog "
+                          "/var/log/syslog, and the previous rotated log."))
+        elif log_begins_with_start:
+            t = self.startups[0]
+            out.append(Finding(
+                "INFO", "Log begins at a startup",
+                "The log starts with mongod starting at %s. Nothing before it "
+                "is in this file, so whether that start was planned is not "
+                "visible here." % (t.strftime("%H:%M:%S") if t else "?"),
+                next_step="If it was not planned: mdbkit oslog /var/log/syslog "
+                          "(OOM kills, fd limits), or the previous rotated log."))
+        elif self.startups:
+            starts = list(zip(self.startups, self.start_clean))
+            first_crashed = []
+            if self.at_file_start and self.history_before_start == 0:
+                # Where the log begins: only a crash if mongod says so.
+                if self.start_reported[:1] == [True] and not self.start_clean[0]:
+                    first_crashed = [self.startups[0]]
+                starts = starts[1:]
+            crashed = first_crashed + [t for t, clean in starts if not clean]
+            planned = [t for t, clean in starts if clean]
+            fmt = lambda ts: ", ".join(t.strftime("%H:%M:%S") if t else "?"
+                                       for t in ts[:5])
+            if crashed:
+                out.append(Finding(
+                    "CRIT", "Process start(s) in window",
+                    "mongod started %dx after an unclean stop (at %s): it "
+                    "died without shutting down, which is what a crash, "
+                    "kill -9 or OOM kill looks like.%s" % (
+                        len(crashed), fmt(crashed),
+                        " %d other start(s) followed a clean shutdown."
+                        % len(planned) if planned else ""),
+                    next_step="Find out why it stopped: mdbkit oslog "
+                              "/var/log/syslog (OOM kills, fd limits)."))
+            elif planned:
+                out.append(Finding(
+                    "WARN", "Process start(s) in window",
+                    "mongod restarted %dx after a clean shutdown (at %s). "
+                    "Planned restarts are routine; confirm these were."
+                    % (len(planned), fmt(planned)),
+                    next_step="If not planned: 'Terminating via shutdown "
+                              "command' names the connection that sent it "
+                              "(connN); 'Received signal' means the OS or "
+                              "service manager stopped it."))
 
         if self.errors:
             total = sum(self.errors.values())
@@ -653,31 +796,77 @@ def discover_dbpath(from_log: Optional[str]) -> Tuple[Optional[str], str]:
     return (from_log, "log (not present on this host)") if from_log else (None, "")
 
 
+def _same_path(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (OSError, ValueError):
+        return a.rstrip("/") == b.rstrip("/")
+
+
+def pick_mongod(running: List[Tuple[int, List[str]]],
+                log_pids: Optional[List[int]] = None,
+                dbpath: Optional[str] = None) -> Optional[Tuple[int, List[str]]]:
+    """The running mongod this log belongs to, or None if that is unclear.
+
+    On a host running several mongods, reporting the first one found gives
+    another instance's memory and uptime. Match by the pid in the log's
+    startup line, then by dbPath; only a lone mongod is assumed.
+    """
+    log_pids = log_pids or []
+    for pid, argv in running:
+        if pid in log_pids:
+            return pid, argv
+    if dbpath:
+        for pid, argv in running:
+            if _same_path(dbpath_from_argv(argv), dbpath):
+                return pid, argv
+    if len(running) == 1:
+        argv_db = dbpath_from_argv(running[0][1])
+        if not (dbpath and argv_db and not _same_path(argv_db, dbpath)):
+            return running[0]
+    return None
+
+
 def sysprobe(dbpath_from_log: Optional[str],
-             explicit: Optional[str] = None) -> List[Finding]:
+             explicit: Optional[str] = None,
+             log_pids: Optional[List[int]] = None) -> List[Finding]:
     """Local OS probes. Stdlib only, no shell-outs, all failures soft."""
     out: List[Finding] = []
     running = find_mongods()
-    if len(running) > 1 and not explicit:
-        rows = []
-        for pid, argv in running[:6]:
-            rows.append("pid %d%s%s" % (
-                pid,
-                "  port %s" % port_from_argv(argv) if port_from_argv(argv) else "",
-                "  dbPath %s" % dbpath_from_argv(argv)
-                if dbpath_from_argv(argv) else ""))
-        out.append(Finding(
-            "INFO", "Multiple mongod processes",
-            "%d mongod processes are running here, so mdbkit did not guess "
-            "which one this log belongs to." % len(running), rows,
-            "Pass --dbpath /path/to/that/instance to include disk and "
-            "metrics checks."))
     if explicit:
         dbpath, how = explicit, "--dbpath"
     else:
         dbpath, how = discover_dbpath(dbpath_from_log)
+    found = pick_mongod(running, log_pids, explicit or dbpath)
 
-    found = find_mongod()
+    if len(running) > 1:
+        if found:
+            out.append(Finding(
+                "INFO", "Multiple mongod processes",
+                "%d mongod processes are running here; this log belongs to "
+                "pid %d (matched by %s), so only that one is reported." % (
+                    len(running), found[0],
+                    "the pid in its startup line" if found[0] in (log_pids or [])
+                    else "its dbPath")))
+        else:
+            rows = []
+            for pid, argv in running[:6]:
+                rows.append("pid %d%s%s" % (
+                    pid,
+                    "  port %s" % port_from_argv(argv) if port_from_argv(argv) else "",
+                    "  dbPath %s" % dbpath_from_argv(argv)
+                    if dbpath_from_argv(argv) else ""))
+            if len(running) > 6:
+                rows.append("... and %d more" % (len(running) - 6))
+            out.append(Finding(
+                "INFO", "Multiple mongod processes",
+                "%d mongod processes are running here, so mdbkit did not guess "
+                "which one this log belongs to." % len(running), rows,
+                "Pass --dbpath /path/to/that/instance to include disk and "
+                "metrics checks."))
+
     if found:
         pid, _argv = found
         rss_kb = 0
@@ -923,6 +1112,48 @@ def find_diagnostic_data(dbpath: Optional[str]) -> Optional[str]:
     return None
 
 
+def _oom_attribution(engine: "TriageEngine", kills, detail: str):
+    """Say whether an OOM kill hit the mongod that wrote this log.
+
+    On a host running several mongods a kill of any of them used to be
+    reported as "this explains the restart above". The kernel line names
+    the pid; the log's startup lines say which pid this mongod had when.
+    """
+    ours, others, unknown = [], [], []
+    for e in kills:
+        killed = int(num(e.detail.get("pid"), 0))
+        proc = (e.detail.get("process") or "").lower()
+        if not killed:
+            unknown.append(e)
+        elif killed in engine.pids:
+            ours.append(killed)
+        else:
+            running = engine.pid_at(e.ts)
+            if running is not None and running != killed:
+                others.append((killed, proc))
+            else:
+                unknown.append(e)
+    if ours:
+        return (detail + " pid %s was this log's mongod." % ", ".join(
+                    str(p) for p in sorted(set(ours))),
+                "This explains the unexplained restart in the mongod log above.")
+    if others and not unknown:
+        mongo = [p for p, proc in others if "mongo" in proc]
+        what = ("another mongod on this host" if mongo
+                else "another process on this host")
+        return (detail + " Killed pid(s) %s: %s, not the mongod that wrote "
+                "this log (pid %s at the time)." % (
+                    ", ".join(str(p) for p, _ in others), what,
+                    ", ".join(str(engine.pid_at(e.ts)) for e in kills[:1])),
+                "The host is short of memory. Triage the killed instance's own "
+                "log; on a host running several mongods, check that their "
+                "WiredTiger cache sizes add up to well under the RAM.")
+    return (detail,
+            "If the killed pid was this log's mongod, this explains an "
+            "unexplained restart above. The log does not show which pid it "
+            "had at that moment, so mdbkit cannot confirm it.")
+
+
 def run_triage(logfile: str, window_min: Optional[int] = None,
                dbpath: Optional[str] = None, no_sysprobe: bool = False,
                ftdc_path: Optional[str] = None, oslog=None,
@@ -938,13 +1169,23 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
     cutoff = None
     if window_min and paths != ["-"]:
         pre = ParseStats()
-        for _ in iter_entries_multi(paths, pre):
-            pass
+        early: List[LogEntry] = []
+        for e in iter_entries_multi(paths, pre):
+            if e.msg_id == ID_STARTUP:
+                early.append(e)
         if pre.last_ts:
             cutoff = pre.last_ts - timedelta(minutes=window_min)
 
     stats = ParseStats()
     engine = TriageEngine()
+    if cutoff is not None and pre.first_ts is not None:
+        engine.at_file_start = pre.first_ts >= cutoff
+    if window_min and paths != ["-"]:
+        # The process that wrote the log may have started before the
+        # window; its pid and dbPath still identify it on this host.
+        for e in early:
+            engine.note_pid(e)
+            engine.dbpath = text(e.attr.get("dbPath")) or engine.dbpath
     for entry in iter_entries_multi(paths, stats):
         if cutoff and entry.ts and entry.ts < cutoff:
             continue
@@ -954,7 +1195,8 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
     resolved_dbpath = None
     if not no_sysprobe:
         resolved_dbpath = dbpath or discover_dbpath(engine.dbpath)[0]
-        findings += sysprobe(engine.dbpath, explicit=dbpath)
+        findings += sysprobe(engine.dbpath, explicit=dbpath,
+                             log_pids=engine.pids)
     if not ftdc_path:
         # Only auto-discover local metrics when the log actually belongs to
         # this machine. Correlating one host's log with another host's
@@ -1022,11 +1264,14 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
                     g["explanation"] or g["kind"], g["count"], when)
                 if g["processes"]:
                     detail += " Processes: %s." % ", ".join(g["processes"])
+                next_step = ""
+                if g["kind"] == "oom-kill":
+                    detail, next_step = _oom_attribution(
+                        engine, [e for e in events if e.kind == "oom-kill"],
+                        detail)
                 findings.append(Finding(
                     g["severity"], "System: %s" % g["kind"], detail,
-                    g["examples"][:2],
-                    "This explains an unexplained restart in the mongod log "
-                    "above." if g["kind"] == "oom-kill" else ""))
+                    g["examples"][:2], next_step))
         except OSError:
             pass
     elif not no_sysprobe and OS.uses_journald():

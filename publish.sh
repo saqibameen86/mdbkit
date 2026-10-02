@@ -21,6 +21,21 @@ VERSION=$(python3 -c "import re,io;print(re.search(r'^version = \"(.*?)\"', io.o
 echo "Version to publish: $VERSION"
 echo
 
+# Refuse to republish. PyPI never accepts a version twice (twine only says
+# "400 Bad Request"), and an old folder would also force-push old history
+# over GitHub. Checked before anything is committed or pushed.
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://pypi.org/pypi/mdbkit/$VERSION/json" || echo "000")
+if [ "$STATUS" = "200" ]; then
+  echo "ERROR: mdbkit $VERSION is already on PyPI."
+  echo "       This folder holds an old release. Unpack the newest download:"
+  echo "         cd ~/Downloads && ls -t mdbkit*.tar.gz | head -3"
+  echo "       (a repeat download is saved as 'mdbkit (1).tar.gz')"
+  exit 1
+elif [ "$STATUS" != "404" ]; then
+  echo "WARNING: could not check PyPI for $VERSION (HTTP $STATUS); continuing."
+  echo
+fi
+
 echo "[1/5] Preparing git..."
 [ -d .git ] || { echo "      initialising repository"; git init -q; }
 git config user.name "$GIT_NAME"

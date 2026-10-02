@@ -9,7 +9,7 @@
 deterministic index advice, incident triage, a startup configuration audit,
 and diagnostic-data decoding. For MongoDB 4.4 through 8.x and 9.0, from the
 terminal, without connecting to anything.
-**[Last checked against MongoDB 9.0.2, 8.3.13, 8.0.34 and 7.0.45](#compatibility)**
+**[Tested against real MongoDB 9.0.2, 8.3.11, 8.0.32 and 7.0.43](#compatibility)**
 (October 2026).
 
 A spiritual successor to mtools' log tools, which never learned to read the
@@ -239,29 +239,43 @@ updates — upgrades are always explicit.
 
 ## Compatibility
 
-**Last checked against (October 2026):** MongoDB **9.0.2**, **8.3.13**,
-**8.0.34** (LTS) and **7.0.45** (LTS). mdbkit reads the structured JSON log
-format, so anything from **4.4** onwards works; 4.2 and earlier wrote plain
-text logs and are not supported.
+**Tested against (October 2026):** MongoDB **9.0.2**, **8.3.11**, **8.0.32**
+(LTS) and **7.0.43** (LTS), the newest release in each series at the time.
+mdbkit reads the structured JSON log format, so anything from **4.4** onwards
+works; 4.2 and earlier wrote plain text logs and are not supported.
 
 | MongoDB | What mdbkit uses from it |
 |---|---|
 | 4.4 – 7.0 | Everything except the 8.x-only fields below |
 | 8.0 | `workingMillis` (time executing, as distinct from waiting), `queues.execution.totalTimeQueuedMicros` (ticket queue time), `queryShapeHash` (usable with `setQuerySettings`), `planCacheShapeHash`, the 8.0 transparent-huge-page guidance |
 | 8.1+ | `<stage>Spills` / `<stage>SpilledBytes` (disk spills per stage) |
-| 8.3+ | `peakTrackedMemBytes`, "Slow in-progress query" lines (id 1794200) |
-| 9.0 | No changes to the fields mdbkit reads were found in the 9.0 release notes. Its `$queryStats` restructuring does not affect logs |
+| 8.3+ | "Slow in-progress query" lines (id 1794200, component `SLOWPROG`), logged by default for operations still running after 5 s (`--defaultSlowInProgMS`), and `peakTrackedMemBytes` |
+| 9.0 | Same log fields as 8.3. Adds a few fields mdbkit does not use yet (`delinquencyInfo`, `queues.ingress`) |
 
-When a field is missing, because the log predates it, that part of the
-output is left out. It is never guessed. FTDC decoding and `serverstatus`
-read concurrency tickets from either the older
-`wiredTiger.concurrentTransactions` or the newer `queues.execution` layout.
+When a field is missing because the log predates it, that part of the output
+is left out. It is never guessed. FTDC decoding and `serverstatus` read
+concurrency tickets from either the older `wiredTiger.concurrentTransactions`
+or the newer `queues.execution` layout.
 
-**How "checked" was established, honestly:** these versions were checked
-against MongoDB's release notes and server source (log message ids, field
-names, startup warnings), and every new field is covered by tests built from
-those definitions. The 0.6.0 release was *not* additionally run against a
-live 8.3 or 9.0 server. If you hit a line mdbkit misreads, please
+**How it was tested.** Official MongoDB builds of each version were run with
+`mdbkit lab` (a three-node replica set and a standalone), seeded, and put
+through a workload built to produce every field above: unindexed queries,
+sorts and groups forced to spill to disk, writes blocked behind `fsyncLock` so
+they wait rather than work, long-running server-side JavaScript, a clean
+restart and a `kill -9`. Every mdbkit command was then run on the resulting
+logs, `diagnostic.data`, serverStatus and explain output and `getLog`
+captures, and compared with what the server actually did. Trimmed copies of
+that output are in [`tests/fixtures/real/`](tests/fixtures/real/) and run with
+every test.
+
+> **Correction.** The 0.6.0 README and release notes said "last checked
+> against 9.0.2, 8.3.13, 8.0.34 and 7.0.45". Three of those version numbers
+> were wrong: MongoDB's release index has no 8.3.13, 8.0.34 or 7.0.45. That
+> release was also checked against release notes and server source only, not
+> a running server. Testing against real servers in 0.6.1 found several bugs
+> 0.6.0 had missed (see the release notes).
+
+If mdbkit misreads a line from your deployment, please
 [open an issue](../../issues) with the line (redact as you like).
 
 ---
@@ -296,7 +310,7 @@ not help.
 mdbkit export-script indexes > export_indexes.js
 mdbkit export-script schema  > export_schema.js
 
-mongosh --quiet --host your_db_host --port 27017 \
+mongosh --quiet "mongodb://your_db_host:27017/" \
   --username your_username --password your_password \
   --authenticationDatabase admin \
   --eval "$(cat export_indexes.js)" > indexes.json      # repeat for schema
@@ -543,6 +557,13 @@ query with different parameters is counted once.
 | `plan` | The plan MongoDB chose: `COLLSCAN` (no index), `IXSCAN{fields}` (index used), `IDHACK` (`_id` lookup), `+SORT` (in-memory sort), `+SPILL` (wrote temporary files to disk). `?` = the plan was not recorded on that line |
 | `shape` | Fields and operators queried, with the sort |
 
+Two kinds of row are worth knowing about. A `getMore(find)` or
+`getMore(aggregate)` row is a cursor fetching more results; it is grouped
+under the shape of the query that opened the cursor. Slow `insert` rows are
+included even though no index can speed up an insert: a slow insert is still
+latency your application saw, and on 8.0+ the `--shape` view says whether it
+was executing or waiting (on locks, flow control or write concern).
+
 ```bash
 mdbkit queries mongod.log
 mdbkit queries mongod.log --sort scanRatio --limit 10
@@ -786,6 +807,29 @@ mdbkit triage mongod.log --report incident.html
 mdbkit triage mongod.log --window 0 --no-sysprobe
 ```
 
+**Restarts and crashes.** A restart after a clean shutdown is a WARN; a start
+with no clean shutdown before it is a CRIT, because that is what a crash,
+`kill -9` or OOM kill looks like. mongod itself records whether its previous
+shutdown was clean, so mdbkit can tell even when the crash happened before
+the log you are reading begins. The first election of a newly initiated
+replica set is reported as INFO, not as instability.
+
+**Hosts running several mongods.** Run mdbkit once per instance, on that
+instance's own log; don't pass several instances' logs in one command,
+because several files are read as one stream (that is for the rotated logs of
+one instance, or the members of one replica set). When several mongods run on
+the host, `triage` uses the pid and dbPath in the log's startup line to pick
+the right process for its memory, uptime and disk checks, and when
+`--oslog` shows an OOM kill it says whether the killed pid was this
+instance or another one.
+
+```bash
+for log in /var/log/mongodb/*/mongod.log; do
+  echo "== $log"
+  mdbkit triage "$log" --only CRIT,WARN
+done
+```
+
 ---
 
 ### `mdbkit audit <log>`
@@ -855,6 +899,10 @@ mdbkit ftdc summary /var/lib/mongodb/diagnostic.data
 mdbkit ftdc timeline diagnostic.data --metric conns.current --step 300
 mdbkit ftdc export diagnostic.data > metrics.csv
 ```
+
+In `timeline`, gauges (connections, cache bytes, tickets) show the peak in
+each bucket and cumulative counters (`ops.*`, `sys.cpu.*`) show their rate
+per second over it.
 
 Metric labels include `ops.*` (insert/query/update/delete/getmore/command),
 `conns.current`, `conns.available`, `queue.readers`, `queue.writers`,
@@ -989,8 +1037,8 @@ mdbkit triage  $(mdbkit lab logs)               # all three as one stream
 mdbkit loginfo $(mdbkit lab logs | sed -n 2p)   # a specific secondary
 ```
 
-**A single node**, when you do not need replication — faster to start and it
-does not require `mongosh`:
+**A single node**, when you do not need replication. It starts faster, and
+`start` works without `mongosh` (`seed` still needs it):
 
 ```bash
 mdbkit lab start --standalone
@@ -1123,7 +1171,9 @@ role and process memory. Tickets are read from either the older
 mongosh prints when you run `db.serverStatus()` and copy the output:
 unquoted keys, `Long('42')`, `ISODate(...)`, `Timestamp({...})`. A file
 redirected in Windows PowerShell (UTF-16) works too. Nothing in the file is
-ever evaluated; it is tokenised as data.
+ever evaluated; it is tokenised as data. Dumps taken with the 0.6.0 export
+script, which wrote 64-bit counters as `{"low": …, "high": …}` objects, are
+read correctly too.
 
 **Two dumps give true rates.** Almost everything in serverStatus is cumulative
 since process start, so a single dump only yields lifetime averages:
@@ -1184,13 +1234,22 @@ duration moving by more than 20%.
 ### `mdbkit export-script {schema|indexes}`
 
 Prints a small `mongosh` script to stdout. **mdbkit never connects to your
-database** — you run these yourself, so you can read exactly what they do
-first. Both are read-only and export **field names and types only, never
-document values**.
+database**. You run these yourself, so you can read exactly what they do
+first. Both are read-only. `schema` exports **field names and types only,
+never document values**. `indexes` exports the index definitions from
+`getIndexes()`; a partial index's filter expression can contain literal
+values.
+
+Both cover **every database you can read** (`admin`, `config` and `local`
+skipped) and key collections by full namespace, so it does not matter which
+database mongosh connects to. To export one database only, set `ONLY_DB` at
+the top of the script. The `serverstatus` script writes relaxed Extended
+JSON, so 64-bit counters come out as plain numbers.
 
 ```bash
 mdbkit export-script indexes > export_indexes.js
 mdbkit export-script schema  > export_schema.js
+mdbkit export-script serverstatus > export_serverstatus.js
 ```
 
 ---
@@ -1199,6 +1258,10 @@ mdbkit export-script schema  > export_schema.js
 
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
+
+**Shipped in v0.6.1:** tested against real MongoDB 7.0, 8.0, 8.3 and 9.0
+servers, with the bugs that turned up fixed; crash vs clean restart
+detection; correct behaviour on hosts running many mongods.
 
 **Shipped in v0.6:** MongoDB 8.x/9.0 support (executing vs waiting time,
 query shape hashes, disk spills, peak memory, in-progress operations, the
@@ -1210,6 +1273,10 @@ shareable reports.
 
 Next up, roughly in order:
 
+* **Hosts running many mongods.** One line per instance (health, restarts,
+  slow time, startup warnings), the WiredTiger cache sizes of every instance
+  added up against the host's RAM (54 instances on default settings would
+  each claim about half of it), and each OOM kill matched to its instance.
 * **Sharded clusters.** `mongos` logs are a different shape, and the classic
   sharded failure — a query with no shard key fanning out to every shard — is
   visible in the log. Also chunk migrations, balancer windows and jumbo
@@ -1224,7 +1291,8 @@ Next up, roughly in order:
   `docs/TESTING-PLAYBOOK.md`. Real logs and metrics very welcome.
 
 mdbkit is validated against real-world structured logs (tens of thousands of
-lines) in addition to its synthetic test fixtures.
+lines) in addition to its synthetic test fixtures, and its tests include real
+output from MongoDB 7.0.43, 8.0.32, 8.3.11 and 9.0.2.
 
 ## Bugs, feature requests, questions
 

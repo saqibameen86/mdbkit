@@ -341,5 +341,7 @@ EXPORT_SCRIPT = """// Save this and run it, then analyse with:
 // apart and compare them:
 //   ... > before.json ; sleep 60 ; ... > after.json
 //   mdbkit serverstatus before.json --after after.json
-JSON.stringify(db.adminCommand({ serverStatus: 1 }));
+// EJSON (relaxed) writes 64-bit counters as plain numbers; plain
+// JSON.stringify would write them as {low, high} objects.
+EJSON.stringify(db.adminCommand({ serverStatus: 1 }), { relaxed: true });
 """

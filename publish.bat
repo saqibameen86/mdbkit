@@ -35,6 +35,20 @@ echo Version to publish: !VERSION!
 echo Commit author:      %GIT_NAME% ^<%GIT_EMAIL%^>
 echo.
 
+REM --- refuse to republish: PyPI never accepts a version twice, and an
+REM --- old folder would force-push old history over GitHub.
+set PYPI_STATUS=000
+for /f %%s in ('curl -s -o nul -w "%%{http_code}" --max-time 15 https://pypi.org/pypi/mdbkit/!VERSION!/json 2^>nul') do set PYPI_STATUS=%%s
+if "!PYPI_STATUS!"=="200" (
+  echo ERROR: mdbkit !VERSION! is already on PyPI.
+  echo        This folder holds an old release. Unpack the newest download.
+  goto :end
+)
+if not "!PYPI_STATUS!"=="404" (
+  echo WARNING: could not check PyPI for !VERSION! ^(HTTP !PYPI_STATUS!^); continuing.
+  echo.
+)
+
 echo [1/5] Preparing git...
 if not exist .git ( git init -q )
 git config user.name "%GIT_NAME%"

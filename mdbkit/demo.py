@@ -55,7 +55,7 @@ _SLOW_TEMPLATES = [
 # The demo log is written in the format of the current MongoDB LTS, so the
 # 8.0-only fields (workingMillis, queues, queryShapeHash, planCacheShapeHash)
 # are exercised by every command.
-DEMO_VERSION = "8.0.34"
+DEMO_VERSION = "8.0.32"
 
 
 def _stable_hex(text: str, length: int) -> str:
@@ -321,8 +321,14 @@ class DemoLog:
         for i in range(6):
             self._connection(0.2 + i * 0.05)
 
-        healthy = [t for t in _SLOW_TEMPLATES if not t[8]]
+        healthy = [t for t in _SLOW_TEMPLATES if not t[8]]   # light traffic
         heavy = [t for t in _SLOW_TEMPLATES if t[8]]
+        # The healthy scenario is the control case: only well-indexed
+        # queries, so "nothing wrong" really shows nothing wrong. (The light
+        # list above also holds an unindexed update; incident and mixed keep
+        # using it so their output is unchanged.)
+        clean = [t for t in _SLOW_TEMPLATES
+                 if "COLLSCAN" not in t[4] and t[5] <= 10 * max(t[6], 1)]
 
         # steady background traffic across the whole window
         per_minute = 3
@@ -331,7 +337,7 @@ class DemoLog:
                 minute = m + self.rng.random()
                 conn = 11 + self.rng.randint(0, 5)
                 if self.scenario == "healthy":
-                    tpl = self.rng.choice(healthy)
+                    tpl = self.rng.choice(clean)
                 elif self.scenario == "incident":
                     tpl = self.rng.choice(heavy if self.rng.random() < 0.75
                                           else healthy)

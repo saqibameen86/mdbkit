@@ -336,7 +336,7 @@ def test_ftdc_rejects_metric_count_larger_than_reference_doc():
 
 MONGOSH_PRINT = """{
   host: 'db1:27017',
-  version: '8.0.34',
+  version: '8.0.32',
   uptime: 86400,
   localTime: ISODate('2026-10-01T00:00:00.000Z'),
   connections: { current: 4180, available: 1020, totalCreated: Long('2841993') },

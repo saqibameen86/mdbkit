@@ -337,8 +337,30 @@ def _initiate(state: dict, echo=print) -> None:
         echo("warning: rs.initiate reported a problem:\n%s"
              % (res.stdout or res.stderr or "").strip()[:400])
         return
-    # give the election a moment so the log has a PRIMARY transition in it
-    time.sleep(3)
+    # rs.initiate returns before the election finishes. Wait for a primary,
+    # so `lab seed` straight after `lab start` does not hit "not primary".
+    if not _wait_primary(mongosh, ports[0]):
+        echo("warning: no primary was elected within 60s; `mdbkit lab seed` "
+             "may fail until one is.")
+
+
+WAIT_PRIMARY_JS = (
+    "for (let i = 0; i < 120; i++) {"
+    " const h = db.hello ? db.hello() : db.isMaster();"
+    " if (h.isWritablePrimary || h.ismaster) { print('PRIMARY'); quit(0); }"
+    " sleep(500); }"
+    " print('NO_PRIMARY');")
+
+
+def _wait_primary(mongosh: str, port: int) -> bool:
+    """Poll the node until it is a writable primary (up to 60 s)."""
+    try:
+        res = subprocess.run([mongosh, "--quiet", "--port", str(port),
+                              "--eval", WAIT_PRIMARY_JS],
+                             capture_output=True, text=True, timeout=90)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return "PRIMARY" in (res.stdout or "") and "NO_PRIMARY" not in res.stdout
 
 
 # ------------------------------------------------------------ lifecycle ---
@@ -499,9 +521,16 @@ def seed(directory: str = DEFAULT_DIR, docs: int = 50000, echo=print) -> bool:
         echo(script)
         return False
     port = live[0]["port"]
+    if state.get("replicaSet"):
+        # Address the whole set so writes go to whichever node is primary,
+        # and wait for one if an election is still in progress.
+        hosts = ",".join("127.0.0.1:%d" % n["port"] for n in live)
+        target = ["mongodb://%s/?replicaSet=%s&serverSelectionTimeoutMS=60000"
+                  % (hosts, state["replicaSet"])]
+    else:
+        target = ["--port", str(port)]
     echo("seeding via %s on port %d (this takes a moment) ..." % (mongosh, port))
-    res = subprocess.run([mongosh, "--quiet", "--port", str(port),
-                          "--eval", script],
+    res = subprocess.run([mongosh, "--quiet"] + target + ["--eval", script],
                          capture_output=True, text=True, timeout=900)
     out = (res.stdout or "").strip()
     if out:

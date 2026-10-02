@@ -52,7 +52,13 @@ def render_summary(summary: LogSummary, stats: ParseStats) -> str:
     parts.append(f"connections accepted: {summary.connections_accepted:,}")
     parts.append(
         f"slow queries logged: {summary.slow_queries:,}"
-        + (f" (slowest {_ms(summary.slowest_ms)})" if summary.slow_queries else "")
+        + ((f" ({summary.user_slow_queries:,} on your collections, slowest "
+            f"{_ms(summary.slowest_ms)}; the rest are internal operations)"
+            if summary.user_slow_queries != summary.slow_queries else
+            f" (slowest {_ms(summary.slowest_ms)})")
+           if summary.user_slow_queries else
+           (" (all on internal admin/config/local namespaces)"
+            if summary.slow_queries else ""))
     )
     if getattr(summary, "slow_in_progress", 0):
         parts.append(f"still-running operations logged (8.3+): "
@@ -77,7 +83,8 @@ def _plan_label(s) -> str:
 
 def _plan_core(s) -> str:
     if not s.plan_summaries:
-        return "?"
+        # An insert has no query plan; "?" means "plan not logged".
+        return "-" if s.shape.operation == "insert" else "?"
     top = s.plan_summaries.most_common(1)[0][0]
     if "COLLSCAN" in top:
         return "COLLSCAN" + ("+SORT" if s.in_memory_sort else "")
@@ -100,7 +107,12 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
     rows = []
     for s in results:
         # scan ratio: handle zero-return ops (updates, deletes) gracefully
-        if s.n_returned:
+        if s.n_returned and not s.docs_examined and not s.keys_examined \
+                and s.shape.operation.startswith("getMore"):
+            # A getMore only hands over results; the scanning was done by
+            # the find/aggregate that opened the cursor (its own row).
+            scan = "-"
+        elif s.n_returned:
             scan = f"{s.scan_ratio:.0f}:1"
         elif s.docs_examined:
             scan = f"{s.docs_examined:,}ex/0ret"
@@ -355,12 +367,20 @@ def render_ftdc_summary(reader, file_count: int) -> str:
     return "\n".join(parts)
 
 
-def render_ftdc_timeline(reader, step: int = 60) -> str:
+def render_ftdc_timeline(reader, step: int = 60, show_internal: bool = False) -> str:
+    """One row per time bucket. Gauges show the bucket's peak; cumulative
+    counters show their rate over the bucket, since a running total since
+    server start says nothing about that minute."""
     parts = ["== mdbkit ftdc timeline ==", ""]
     if not reader.series:
         parts.append("No metrics decoded.")
         return "\n".join(parts)
-    labels = sorted(reader.series)
+    all_labels = sorted(reader.series)
+    # "_disk.*" and "_repl.*" are helper columns for the summary's disk and
+    # replication-lag tables, not readable on their own.
+    labels = [lb for lb in all_labels if show_internal or not lb.startswith("_")]
+    if not labels:
+        labels = all_labels
     base = reader.series[labels[0]]
     if not base.times:
         parts.append("No samples.")
@@ -376,20 +396,42 @@ def render_ftdc_timeline(reader, step: int = 60) -> str:
         for lb in labels:
             vals = reader.series[lb].values
             if i < len(vals):
-                buckets[key].setdefault(lb, []).append(vals[i])
+                buckets[key].setdefault(lb, []).append((t, vals[i]))
 
     from datetime import datetime, timezone
     rows = []
+    prev_last = {}
     for key in order:
-        row = [datetime.fromtimestamp(key, tz=timezone.utc).strftime("%H:%M")]
+        row = [datetime.fromtimestamp(key, tz=timezone.utc).strftime(
+            "%H:%M" if step % 60 == 0 else "%H:%M:%S")]
         for lb in labels:
-            vals = buckets[key].get(lb) or []
-            row.append(_human(max(vals), lb) if vals else "-")
+            pts = buckets[key].get(lb) or []
+            if not pts:
+                row.append("-")
+                continue
+            if getattr(reader.series[lb], "kind", "gauge") == "counter":
+                t0, v0 = prev_last.get(lb, pts[0])
+                t1, v1 = pts[-1]
+                secs = (t1 - t0).total_seconds()
+                prev_last[lb] = pts[-1]
+                if secs <= 0 or v1 < v0:      # first sample, or a restart
+                    row.append("-")
+                else:
+                    row.append("%s/s" % _rate((v1 - v0) / secs))
+            else:
+                row.append(_human(max(v for _, v in pts), lb))
         rows.append(row)
     parts.append(_table(["time"] + labels, rows))
     parts.append("")
-    parts.append("Each row is the peak within a %ds bucket." % step)
+    parts.append("Gauges show the peak within each %ds bucket; counters "
+                 "(ops.*, sys.cpu.*, ...) show their rate per second." % step)
     return "\n".join(parts)
+
+
+def _rate(v: float) -> str:
+    if v >= 100:
+        return format(int(round(v)), ",")
+    return "%.1f" % v
 
 
 # -------------------------------------------------------------- compare ----
@@ -533,13 +575,26 @@ def render_shape_detail(s, stats) -> str:
         if s.query_shape_hashes:
             h = s.query_shape_hashes.most_common(1)[0][0]
             parts.append("  queryShapeHash     : %s" % h)
-            parts.append("    pin or block this shape without a code change (8.0+):")
-            parts.append("    db.adminCommand({setQuerySettings: \"%s\", settings: {...}})" % h)
+            # Query settings apply to find, distinct and aggregate only.
+            base_op = s.shape.operation.replace("getMore(", "").rstrip(")")
+            if base_op in ("find", "distinct", "aggregate"):
+                parts.append("    pin or block this shape without a code change (8.0+):")
+                parts.append("    db.adminCommand({setQuerySettings: \"%s\", settings: {...}})" % h)
         if s.plan_cache_hashes:
             parts.append("  planCacheShapeHash : %s  (queryHash before 8.0)"
                          % s.plan_cache_hashes.most_common(1)[0][0])
         parts.append("")
-    parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
+    if s.shape.operation == "insert":
+        if s.waiting_pct is not None and s.waiting_pct >= 40:
+            parts.append("next: an index cannot speed up an insert. Most of this "
+                         "time was waiting: look for lock holders, flow control "
+                         "and write-concern waits at those times.")
+        else:
+            parts.append("next: an index cannot speed up an insert. Look at "
+                         "document size, the number of indexes to maintain, and "
+                         "write concern.")
+    else:
+        parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
     return "\n".join(parts)
 
 
@@ -638,7 +693,11 @@ def render_audit(res, stats) -> str:
         parts.append("[%s] %s" % (i.severity, i.title))
         parts.append("        mongod said: %s" % i.message[:200])
         parts.append("        fix: %s" % i.advice)
-        if i.count > 1:
-            parts.append("        seen at %d startups" % i.count)
+        for change in i.changes[:6]:
+            parts.append("          - %s" % change)
+        if i.startups > 1:
+            parts.append("        seen at %d startups" % i.startups)
+        elif i.count > 1:
+            parts.append("        %d related messages at this startup" % i.count)
         parts.append("")
     return "\n".join(parts).rstrip()

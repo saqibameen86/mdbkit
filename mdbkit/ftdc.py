@@ -119,6 +119,15 @@ def parse_document(buf: bytes, pos: int = 0, depth: int = 0) -> Tuple[dict, int]
             raise BsonError("unknown BSON type 0x%02x" % etype)
         if p > end:
             raise BsonError("element overruns its document")
+        if name in out:
+            # BSON allows repeated keys, and real FTDC has them (a filesystem
+            # mounted twice appears twice under systemMetrics.mounts). Every
+            # occurrence is a metric column, so keep each one: collapsing
+            # them shifts every later column onto the wrong metric.
+            n = 2
+            while "%s#%d" % (name, n) in out:
+                n += 1
+            name = "%s#%d" % (name, n)
         out[name] = val
     return out, end
 

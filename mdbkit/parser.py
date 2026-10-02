@@ -67,6 +67,14 @@ def num(value, default=0):
                     "$numberDecimal"):
             if key in value:
                 return num(value[key], default)
+        low, high = value.get("low"), value.get("high")
+        if (isinstance(low, int) and isinstance(high, int)
+                and not isinstance(low, bool) and not isinstance(high, bool)
+                and set(value) <= {"low", "high", "unsigned"}):
+            # A BSON Long passed through plain JSON.stringify in mongosh:
+            # {"low": 40022, "high": 0, "unsigned": false}. mdbkit's own
+            # serverStatus export script produced these before 0.6.1.
+            return (high << 32) | (low & 0xFFFFFFFF)
         return default
     if isinstance(value, str):
         text = value.strip()

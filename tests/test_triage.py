@@ -48,8 +48,10 @@ def test_quiet_log_has_ok_findings():
     assert by["Hot collection"].detail.startswith("shop.events")
     # fixture has one E line -> error finding present
     assert by["Error-severity log lines"].severity == "WARN"
-    # startup marker present -> restart warning
-    assert "Process start(s) in window" in by
+    # the fixture begins with the startup line: nothing before it, so it is
+    # reported as where the log begins, not as a restart
+    assert by["Log begins at a startup"].severity == "INFO"
+    assert "Process start(s) in window" not in by
 
 
 def test_connection_storm(tmp_path):

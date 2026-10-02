@@ -160,6 +160,20 @@ def shell_to_json(src: str) -> str:
         c = src[i]
         if c in "'\"":
             s, i = _read_string(src, i)
+            # mongosh prints long strings as 'part one' +\n 'part two'.
+            while True:
+                k = i
+                while k < n and src[k] in " \t\r\n":
+                    k += 1
+                if k < n and src[k] == "+":
+                    k += 1
+                    while k < n and src[k] in " \t\r\n":
+                        k += 1
+                    if k < n and src[k] in "'\"":
+                        more, i = _read_string(src, k)
+                        s = s[:-1] + more[1:]
+                        continue
+                break
             out.append(s)
             expect_key = False
             continue

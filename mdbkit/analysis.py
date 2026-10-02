@@ -10,7 +10,7 @@ Three analyses, mirroring the most-used mtools workflows:
 from __future__ import annotations
 
 import math
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -148,7 +148,12 @@ def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
         operation = "distinct"
         filter_doc = command.get("query") or {}
     elif "getMore" in command:
-        origin = command.get("originatingCommand")
+        # Real logs carry the query that opened the cursor next to the
+        # command (attr.originatingCommand), not inside it; older captures
+        # and some tools nest it. Without it every getMore is shape "{}".
+        origin = attr.get("originatingCommand")
+        if not isinstance(origin, dict):
+            origin = command.get("originatingCommand")
         if isinstance(origin, dict):
             fake = LogEntry(
                 ts=entry.ts, severity=entry.severity, component=entry.component,
@@ -366,6 +371,52 @@ class ShapeStats:
         }
 
 
+class BatchDedup:
+    """Recognise the second log line of one slow write.
+
+    MongoDB logs a slow update or delete twice: a WRITE entry for the
+    statement (with docsExamined and the plan) and then a COMMAND entry for
+    the whole batch (ns "<db>.$cmd", command {update: <coll>, updates: [...]})
+    on the same connection. Counting both doubles every write's count and
+    time. The WRITE line is kept; the batch line that follows it is the
+    duplicate.
+
+    Lines are paired by connection and collection, not opid: 9.0 logs an
+    opid on both lines, 8.0 and earlier on neither. A connection runs its
+    operations one at a time, so the batch line always follows its WRITE
+    lines.
+    """
+
+    BATCH_COMMANDS = ("update", "delete")
+
+    def __init__(self, remember: int = 20000):
+        self.remember = remember
+        self._pending: "OrderedDict[str, str]" = OrderedDict()   # ctx -> ns
+
+    def is_duplicate(self, entry: LogEntry) -> bool:
+        ctx = entry.ctx or ""
+        if entry.component == "WRITE":
+            ns = text(entry.attr.get("ns"))
+            if ctx and ns:
+                self._pending[ctx] = ns
+                self._pending.move_to_end(ctx)
+                if len(self._pending) > self.remember:
+                    self._pending.popitem(last=False)
+            return False
+        pending = self._pending.pop(ctx, None)
+        if pending is None or entry.component != "COMMAND":
+            return False
+        cmd = entry.attr.get("command")
+        if not isinstance(cmd, dict):
+            return False
+        for name in self.BATCH_COMMANDS:
+            coll = cmd.get(name)
+            if isinstance(coll, str) and name + "s" in cmd:
+                db = text(cmd.get("$db")) or text(entry.attr.get("ns")).split(".", 1)[0]
+                return pending == "%s.%s" % (db, coll)
+        return False
+
+
 class QueryAggregator:
     NOISE_OPS = frozenset({
         "hello", "isMaster", "ismaster", "ping", "endSessions", "saslStart",
@@ -390,6 +441,7 @@ class QueryAggregator:
         self.include_system = include_system
         self.shapes: Dict[QueryShape, ShapeStats] = {}
         self.skipped_system = 0
+        self.dedup = BatchDedup()
 
     @classmethod
     def is_system_ns(cls, ns: str) -> bool:
@@ -401,10 +453,19 @@ class QueryAggregator:
     def consume(self, entry: LogEntry):
         if not entry.is_slow_query:
             return
+        if self.dedup.is_duplicate(entry):
+            return
         if num(entry.attr.get("durationMillis")) < self.min_ms:
             return
         shape = extract_shape(entry)
-        if shape is None or shape.operation == "insert":
+        if shape is None:
+            return
+        # Slow inserts stay in: no index can fix them, but a 3 s insert is
+        # still a latency problem (lock waits, write concern, disk), and on
+        # 8.0+ the executing/waiting split says which.
+        if not shape.ns:
+            # Commands not run against any collection (e.g. a driver
+            # handshake probing for an unknown command). Not a query shape.
             return
         if shape.operation in self.NOISE_OPS and not shape.filter_fields:
             return
@@ -614,7 +675,8 @@ class LogSummary:
     severity_counts: Counter = field(default_factory=Counter)
     component_counts: Counter = field(default_factory=Counter)
     slow_queries: int = 0
-    slowest_ms: int = 0
+    user_slow_queries: int = 0
+    slowest_ms: int = 0          # on user namespaces only
     slow_in_progress: int = 0
     connections_accepted: int = 0
     warnings: int = 0
@@ -626,6 +688,7 @@ class LogSummary:
             "versions": self.versions,
             "hosts": self.host_info,
             "slowQueries": self.slow_queries,
+            "userSlowQueries": self.user_slow_queries,
             "slowInProgress": self.slow_in_progress,
             "slowestMs": self.slowest_ms,
             "connectionsAccepted": self.connections_accepted,
@@ -663,6 +726,13 @@ class SummaryAggregator:
             s.connections_accepted += 1
         if entry.is_slow_query:
             s.slow_queries += 1
-            s.slowest_ms = max(s.slowest_ms, int(num(entry.attr.get("durationMillis"))))
+            ns = text(entry.attr.get("ns"))
+            # Internal operations (replication getMores on the oplog,
+            # awaitable hello) wait by design; counting them as "slowest"
+            # reports a 10 s long-poll as the worst query.
+            if ns and not QueryAggregator.is_system_ns(ns):
+                s.user_slow_queries += 1
+                s.slowest_ms = max(s.slowest_ms,
+                                   int(num(entry.attr.get("durationMillis"))))
         elif entry.msg_id == ID_SLOW_IN_PROGRESS:
             s.slow_in_progress += 1

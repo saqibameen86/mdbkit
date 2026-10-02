@@ -1,0 +1,18 @@
+{
+  totalLinesWritten: 4,
+  log: [
+    '{"t":{"$date":"2026-10-02T22:57:00.063+05:30"},"s":"I",  "c":"STORAGE",  "id":22297,   "ctx":"initandlisten","msg":"Using the XFS filesystem is strongly recommended with the WiredTiger storage engine. See http://dochub.mongodb.org/core/prodnotes-filesystem","tags":["startupWarnings"]}\n',
+    '{"t":{"$date":"2026-10-02T22:57:00.821+05:30"},"s":"W",  "c":"CONTROL",  "id":22120,   "ctx":"initandlisten","msg":"Access control is not enabled for the database. Read and write access to data and configuration is unrestricted","tags":["startupWarnings"]}\n',
+    '{"t":{"$date":"2026-10-02T22:57:00.821+05:30"},"s":"W",  "c":"CONTROL",  "id":22138,   "ctx":"initandlisten","msg":"You are running this process as the root user, which is not recommended","tags":["startupWarnings"]}\n',
+    '{"t":{"$date":"2026-10-02T22:57:00.822+05:30"},"s":"W",  "c":"CONTROL",  "id":22184,   "ctx":"initandlisten","msg":"Soft rlimits for open file descriptors too low","attr":{"currentValue":20000,"recommendedMinimum":64000},"tags":["startupWarnings"]}\n'
+  ],
+  ok: 1,
+  '$clusterTime': {
+    clusterTime: Timestamp({ t: 1790962051, i: 21 }),
+    signature: {
+      hash: Binary.createFromBase64('AAAAAAAAAAAAAAAAAAAAAAAAAAA=', 0),
+      keyId: Long('0')
+    }
+  },
+  operationTime: Timestamp({ t: 1790962051, i: 21 })
+}

@@ -12,7 +12,8 @@ last restart has already rotated away — and explains each one.
 
 The message ids below are taken from the MongoDB server source
 (startup_warnings_mongod.cpp / startup_warnings_common.cpp) for 6.0, 7.0 and
-8.x. Unknown startup warnings are still reported, with MongoDB's own text.
+8.x, and checked against what real 7.0.43, 8.0.32, 8.3.11 and 9.0.2 servers
+log. Unknown startup warnings are still reported, with MongoDB's own text.
 
 Offline and read-only like every other analysis command.
 """
@@ -96,6 +97,9 @@ KNOWN: Dict[int, tuple] = {
               "Set vm.swappiness to 0 or 1; swapping the WiredTiger cache "
               "is far slower than evicting from it."),
     22161: ("openvz", "INFO", "Running under OpenVZ", "Known issues on old RHEL kernels."),
+    22297: ("xfs", "WARN", "WiredTiger is not on XFS",
+            "MongoDB strongly recommends XFS for WiredTiger; ext4 is known to "
+            "stall under heavy checkpointing."),
     # build / mode
     22123: ("32-bit", "WARN", "32-bit binary", "Unsupported for production."),
     22135: ("32-bit", "WARN", "32-bit binary on a 64-bit OS", "Unsupported for production."),
@@ -130,13 +134,17 @@ class AuditItem:
     advice: str
     message: str
     ids: List[int] = field(default_factory=list)
-    count: int = 0
+    count: int = 0               # messages
+    startups: int = 0            # distinct startups that reported it
     last_seen: Optional[datetime] = None
+    changes: List[str] = field(default_factory=list)   # "file: now -> want"
+    _seen_in: set = field(default_factory=set, repr=False)
 
     def to_dict(self) -> dict:
         return {"key": self.key, "severity": self.severity, "title": self.title,
                 "advice": self.advice, "message": self.message,
                 "ids": self.ids, "count": self.count,
+                "startups": self.startups, "changes": self.changes,
                 "lastSeen": self.last_seen.isoformat() if self.last_seen else None}
 
 
@@ -165,6 +173,23 @@ def _full_text(entry: LogEntry) -> str:
     details = ["%s=%s" % (k, v) for k, v in entry.attr.items()
                if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
     return entry.msg + (" [%s]" % ", ".join(details) if details else "")
+
+
+def _change_of(entry: LogEntry) -> str:
+    """The concrete fix a kernel-setting warning asks for, e.g.
+    "/sys/kernel/mm/transparent_hugepage/enabled: never -> always"."""
+    a = entry.attr
+    target = text(a.get("sysfsFile") or a.get("file"))
+    if not target:
+        return ""
+    now = a.get("currentValue")
+    want = a.get("desiredValue")
+    if want is None and "max_ptes_none" in target:
+        want = 0      # 8640302 says "should be 0" in its message text
+    out = "%s: %s" % (target, now if now is not None else "?")
+    if want is not None:
+        out += " -> %s" % want
+    return out
 
 
 def audit_entries(entries: Iterable[LogEntry], source: str = "") -> AuditResult:
@@ -202,6 +227,12 @@ def audit_entries(entries: Iterable[LogEntry], source: str = "") -> AuditResult:
             item = found[key] = AuditItem(key, sev, title, advice,
                                           msg_text[:300])
         item.count += 1
+        change = _change_of(entry)
+        if change and change not in item.changes:
+            item.changes.append(change)
+        if startups not in item._seen_in:
+            item._seen_in.add(startups)
+            item.startups += 1
         if entry.msg_id and entry.msg_id not in item.ids:
             item.ids.append(entry.msg_id)
         if entry.ts is not None:
