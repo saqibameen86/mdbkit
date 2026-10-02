@@ -117,14 +117,14 @@ def _relax_shell_json(text: str) -> str:
 
 
 def load_explain(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
+    from .shelljson import loads_lenient, read_text_file
+    text = read_text_file(path)
     try:
-        doc = json.loads(text)
-    except json.JSONDecodeError:
+        doc = loads_lenient(text)
+    except ValueError:
         try:
             doc = json.loads(_relax_shell_json(text))
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
             raise ValueError(
                 "Could not parse this file as JSON, even after relaxing "
                 "mongo-shell constructors. Re-export with mongosh:\n"

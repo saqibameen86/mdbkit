@@ -91,7 +91,8 @@ def test_summary_counts_are_sane(tmp_path):
     for e in iter_entries(path, stats):
         agg.consume(e)
     assert stats.unparsed == 0
-    assert agg.summary.versions == ["7.0.14"]
+    from mdbkit.demo import DEMO_VERSION
+    assert agg.summary.versions == [DEMO_VERSION]
     assert agg.summary.startups == 1
     assert agg.summary.slow_queries > 50
     assert agg.summary.connections_accepted > 10

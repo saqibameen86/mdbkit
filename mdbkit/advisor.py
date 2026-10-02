@@ -74,8 +74,8 @@ def load_indexes(path: str) -> Dict[str, List[dict]]:
     or a raw getIndexes() array (then the caller must map it to a namespace).
     Returns {namespace: [ {name, key(ordered pairs)} ]}.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
+    from .shelljson import loads_lenient, read_text_file
+    data = loads_lenient(read_text_file(path))
     result: Dict[str, List[dict]] = {}
     if isinstance(data, dict) and "collections" in data:
         db = data.get("db", "")
@@ -116,8 +116,8 @@ def load_schema(path: str) -> Dict[str, dict]:
 
     Returns {namespace: {fieldPath: {"types": [...], "presence": float}}}.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
+    from .shelljson import loads_lenient, read_text_file
+    data = loads_lenient(read_text_file(path))
     result: Dict[str, dict] = {}
     db = data.get("db", "")
     for coll, info in (data.get("collections") or {}).items():

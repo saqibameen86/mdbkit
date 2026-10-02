@@ -36,6 +36,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 MASK64 = (1 << 64) - 1
 MAX_CHUNK_BYTES = 256 * 1024 * 1024  # refuse absurd/corrupt sizes
+MAX_SAMPLES = 100_000  # mongod writes ~300 per chunk
 
 
 # --------------------------------------------------------------- BSON ------
@@ -116,6 +117,8 @@ def parse_document(buf: bytes, pos: int = 0, depth: int = 0) -> Tuple[dict, int]
             val = None
         else:
             raise BsonError("unknown BSON type 0x%02x" % etype)
+        if p > end:
+            raise BsonError("element overruns its document")
         out[name] = val
     return out, end
 
@@ -308,7 +311,7 @@ def iter_documents(path: str) -> Iterator[dict]:
     while pos < len(data) - 4:
         try:
             doc, pos = parse_document(data, pos)
-        except (BsonError, struct.error, ValueError):
+        except (BsonError, struct.error, ValueError, IndexError, RecursionError):
             break  # truncated tail (common on the live/interim file)
         yield doc
 
@@ -337,20 +340,23 @@ def decode_chunk(doc: dict, wanted_paths: Optional[set] = None
     uncompressed_size = struct.unpack_from("<I", blob, 0)[0]
     if uncompressed_size > MAX_CHUNK_BYTES:
         raise BsonError("implausible chunk size %d" % uncompressed_size)
-    raw = zlib.decompress(bytes(blob[4:]))
+    inflater = zlib.decompressobj()
+    raw = inflater.decompress(bytes(blob[4:]), MAX_CHUNK_BYTES)
+    if inflater.unconsumed_tail:
+        raise BsonError("chunk inflates past %d bytes" % MAX_CHUNK_BYTES)
     ref, pos = parse_document(raw, 0)
     metric_count, sample_count = struct.unpack_from("<II", raw, pos)
     pos += 8
     leaves = numeric_metrics(ref)
     paths = [p for p, _ in leaves]
     base = [v for _, v in leaves]
-    if metric_count != len(paths):
-        if metric_count < len(paths):
-            paths, base = paths[:metric_count], base[:metric_count]
-        else:
-            extra = metric_count - len(paths)
-            paths += ["_unknown.%d" % i for i in range(extra)]
-            base += [0] * extra
+    if metric_count > len(paths) or sample_count > MAX_SAMPLES:
+        # mongod's own decompressor rejects a count that disagrees with the
+        # reference document; padding millions of phantom columns would
+        # only burn CPU on a corrupt chunk.
+        raise BsonError("chunk header does not match its reference document")
+    if metric_count < len(paths):
+        paths, base = paths[:metric_count], base[:metric_count]
 
     if wanted_paths is None:
         wanted_idx = None
@@ -384,7 +390,7 @@ def iter_chunks(path: str) -> Iterator[Chunk]:
             continue
         try:
             chunk = decode_chunk(doc)
-        except (BsonError, zlib.error, struct.error, ValueError):
+        except (BsonError, zlib.error, struct.error, ValueError, IndexError):
             continue  # skip corrupt chunk, keep going
         if chunk is not None:
             yield chunk
@@ -425,10 +431,25 @@ CURATED: List[Tuple[str, str, str]] = [
      "serverStatus.wiredTiger.cache.maximum bytes configured", "gauge"),
     ("cache.dirtyBytes",
      "serverStatus.wiredTiger.cache.tracked dirty bytes in the cache", "gauge"),
+    # Execution tickets. MongoDB 8.0 moved these from
+    # wiredTiger.concurrentTransactions to queues.execution; both are listed
+    # under the same label and whichever the server recorded is used.
     ("tickets.readAvail",
      "serverStatus.wiredTiger.concurrentTransactions.read.available", "gauge"),
+    ("tickets.readAvail",
+     "serverStatus.queues.execution.read.available", "gauge"),
     ("tickets.writeAvail",
      "serverStatus.wiredTiger.concurrentTransactions.write.available", "gauge"),
+    ("tickets.writeAvail",
+     "serverStatus.queues.execution.write.available", "gauge"),
+    ("tickets.readTotal",
+     "serverStatus.wiredTiger.concurrentTransactions.read.totalTickets", "gauge"),
+    ("tickets.readTotal",
+     "serverStatus.queues.execution.read.totalTickets", "gauge"),
+    ("tickets.writeTotal",
+     "serverStatus.wiredTiger.concurrentTransactions.write.totalTickets", "gauge"),
+    ("tickets.writeTotal",
+     "serverStatus.queues.execution.write.totalTickets", "gauge"),
     ("mem.residentMB", "serverStatus.mem.resident", "gauge"),
     # Checkpoint pressure. mongod does not log checkpoint duration at default
     # verbosity on modern versions (those calls are LOGV2_DEBUG level 4), so
@@ -578,6 +599,7 @@ class FtdcReader:
         """
         index = {p: i for i, p in enumerate(paths)}
         chosen = []
+        taken = set()
         for label, path, kind in CURATED:
             if self.wanted and label not in self.wanted:
                 continue
@@ -588,7 +610,8 @@ class FtdcReader:
                         mid = p[len(pre):len(p) - len(suf)] if suf else p[len(pre):]
                         chosen.append(("%s[%s]" % (label, mid), kind, i))
                 continue
-            if path in index:
+            if path in index and label not in taken:
+                taken.add(label)
                 chosen.append((label, kind, index[path]))
         if self.wanted:
             known = {lb for lb, _p, _k in CURATED}
@@ -623,7 +646,7 @@ class FtdcReader:
                         continue
                 try:
                     chunk = decode_chunk(doc, wanted_paths)
-                except (BsonError, zlib.error, struct.error, ValueError):
+                except (BsonError, zlib.error, struct.error, ValueError, IndexError):
                     self.errors += 1
                     continue
                 if chunk is None or not chunk.rows:

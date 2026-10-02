@@ -22,9 +22,17 @@ from .parser import (
     ID_CLIENT_METADATA,
     ID_CONN_ACCEPTED,
     ID_CONN_ENDED,
+    ID_SLOW_IN_PROGRESS,
     ID_STARTUP,
     LogEntry,
+    num,
+    text,
 )
+
+
+def _d(value) -> dict:
+    """A sub-document that might not be a document."""
+    return value if isinstance(value, dict) else {}
 
 # ---------------------------------------------------------------------------
 # Query shape extraction
@@ -102,13 +110,14 @@ def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
     command = attr.get("command") if isinstance(attr.get("command"), dict) else {}
     op_type = attr.get("type", "")
 
-    ns = attr.get("ns", "")
+    ns = text(attr.get("ns"))
     if (not ns or ns.endswith(".$cmd") or ns.endswith(".")) and command:
         coll = (command.get("find") or command.get("aggregate")
                 or command.get("update") or command.get("delete")
                 or command.get("insert") or command.get("findAndModify")
                 or command.get("count") or command.get("distinct") or "")
-        db = command.get("$db", "")
+        db = text(command.get("$db"))
+        coll = text(coll)
         if db and coll:
             ns = f"{db}.{coll}"
 
@@ -205,35 +214,94 @@ class ShapeStats:
     first_ts: object = None
     last_ts: object = None
     example: str = ""
+    # MongoDB 8.0+: workingMillis excludes time spent waiting for execution
+    # tickets, locks and flow control, so durationMillis - workingMillis is
+    # the time an operation spent waiting rather than working.
+    timed_count: int = 0          # occurrences that carried workingMillis
+    timed_total_ms: int = 0       # their durationMillis
+    working_ms: int = 0           # their workingMillis
+    queued_us: int = 0            # queues.*.totalTimeQueuedMicros
+    # MongoDB 8.0+ server-computed identifiers for this shape.
+    query_shape_hashes: Counter = field(default_factory=Counter)
+    plan_cache_hashes: Counter = field(default_factory=Counter)
+    query_frameworks: Counter = field(default_factory=Counter)
+    # Disk spilling: hasSortStage+usedDisk on older versions, <stage>Spills
+    # counters from 8.1.
+    spills: int = 0
+    spilled_bytes: int = 0
+    # MongoDB 8.3+: tracked memory per operation.
+    peak_mem_bytes: int = 0
+    cpu_nanos: int = 0
 
     def add(self, entry: LogEntry):
         attr = entry.attr
         self.count += 1
         app = attr.get("appName")
         if app:
-            self.app_names[str(app)] += 1
+            self.app_names[text(app)] += 1
         if entry.ts is not None:
             if self.first_ts is None:
                 self.first_ts = entry.ts
             self.last_ts = entry.ts
-        self.durations.append(int(attr.get("durationMillis", 0) or 0))
-        self.docs_examined += int(attr.get("docsExamined", 0) or 0)
-        self.keys_examined += int(attr.get("keysExamined", 0) or 0)
+        duration = int(max(0, num(attr.get("durationMillis"))))
+        self.durations.append(duration)
+        self.docs_examined += int(max(0, num(attr.get("docsExamined"))))
+        self.keys_examined += int(max(0, num(attr.get("keysExamined"))))
         n = attr.get("nreturned")
         if n is None:
             n = attr.get("nMatched")
         if n is None:
             n = attr.get("ndeleted", attr.get("nDeleted"))
-        self.n_returned += int(n or 0)
-        plan = attr.get("planSummary", "")
+        self.n_returned += int(max(0, num(n)))
+        plan = text(attr.get("planSummary"))
         if plan:
             self.plan_summaries[plan] += 1
             if "COLLSCAN" in plan:
                 self.collscan = True
-        if attr.get("hasSortStage"):
+        if attr.get("hasSortStage") is True:
             self.in_memory_sort = True
+
+        if "workingMillis" in attr:
+            working = int(max(0, num(attr.get("workingMillis"))))
+            self.timed_count += 1
+            self.timed_total_ms += duration
+            self.working_ms += min(working, duration) if duration else working
+        for queue in _d(attr.get("queues")).values():
+            self.queued_us += int(max(0, num(_d(queue).get(
+                "totalTimeQueuedMicros"))))
+
+        for key, bucket in (("queryShapeHash", self.query_shape_hashes),
+                            ("planCacheShapeHash", self.plan_cache_hashes),
+                            ("queryFramework", self.query_frameworks)):
+            value = attr.get(key)
+            if key == "planCacheShapeHash" and value is None:
+                value = attr.get("queryHash")       # pre-8.0 name
+            if value:
+                bucket[text(value)] += 1
+
+        if attr.get("usedDisk") is True:
+            self.spills += 1
+        for key, value in attr.items():
+            if key.endswith("Spills"):
+                self.spills += int(max(0, num(value)))
+            elif key.endswith("SpilledBytes"):
+                self.spilled_bytes += int(max(0, num(value)))
+        self.peak_mem_bytes = max(self.peak_mem_bytes,
+                                  int(max(0, num(attr.get("peakTrackedMemBytes")))))
+        self.cpu_nanos += int(max(0, num(attr.get("cpuNanos"))))
         if not self.example:
             self.example = entry.raw[:2000]
+
+    @property
+    def waiting_ms(self) -> int:
+        """Time spent waiting (tickets, locks, flow control), 8.0+ only."""
+        return max(0, self.timed_total_ms - self.working_ms)
+
+    @property
+    def waiting_pct(self) -> Optional[float]:
+        if not self.timed_total_ms:
+            return None
+        return 100.0 * self.waiting_ms / self.timed_total_ms
 
     # -- derived metrics ---------------------------------------------------
     @property
@@ -283,6 +351,18 @@ class ShapeStats:
             "appNames": dict(self.app_names.most_common()),
             "firstSeen": self.first_ts.isoformat() if self.first_ts else None,
             "lastSeen": self.last_ts.isoformat() if self.last_ts else None,
+            "workingMs": self.working_ms if self.timed_count else None,
+            "waitingMs": self.waiting_ms if self.timed_count else None,
+            "waitingPct": (round(self.waiting_pct, 1)
+                           if self.waiting_pct is not None else None),
+            "queuedMicros": self.queued_us or None,
+            "queryShapeHashes": dict(self.query_shape_hashes.most_common()),
+            "planCacheShapeHashes": dict(self.plan_cache_hashes.most_common()),
+            "queryFrameworks": dict(self.query_frameworks),
+            "spills": self.spills,
+            "spilledBytes": self.spilled_bytes,
+            "peakTrackedMemBytes": self.peak_mem_bytes or None,
+            "cpuNanos": self.cpu_nanos or None,
         }
 
 
@@ -321,7 +401,7 @@ class QueryAggregator:
     def consume(self, entry: LogEntry):
         if not entry.is_slow_query:
             return
-        if int(entry.attr.get("durationMillis", 0) or 0) < self.min_ms:
+        if num(entry.attr.get("durationMillis")) < self.min_ms:
             return
         shape = extract_shape(entry)
         if shape is None or shape.operation == "insert":
@@ -360,7 +440,8 @@ class QueryAggregator:
 # Connections
 # ---------------------------------------------------------------------------
 
-def _ip_of(remote: str) -> str:
+def _ip_of(remote) -> str:
+    remote = text(remote)
     return remote.rsplit(":", 1)[0] if remote else "unknown"
 
 
@@ -462,22 +543,24 @@ class ConnectionAggregator:
             if entry.attr.get("connectionId") is not None:
                 self._conn_ip["conn%s" % attr.get("connectionId")] = ip
             self.report.peak_count = max(
-                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
+                self.report.peak_count, int(num(attr.get("connectionCount"))))
         elif entry.msg_id == ID_CONN_ENDED:
             ip = _ip_of(attr.get("remote", ""))
             self.report.ended[ip] += 1
             self._touch_ip(ip, entry.ts)
             self.report.peak_count = max(
-                self.report.peak_count, int(attr.get("connectionCount", 0) or 0))
+                self.report.peak_count, int(num(attr.get("connectionCount"))))
         elif entry.msg_id == ID_CLIENT_METADATA:
-            doc = attr.get("doc", {}) or {}
-            app = (doc.get("application") or {}).get("name")
+            doc = _d(attr.get("doc"))
+            app = _d(doc.get("application")).get("name")
+            app = text(app) if app else app
             ip = _ip_of(attr.get("remote", "")) or self._conn_ip.get(entry.ctx, "")
             if app:
                 self.report.app_names[app] += 1
                 if ip:
                     self.report.ip_apps[ip][app] += 1
-            driver = (doc.get("driver") or {}).get("name")
+            driver = _d(doc.get("driver")).get("name")
+            driver = text(driver) if driver else driver
             if driver:
                 self.report.drivers[driver] += 1
             self._touch_ip(ip, entry.ts)
@@ -532,6 +615,7 @@ class LogSummary:
     component_counts: Counter = field(default_factory=Counter)
     slow_queries: int = 0
     slowest_ms: int = 0
+    slow_in_progress: int = 0
     connections_accepted: int = 0
     warnings: int = 0
     errors: int = 0
@@ -542,6 +626,7 @@ class LogSummary:
             "versions": self.versions,
             "hosts": self.host_info,
             "slowQueries": self.slow_queries,
+            "slowInProgress": self.slow_in_progress,
             "slowestMs": self.slowest_ms,
             "connectionsAccepted": self.connections_accepted,
             "warnings": self.warnings,
@@ -570,11 +655,14 @@ class SummaryAggregator:
             if host:
                 s.host_info.append(f"{host}:{port}" if port else str(host))
         elif entry.msg_id == ID_BUILD_INFO:
-            version = (entry.attr.get("buildInfo") or {}).get("version")
+            version = _d(entry.attr.get("buildInfo")).get("version")
+            version = text(version) if version else version
             if version and version not in s.versions:
                 s.versions.append(version)
         elif entry.msg_id == ID_CONN_ACCEPTED:
             s.connections_accepted += 1
         if entry.is_slow_query:
             s.slow_queries += 1
-            s.slowest_ms = max(s.slowest_ms, int(entry.attr.get("durationMillis", 0) or 0))
+            s.slowest_ms = max(s.slowest_ms, int(num(entry.attr.get("durationMillis"))))
+        elif entry.msg_id == ID_SLOW_IN_PROGRESS:
+            s.slow_in_progress += 1

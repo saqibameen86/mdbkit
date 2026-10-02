@@ -54,6 +54,9 @@ def render_summary(summary: LogSummary, stats: ParseStats) -> str:
         f"slow queries logged: {summary.slow_queries:,}"
         + (f" (slowest {_ms(summary.slowest_ms)})" if summary.slow_queries else "")
     )
+    if getattr(summary, "slow_in_progress", 0):
+        parts.append(f"still-running operations logged (8.3+): "
+                     f"{summary.slow_in_progress:,}")
     parts.append(f"warnings: {summary.warnings:,}   errors: {summary.errors:,}")
     if summary.warnings:
         parts.append(f"  next: mdbkit filter <log> --severity W")
@@ -67,7 +70,12 @@ def render_summary(summary: LogSummary, stats: ParseStats) -> str:
 
 
 def _plan_label(s) -> str:
-    """Shortest useful plan label from planSummaries counter."""
+    """Shortest useful plan label, plus +SPILL if the shape wrote to disk."""
+    label = _plan_core(s)
+    return label + "+SPILL" if getattr(s, "spills", 0) else label
+
+
+def _plan_core(s) -> str:
     if not s.plan_summaries:
         return "?"
     top = s.plan_summaries.most_common(1)[0][0]
@@ -119,10 +127,20 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
         "cumMs  = total wall time accumulated across ALL occurrences (not one query)\n"
         "docsEx = total documents examined across all occurrences\n"
         "scan   = docsExamined per returned doc (high = index missing or weak)\n"
-        "plan   = most common query plan; COLLSCAN/+SORT = index needed\n"
+        "plan   = most common query plan; COLLSCAN/+SORT = index needed;\n"
+        "         +SPILL = wrote temporary files to disk (sort/group too big for memory)\n"
         "         empty plan (?) = plan not present in log (below slowms threshold)\n"
         "next   : mdbkit advise <log> [--ns <namespace>] for index candidates"
     )
+    timed = [r for r in results if r.timed_count]
+    total = sum(r.timed_total_ms for r in timed)
+    if total:
+        waiting = sum(r.waiting_ms for r in timed)
+        parts.append("")
+        parts.append(
+            "MongoDB 8.0+ timing: %.0f%% of this time was spent waiting "
+            "(tickets, locks, flow control) rather than executing — "
+            "--shape N shows the split per shape." % (100.0 * waiting / total))
     return "\n".join(parts)
 
 
@@ -484,8 +502,54 @@ def render_shape_detail(s, stats) -> str:
         for app, n in s.app_names.most_common(5):
             parts.append("  %-30s %dx" % (app, n))
         parts.append("")
+
+    if s.timed_count:
+        parts.append("where the time went (MongoDB 8.0+)")
+        parts.append("  executing     : %s" % _ms(s.working_ms))
+        parts.append("  waiting       : %s (%.0f%%) — tickets, locks, flow control"
+                     % (_ms(s.waiting_ms), s.waiting_pct or 0))
+        if s.queued_us:
+            parts.append("  ticket queue  : %s of the wait" % _ms(s.queued_us / 1000.0))
+        parts.append("")
+    extra = []
+    if s.spills:
+        extra.append("disk spills   : %d%s" % (
+            s.spills, " (%s written)" % _human_bytes(s.spilled_bytes)
+            if s.spilled_bytes else ""))
+    if s.peak_mem_bytes:
+        extra.append("peak memory   : %s per operation (8.3+ tracked memory)"
+                     % _human_bytes(s.peak_mem_bytes))
+    if s.cpu_nanos:
+        extra.append("CPU time      : %s total" % _ms(s.cpu_nanos / 1e6))
+    if s.query_frameworks:
+        extra.append("engine        : %s" % ", ".join(
+            "%s %dx" % kv for kv in s.query_frameworks.most_common()))
+    if extra:
+        parts.append("resources")
+        parts.extend("  " + e for e in extra)
+        parts.append("")
+    if s.query_shape_hashes or s.plan_cache_hashes:
+        parts.append("server identifiers")
+        if s.query_shape_hashes:
+            h = s.query_shape_hashes.most_common(1)[0][0]
+            parts.append("  queryShapeHash     : %s" % h)
+            parts.append("    pin or block this shape without a code change (8.0+):")
+            parts.append("    db.adminCommand({setQuerySettings: \"%s\", settings: {...}})" % h)
+        if s.plan_cache_hashes:
+            parts.append("  planCacheShapeHash : %s  (queryHash before 8.0)"
+                         % s.plan_cache_hashes.most_common(1)[0][0])
+        parts.append("")
     parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
     return "\n".join(parts)
+
+
+def _human_bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "%.1f TiB" % n
 
 
 # ---------------------------------------------------------------- oslog ----
@@ -542,5 +606,39 @@ def render_serverstatus(checks) -> str:
             parts.append("        - %s" % e)
         if c.next_step:
             parts.append("        next: %s" % c.next_step)
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+# ---------------------------------------------------------------- audit ----
+
+def render_audit(res, stats) -> str:
+    parts = ["== mdbkit audit: startup configuration ==", render_parse_stats(stats)]
+    src = " from %s" % res.source if res.source and res.source != "log" else ""
+    parts.append("startups seen: %d%s%s" % (
+        res.startups, src,
+        ("   version(s): %s" % ", ".join(res.versions)) if res.versions else ""))
+    parts.append("")
+    if not res.items:
+        if res.startups:
+            parts.append("mongod reported no configuration warnings at startup.")
+        else:
+            from .audit import GETLOG_HINT
+            parts.append("No startup in this log, so there is nothing to audit.")
+            parts.append(GETLOG_HINT)
+        return "\n".join(parts)
+    counts = {}
+    for i in res.items:
+        counts[i.severity] = counts.get(i.severity, 0) + 1
+    parts.append("findings: %s" % ", ".join(
+        "%d %s" % (counts[k], k.lower()) for k in ("CRIT", "WARN", "INFO")
+        if k in counts))
+    parts.append("")
+    for i in res.items:
+        parts.append("[%s] %s" % (i.severity, i.title))
+        parts.append("        mongod said: %s" % i.message[:200])
+        parts.append("        fix: %s" % i.advice)
+        if i.count > 1:
+            parts.append("        seen at %d startups" % i.count)
         parts.append("")
     return "\n".join(parts).rstrip()

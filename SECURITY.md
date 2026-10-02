@@ -3,17 +3,31 @@
 ## Design posture
 
 Every **analysis** command — `loginfo`, `queries`, `connections`, `filter`,
-`advise`, `explain`, `triage`, `ftdc`, `demo`, `export-script` — is safe to
-run on a production database host:
+`advise`, `explain`, `triage`, `audit`, `ftdc`, `oslog`, `serverstatus`,
+`compare`, `demo`, `export-script` — is safe to run on a production database
+host:
 
 * **No network code.** The tool never opens a socket, phones home, checks for
   updates, or sends telemetry. Verify it yourself:
-  `grep -rn "socket\|urllib\|http" mdbkit/` finds nothing.
+  `grep -rn --include='*.py' "socket\|urllib\|http" mdbkit/` matches only
+  `lab.py`, which checks that a local port is free before starting a test
+  cluster (see below).
 * **No database connection.** Analysis commands read files and write to your
   terminal. They never connect to MongoDB.
 * **No code execution.** Log lines, explain files, and schema/index exports
-  are parsed with strict `json.loads` only. MongoDB shell constructors
-  (`ObjectId(...)`, `ISODate(...)`) are unwrapped textually, never evaluated.
+  are parsed with `json.loads`. Where a file is mongosh's printed output
+  rather than JSON (`Long('42')`, `ISODate(...)`, unquoted keys), a small
+  tokenizer in `shelljson.py` converts it to JSON text first. Constructors
+  are unwrapped textually, never evaluated.
+* **Terminal-safe output.** Log content is attacker-influenced: a client can
+  put almost anything in its appName or a query. Before anything reaches
+  your terminal, control characters (ANSI escape sequences, OSC, C1 codes,
+  carriage returns) are rewritten as visible `\uXXXX` text, so a crafted log
+  line cannot rewrite your screen, retitle the window or hide other output.
+* **Bounded on hostile input.** Compressed FTDC chunks are decompressed with a
+  hard size cap, malformed chunk headers are rejected, and very long syslog
+  lines are matched only on their first 4 KB, so a crafted file costs
+  seconds at most, not minutes or gigabytes.
 * **Untrusted input by default.** Malformed, truncated, adversarial, or
   binary input is counted and skipped, never echoed into exceptions.
 * **Read-only.** Analysis commands never mutate a deployment. Where an action
@@ -34,6 +48,14 @@ does, and it is bounded:
   directory carries a `.mdbkit-lab.json` marker, and `lab destroy` aborts
   without one.
 * It never connects to, reads, or modifies any MongoDB it did not start.
+* Before signalling a pid it confirms the process is still one of its own
+  `mongod`s (its command line names the lab's data directory, read from
+  `/proc` or `ps`). A stale pid that now belongs to something else is never
+  signalled.
+* `lab destroy` refuses to delete a directory while any lab node in it is
+  still running.
+* Its only network-stack use is a bind attempt on `127.0.0.1:<port>`, to
+  report a busy port clearly before anything starts.
 * `lab seed` writes sample data only into the lab it created.
 
 If you want the guarantee that mdbkit never starts a process on a given

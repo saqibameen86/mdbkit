@@ -273,6 +273,55 @@ def cmd_triage(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------ arguments ---
+
+def _int_range(lo, hi=None, what="value"):
+    """argparse type: an integer within [lo, hi], with a readable error."""
+    def parse(value):
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("%r is not a whole number" % value)
+        if n < lo or (hi is not None and n > hi):
+            if hi is None:
+                raise argparse.ArgumentTypeError(
+                    "%s must be %d or more (got %d)" % (what, lo, n))
+            raise argparse.ArgumentTypeError(
+                "%s must be between %d and %d (got %d)" % (what, lo, hi, n))
+        return n
+    return parse
+
+
+NON_NEG = _int_range(0)
+POSITIVE = _int_range(1)
+
+
+# ------------------------------------------------------- safe terminal ----
+
+class _SafeStream:
+    """Escape control characters on their way to the terminal.
+
+    Log content is not trusted: a client chooses its own appName, and a
+    namespace or error message can carry any bytes. Printed raw, an escape
+    sequence could clear the screen, retitle the terminal or worse. Newlines
+    and tabs pass through; every other C0/C1 control character is written as
+    a visible \\uXXXX escape, which also keeps JSON output valid.
+    """
+
+    _CONTROL = list(range(0x00, 0x20)) + [0x7f] + list(range(0x80, 0xa0))
+
+    def __init__(self, stream, allow=(0x09, 0x0a)):
+        self._stream = stream
+        self._table = {c: "\\u%04x" % c for c in self._CONTROL
+                       if c not in allow}
+
+    def write(self, data):
+        return self._stream.write(data.translate(self._table))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def parse_duration(text: str) -> int:
     """Parse '90m', '4h', '2d' or a bare number of minutes."""
     t = text.strip().lower()
@@ -389,7 +438,7 @@ def cmd_oslog(args) -> int:
                   % ", ".join(OS.COMMON_OSLOGS), file=sys.stderr)
         return 2
     try:
-        events = OS.scan(paths)
+        events = OS.scan(paths, strict=True)
     except OSError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 2
@@ -431,6 +480,20 @@ def cmd_serverstatus(args) -> int:
         print(render_serverstatus(checks))
     if args.exit_code:
         sev = {c.severity for c in checks}
+        return 2 if "CRIT" in sev else (1 if "WARN" in sev else 0)
+    return 0
+
+
+def cmd_audit(args) -> int:
+    from .audit import run_audit
+    from .render import render_audit
+    res, stats = run_audit(args.logfile)
+    if args.json:
+        print(dump_json(res.to_dict()))
+    else:
+        print(render_audit(res, stats))
+    if args.exit_code:
+        sev = {i.severity for i in res.items}
         return 2 if "CRIT" in sev else (1 if "WARN" in sev else 0)
     return 0
 
@@ -607,8 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sort", default="totalMs",
                     choices=["totalMs", "duration", "count", "mean", "max",
                              "docsExamined", "scanRatio"])
-    sp.add_argument("--limit", type=int, default=0, help="show top N shapes")
-    sp.add_argument("--min-ms", type=int, default=0,
+    sp.add_argument("--limit", type=NON_NEG, default=0, help="show top N shapes")
+    sp.add_argument("--min-ms", type=NON_NEG, default=0,
                     help="ignore operations faster than this")
     sp.add_argument("--include-system", action="store_true",
                     help="include internal admin/config/local namespaces "
@@ -616,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "not your workload)")
     sp.add_argument("--report", metavar="FILE",
                     help="write a shareable .md or .html report instead")
-    sp.add_argument("--shape", type=int, metavar="N",
+    sp.add_argument("--shape", type=POSITIVE, metavar="N",
                     help="show full detail for shape N from the table "
                          "(plans, clients, timings, scan ratio)")
     sp.set_defaults(func=cmd_queries)
@@ -631,13 +694,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--component", help="e.g. COMMAND, NETWORK, REPL")
     sp.add_argument("--severity", help="I, W, E, F")
     sp.add_argument("--ns", help="exact namespace, e.g. shop.orders")
-    sp.add_argument("--slow", type=int, help="only ops with durationMillis >= N")
+    sp.add_argument("--slow", type=NON_NEG, help="only ops with durationMillis >= N")
     sp.add_argument("--from", dest="ts_from", help="ISO timestamp lower bound")
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--msg", help="substring match on the msg field")
-    sp.add_argument("--limit", type=int, metavar="N",
+    sp.add_argument("--limit", type=NON_NEG, metavar="N",
                     help="print only the first N matching lines")
-    sp.add_argument("--last", type=int, metavar="N",
+    sp.add_argument("--last", type=POSITIVE, metavar="N",
                     help="print only the LAST N matching lines (most recent — "
                          "usually what you want during an incident)")
     sp.add_argument("--as-explain", action="store_true",
@@ -653,12 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.add_argument("--indexes", help="indexes.json from `mdbkit export-script indexes`")
     sp.add_argument("--schema", help="schema.json from `mdbkit export-script schema`")
-    sp.add_argument("--min-ms", type=int, default=0)
-    sp.add_argument("--min-count", type=int, default=1,
+    sp.add_argument("--min-ms", type=NON_NEG, default=0)
+    sp.add_argument("--min-count", type=POSITIVE, default=1,
                     help="only advise on shapes seen at least N times")
     sp.add_argument("--ns", metavar="NAMESPACE",
                     help="only advise on this namespace, e.g. shop.orders")
-    sp.add_argument("--limit", type=int, default=10, metavar="N",
+    sp.add_argument("--limit", type=NON_NEG, default=10, metavar="N",
                     help="show only the top N recommendations (default 10; "
                          "0 = all)")
     sp.add_argument("--include-system", action="store_true",
@@ -681,7 +744,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "memory/load probes")
     sp.add_argument("logfile", nargs="+",
                     help="mongod log file(s) or a glob, or '-' for stdin")
-    sp.add_argument("--window", type=int, metavar="MINUTES",
+    sp.add_argument("--window", type=NON_NEG, metavar="MINUTES",
                     help="analyze only the last N minutes of log time "
                          "(default: whole file)")
     sp.add_argument("--dbpath", help="override dbPath for the disk probe")
@@ -717,7 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--metric", action="append",
                     help="restrict to a metric label (repeatable), "
                          "e.g. --metric conns.current")
-    sp.add_argument("--step", type=int, default=60, metavar="SECONDS",
+    sp.add_argument("--step", type=_int_range(1, 86400, "--step"), default=60, metavar="SECONDS",
                     help="timeline bucket size (default 60)")
     sp.add_argument("--last", metavar="DURATION",
                     help="analyze only the most recent window, e.g. 90m, 4h, "
@@ -729,6 +792,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_ftdc)
+
+    sp = sub.add_parser("audit",
+                        help="startup configuration warnings mongod logged: "
+                             "access control, rlimits, THP, NUMA, swappiness")
+    sp.add_argument("logfile", nargs="+",
+                    help="mongod log file(s) covering a startup, or the output "
+                         "of db.adminCommand({getLog: 'startupWarnings'})")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 2 on CRIT, 1 on WARN, else 0")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_audit)
 
     sp = sub.add_parser("oslog",
                         help="scan a system log for OOM kills, fd limits, "
@@ -763,12 +837,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="log file(s) from after the change")
     sp.add_argument("--ns", metavar="NAMESPACE",
                     help="only compare this namespace")
-    sp.add_argument("--min-count", type=int, default=3,
+    sp.add_argument("--min-count", type=POSITIVE, default=3,
                     help="ignore shapes seen fewer than N times in a log "
                          "(default 3, so noise is not read as a regression)")
-    sp.add_argument("--min-ms", type=int, default=0,
+    sp.add_argument("--min-ms", type=NON_NEG, default=0,
                     help="ignore operations faster than this")
-    sp.add_argument("--limit", type=int, default=15,
+    sp.add_argument("--limit", type=NON_NEG, default=15,
                     help="shapes to print (default 15, 0 = all)")
     sp.add_argument("--include-system", action="store_true",
                     help="include internal admin/config/local namespaces")
@@ -783,7 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scenario", default="mixed",
                     choices=["healthy", "incident", "mixed"],
                     help="what the log should contain (default mixed)")
-    sp.add_argument("--minutes", type=int, default=90,
+    sp.add_argument("--minutes", type=_int_range(1, 10080, "--minutes"), default=90,
                     help="how much log time to generate (default 90)")
     sp.add_argument("--seed", type=int, default=7,
                     help="deterministic seed — same seed, same log")
@@ -802,16 +876,16 @@ def build_parser() -> argparse.ArgumentParser:
                              "logs"])
     sp.add_argument("--dir", default=None,
                     help="lab directory (default ~/.mdbkit-lab)")
-    sp.add_argument("--nodes", type=int, default=3,
+    sp.add_argument("--nodes", type=_int_range(1, 7, "--nodes"), default=3,
                     help="replica set size (default 3)")
-    sp.add_argument("--port", type=int, default=28110,
+    sp.add_argument("--port", type=_int_range(1024, 65000, "--port"), default=28110,
                     help="base port (default 28110, deliberately far from 27017)")
     sp.add_argument("--slowms", type=int, default=0,
                     help="slow query threshold in ms (default 0 = log every "
                          "operation, which is what makes the log interesting)")
     sp.add_argument("--standalone", action="store_true",
                     help="single node, no replica set")
-    sp.add_argument("--docs", type=int, default=50000,
+    sp.add_argument("--docs", type=_int_range(1, 10_000_000, "--docs"), default=50000,
                     help="documents to insert for `seed` (default 50000)")
     sp.add_argument("--yes", action="store_true",
                     help="confirm destructive actions")
@@ -830,15 +904,22 @@ def main(argv=None) -> int:
     if getattr(args, "command", None) == "lab" and not args.dir:
         from .lab import DEFAULT_DIR
         args.dir = DEFAULT_DIR
+    real_out, real_err = sys.stdout, sys.stderr
+    # stderr keeps \r for the FTDC progress line; stdout keeps nothing.
+    sys.stdout = _SafeStream(real_out)
+    sys.stderr = _SafeStream(real_err, allow=(0x09, 0x0a, 0x0d))
     try:
         return args.func(args)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, IsADirectoryError, PermissionError,
+            NotADirectoryError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:
         return 0
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
 
 
 if __name__ == "__main__":

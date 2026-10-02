@@ -15,9 +15,12 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+import math
+import zlib
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 # Well-known logv2 message ids we care about.
@@ -34,6 +37,55 @@ ID_AUTH_OK_ALT = 5286306
 ID_AUTH_FAIL = 20249
 ID_LISTENING = 23016
 ID_SHUTDOWN = 23138
+# MongoDB 8.3+: an operation still running past slowOpInProgressThreshold.
+# Logged under component SLOWPROG; it is NOT a completed slow query and must
+# never be counted as one.
+ID_SLOW_IN_PROGRESS = 1794200
+
+
+# ------------------------------------------------------------- coercion ---
+# Log attributes are written by mongod, but a log file is still untrusted
+# input: lines get truncated, hand-edited, or produced by tools that bend the
+# format. One odd value must never abort an analysis of a million lines, so
+# every numeric read goes through these helpers.
+
+def num(value, default=0):
+    """Best-effort number from a log/BSON-ish value; `default` if unusable.
+
+    Accepts ints, floats, numeric strings and Extended JSON wrappers such as
+    {"$numberLong": "12"}. NaN, infinities, booleans-as-dicts and anything
+    else non-numeric yield `default`.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else default
+    if isinstance(value, dict):
+        for key in ("$numberLong", "$numberInt", "$numberDouble",
+                    "$numberDecimal"):
+            if key in value:
+                return num(value[key], default)
+        return default
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                f = float(text)
+            except ValueError:
+                return default
+            return f if math.isfinite(f) else default
+    return default
+
+
+def text(value, default: str = "") -> str:
+    """A string field that might not be a string."""
+    if value is None:
+        return default
+    return value if isinstance(value, str) else str(value)
 
 
 @dataclass
@@ -48,6 +100,7 @@ class LogEntry:
     msg: str
     attr: dict = field(default_factory=dict)
     raw: str = ""
+    tags: tuple = ()
 
     @property
     def is_slow_query(self) -> bool:
@@ -63,6 +116,7 @@ class ParseStats:
     unparsed: int = 0
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
+    damaged: list = field(default_factory=list)
 
     @property
     def unparsed_ratio(self) -> float:
@@ -77,37 +131,50 @@ def _parse_ts(value) -> Optional[datetime]:
         millis = value.get("$numberLong")
         if millis is not None:
             try:
-                return datetime.fromtimestamp(int(millis) / 1000.0).astimezone()
-            except (ValueError, OSError):
+                return datetime.fromtimestamp(int(millis) / 1000.0,
+                                              tz=timezone.utc)
+            except (ValueError, OSError, OverflowError, TypeError):
                 return None
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
+        # logv2 always writes an offset. A timestamp without one comes from a
+        # hand-edited or third-party line; treat it as UTC rather than mixing
+        # naive and aware datetimes, which cannot be compared.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
     return None
 
 
 def parse_line(line: str) -> Optional[LogEntry]:
     """Parse one line. Returns None for anything that isn't a logv2 JSON doc."""
-    line = line.strip()
+    # A UTF-8 byte-order mark (Windows editors, PowerShell redirection) is
+    # not whitespace to str.strip(), and it would silently cost us line 1 —
+    # usually the startup line carrying version, host and dbPath.
+    line = line.strip().lstrip("\ufeff")
     if not line or not line.startswith("{"):
         return None
     try:
         doc = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(doc, dict) or "s" not in doc or "c" not in doc:
         return None
+    attr = doc.get("attr")
+    msg_id = num(doc.get("id"), 0)
     return LogEntry(
         ts=_parse_ts(doc.get("t")),
-        severity=str(doc.get("s", "")),
-        component=str(doc.get("c", "")),
-        msg_id=int(doc.get("id", 0) or 0),
-        ctx=str(doc.get("ctx", "")),
-        msg=str(doc.get("msg", "")),
-        attr=doc.get("attr") or {},
+        severity=text(doc.get("s")),
+        component=text(doc.get("c")),
+        msg_id=int(msg_id) if isinstance(msg_id, (int, float)) else 0,
+        ctx=text(doc.get("ctx")),
+        msg=text(doc.get("msg")),
+        attr=attr if isinstance(attr, dict) else {},
         raw=line,
+        tags=tuple(text(t) for t in doc["tags"]) if isinstance(doc.get("tags"), list) else (),
     )
 
 
@@ -115,9 +182,10 @@ def open_log(path: str) -> io.TextIOBase:
     """Open a log file, stdin ('-'), or a rotated .gz transparently."""
     if path == "-":
         return sys.stdin
-    if path.endswith(".gz"):
-        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="replace")
-    # Sniff gzip magic bytes even without the extension.
+    if os.path.isdir(path):
+        raise IsADirectoryError("%s is a directory, not a log file" % path)
+    # Decide by content, not by name: logrotate and hand-copying both produce
+    # ".gz" files that are not compressed, and compressed files without ".gz".
     with open(path, "rb") as probe:
         magic = probe.read(2)
     if magic == b"\x1f\x8b":
@@ -129,7 +197,7 @@ def iter_entries(path: str, stats: Optional[ParseStats] = None) -> Iterator[LogE
     """Stream LogEntry objects from a file, tracking parse stats if given."""
     handle = open_log(path)
     try:
-        for line in handle:
+        for line in _lines_until_damage(handle, path, stats):
             if stats is not None:
                 stats.total_lines += 1
             entry = parse_line(line)
@@ -147,6 +215,24 @@ def iter_entries(path: str, stats: Optional[ParseStats] = None) -> Iterator[LogE
     finally:
         if handle is not sys.stdin:
             handle.close()
+
+
+def _lines_until_damage(handle, path: str, stats: Optional["ParseStats"]):
+    """Yield lines, stopping cleanly if a compressed file is truncated.
+
+    A rotated log copied while it was still being compressed ends without a
+    gzip trailer. Everything before the damage is valid and worth analysing;
+    crashing on the last few kilobytes would throw all of it away.
+    """
+    try:
+        for line in handle:
+            yield line
+    except (EOFError, gzip.BadGzipFile, zlib.error, OSError) as exc:
+        if stats is not None:
+            stats.damaged.append(path)
+        sys.stderr.write(
+            "warning: %s is truncated or corrupt (%s); analysed everything "
+            "before the damage\n" % (path, str(exc) or type(exc).__name__))
 
 
 PRE_44_HINT = (

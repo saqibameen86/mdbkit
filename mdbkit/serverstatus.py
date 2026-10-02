@@ -19,7 +19,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .explain import _relax_shell_json
+from .shelljson import loads_lenient, read_text_file
+from .parser import num as _coerce
 
 # Thresholds. WiredTiger begins background eviction at 80% cache usage and
 # forces application threads to evict at 95%, so those are the numbers worth
@@ -48,13 +49,14 @@ class Check:
 
 
 def load(path: str) -> dict:
-    """Load a serverStatus dump, tolerating mongosh's extended JSON."""
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
+    """Load a serverStatus dump: strict JSON, EJSON, or mongosh's printed
+    output (unquoted keys, Long(...), ISODate(...)), in UTF-8 or the UTF-16
+    that Windows PowerShell redirection writes."""
     try:
-        doc = json.loads(text)
-    except ValueError:
-        doc = json.loads(_relax_shell_json(text))
+        doc = loads_lenient(read_text_file(path))
+    except ValueError as exc:
+        raise ValueError("could not read %s as serverStatus output (%s)"
+                         % (path, exc))
     if not isinstance(doc, dict):
         raise ValueError("expected a JSON object from serverStatus")
     # mongosh sometimes wraps output, and some tools nest it.
@@ -66,24 +68,23 @@ def load(path: str) -> dict:
 
 
 def _num(doc, *path, default=None):
+    """A number at `path`, or `default`. Never raises: NaN, infinities,
+    strings and sub-documents in odd places all come back as `default`."""
     cur = doc
     for key in path:
         if not isinstance(cur, dict) or key not in cur:
             return default
         cur = cur[key]
-    if isinstance(cur, bool):
-        return int(cur)
-    if isinstance(cur, (int, float)):
-        return cur
-    if isinstance(cur, dict):
-        # extended JSON: {"$numberLong": "42"}
-        for k in ("$numberLong", "$numberInt", "$numberDouble"):
-            if k in cur:
-                try:
-                    return float(cur[k]) if "Double" in k else int(cur[k])
-                except (TypeError, ValueError):
-                    return default
-    return default
+    if isinstance(cur, str):
+        return default
+    marker = object()
+    value = _coerce(cur, marker)
+    return default if value is marker else value
+
+
+def _sub(doc, key) -> dict:
+    value = doc.get(key) if isinstance(doc, dict) else None
+    return value if isinstance(value, dict) else {}
 
 
 def _tickets(doc) -> Dict[str, Dict[str, Optional[float]]]:
@@ -235,7 +236,7 @@ def analyze(doc: dict, after: Optional[dict] = None) -> List[Check]:
                             "Nothing waiting on locks or tickets."))
 
     # -- throughput -------------------------------------------------------
-    ops = doc.get("opcounters") or {}
+    ops = _sub(doc, "opcounters")
     if ops:
         rows = []
         for key in ("insert", "query", "update", "delete", "getmore",
@@ -262,7 +263,7 @@ def analyze(doc: dict, after: Optional[dict] = None) -> List[Check]:
                 "figures are lifetime averages, not current load.", rows))
 
     # -- asserts ----------------------------------------------------------
-    asserts = doc.get("asserts") or {}
+    asserts = _sub(doc, "asserts")
     fired = {k: _num(asserts, k) for k in asserts
              if isinstance(_num(asserts, k), (int, float))}
     noisy = {k: v for k, v in fired.items() if v}
@@ -277,13 +278,14 @@ def analyze(doc: dict, after: Optional[dict] = None) -> List[Check]:
             "assertions are often just rejected client operations."))
 
     # -- replication ------------------------------------------------------
-    repl = doc.get("repl") or {}
+    repl = _sub(doc, "repl")
     if repl:
         role = ("PRIMARY" if repl.get("isWritablePrimary") or repl.get("ismaster")
                 else "SECONDARY" if repl.get("secondary") else "unknown")
         ev = ["set: %s" % repl.get("setName", "?"), "role: %s" % role]
-        if repl.get("hosts"):
-            ev.append("members: %s" % ", ".join(str(h) for h in repl["hosts"]))
+        hosts = repl.get("hosts")
+        if isinstance(hosts, list) and hosts:
+            ev.append("members: %s" % ", ".join(str(h) for h in hosts))
         checks.append(Check("INFO", "Replication", "This node is %s." % role, ev))
 
     fc_lagged = _num(doc, "flowControl", "isLagged")

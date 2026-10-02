@@ -29,9 +29,12 @@ from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
 from .analysis import QueryAggregator
+from .audit import KNOWN as _AUDIT_KNOWN
 from .parser import (ID_CONN_ACCEPTED, ID_LISTENING, ID_SHUTDOWN,
-                     ID_STARTUP, LogEntry, ParseStats, iter_entries,
-                     iter_entries_multi)
+                     ID_SLOW_IN_PROGRESS, ID_STARTUP, LogEntry, ParseStats,
+                     iter_entries, iter_entries_multi, num, text)
+
+AUDIT_IDS = frozenset(_AUDIT_KNOWN)
 
 SEV_ORDER = {"CRIT": 0, "WARN": 1, "INFO": 2, "OK": 3}
 DEFAULT_WINDOW_MIN = 60
@@ -111,8 +114,11 @@ class TriageEngine:
         self.member_states = {}           # host -> (state, ts)
         self.heartbeat_errors = Counter()
         self.listening = False
+        self.listening_at = None
         self.shutdown_at = None
         self.log_host = None
+        self.in_progress: List = []       # 8.3+ "Slow in-progress query"
+        self.audit_entries: List[LogEntry] = []
 
     # ---------------------------------------------------------- consume ----
     def consume(self, entry: LogEntry):
@@ -123,10 +129,15 @@ class TriageEngine:
         wt_msg = str(entry.attr.get("message", "")) if entry.attr else ""
 
         if entry.msg_id == ID_STARTUP and entry.attr.get("host"):
-            self.log_host = str(entry.attr.get("host")).split(":")[0]
+            self.log_host = text(entry.attr.get("host")).split(":")[0]
+        if entry.severity == "W" or entry.msg_id in AUDIT_IDS or \
+                entry.msg_id == ID_STARTUP:
+            self.audit_entries.append(entry)
+        if entry.msg_id == ID_SLOW_IN_PROGRESS:
+            self.in_progress.append(entry)
         if entry.msg_id == ID_STARTUP:
             self.startups.append(entry.ts)
-            self.dbpath = entry.attr.get("dbPath") or self.dbpath
+            self.dbpath = text(entry.attr.get("dbPath")) or self.dbpath
         elif entry.severity in ("E", "F"):
             key = (entry.component, entry.msg)
             self.errors[key] += 1
@@ -151,6 +162,7 @@ class TriageEngine:
 
         if entry.msg_id == ID_LISTENING or "waiting for connections" in msg_l:
             self.listening = True
+            self.listening_at = entry.ts
         if entry.msg_id == ID_SHUTDOWN or msg_l.startswith("shutting down"):
             self.shutdown_at = entry.ts
 
@@ -190,6 +202,7 @@ class TriageEngine:
 
         if "checkpoint" in msg_l or "checkpoint" in wt_msg.lower():
             dur = entry.attr.get("durationMillis")
+            dur = num(dur, None) if dur is not None else None
             if dur is None:
                 m = re.search(r"took (\d+) second", wt_msg.lower())
                 dur = int(m.group(1)) * 1000 if m else None
@@ -230,10 +243,20 @@ class TriageEngine:
         detail_head = "Serving connections; no problems visible in the log."
         next_step = ""
 
-        if self.shutdown_at:
+        restarted = bool(self.shutdown_at and self.listening_at
+                         and self.listening_at > self.shutdown_at)
+        if self.shutdown_at and restarted:
+            sev = "WARN"
+            detail_head = ("Shut down at %s and serving again from %s."
+                           % (self.shutdown_at.strftime("%H:%M:%S"),
+                              self.listening_at.strftime("%H:%M:%S")))
+            next_step = ("If the restart was not planned, check why: "
+                         "mdbkit oslog /var/log/syslog")
+        elif self.shutdown_at:
             sev = "CRIT"
-            detail_head = ("A shutdown was logged at %s — this node stopped "
-                           "serving." % self.shutdown_at.strftime("%H:%M:%S"))
+            detail_head = ("A shutdown was logged at %s and nothing after it "
+                           "shows the node serving again."
+                           % self.shutdown_at.strftime("%H:%M:%S"))
             next_step = "Check whether the process was restarted afterwards."
         elif unhealthy:
             sev = "CRIT"
@@ -286,8 +309,8 @@ class TriageEngine:
                 "Process start(s) in window",
                 "mongod startup marker seen %dx (at %s). Unplanned restarts "
                 "are incidents." % (len(self.startups), ", ".join(ts[:5])),
-                next_step="If unexpected: check the OOM killer (dmesg -T | "
-                          "grep -i oom) and the Errors finding below."))
+                next_step="If unexpected, find out why it stopped: "
+                          "mdbkit oslog /var/log/syslog (OOM kills, fd limits)."))
 
         if self.errors:
             total = sum(self.errors.values())
@@ -303,6 +326,8 @@ class TriageEngine:
 
         out.append(self._storm_finding())
         out.extend(self._slow_query_findings())
+        out.extend(self._in_progress_finding())
+        out.extend(self._audit_finding())
 
         if self.index_builds:
             times = [t.strftime("%H:%M:%S") if t else "?"
@@ -441,7 +466,82 @@ class TriageEngine:
                 s.shape.pretty()[:60])
              for s in shapes[:3]],
             "mdbkit advise <log> --ns %s" % ns))
+
+        out.extend(self._waiting_findings(shapes))
         return out
+
+    def _waiting_findings(self, shapes) -> List[Finding]:
+        """MongoDB 8.0+: was the time spent working, or waiting?
+
+        8.0 logs workingMillis alongside durationMillis. The difference is
+        time spent queued for an execution ticket, waiting on locks or held
+        back by flow control — slowness that no index will fix.
+        """
+        timed = [s for s in shapes if s.timed_count]
+        total = sum(s.timed_total_ms for s in timed)
+        if not timed or total < 1000:
+            return []
+        waiting = sum(s.waiting_ms for s in timed)
+        pct = 100.0 * waiting / total
+        worst = sorted(timed, key=lambda s: s.waiting_ms, reverse=True)[:3]
+        evidence = ["%s %s: %.0f%% of %s waiting" % (
+            s.shape.ns, s.shape.pretty()[:50], s.waiting_pct or 0,
+            _ms(s.timed_total_ms)) for s in worst if s.waiting_ms]
+        queued_s = sum(s.queued_us for s in timed) / 1e6
+        if queued_s >= 1:
+            evidence.append("%.1fs of that was queued for execution tickets"
+                            % queued_s)
+        if pct >= 40:
+            return [Finding(
+                "WARN", "Time spent waiting, not working",
+                "%.0f%% of slow-query time (%s of %s) was spent waiting for "
+                "tickets, locks or flow control rather than executing. An "
+                "index will not fix that part." % (pct, _ms(waiting), _ms(total)),
+                evidence,
+                "Check concurrency: mdbkit serverstatus <dump> (tickets, "
+                "queues), and what held them: mdbkit queries <log> --sort "
+                "scanRatio")]
+        return [Finding(
+            "INFO", "Time spent waiting",
+            "%.0f%% of slow-query time was waiting rather than executing "
+            "(MongoDB 8.0+ workingMillis)." % pct, evidence)]
+
+    def _in_progress_finding(self) -> List[Finding]:
+        """MongoDB 8.3+: operations logged while still running."""
+        if not self.in_progress:
+            return []
+        longest = max(self.in_progress,
+                      key=lambda e: num(e.attr.get("durationMillis")))
+        by_ns = Counter(text(e.attr.get("ns")) or "?" for e in self.in_progress)
+        evidence = ["%dx %s" % (n, ns) for ns, n in by_ns.most_common(3)]
+        evidence.append("longest still running at %s after %s (%s)" % (
+            longest.ts.strftime("%H:%M:%S") if longest.ts else "?",
+            _ms(num(longest.attr.get("durationMillis"))),
+            text(longest.ctx)))
+        return [Finding(
+            "WARN" if len(self.in_progress) >= 5 else "INFO",
+            "Long-running operations",
+            "%d operation(s) were logged as still running past "
+            "slowOpInProgressThreshold (MongoDB 8.3+). If they never logged "
+            "a completed 'Slow query', they were killed or are still going."
+            % len(self.in_progress), evidence,
+            "Find them live with db.currentOp({secs_running: {$gt: 30}}); "
+            "in the log: mdbkit filter <log> --component SLOWPROG")]
+
+    def _audit_finding(self) -> List[Finding]:
+        from .audit import audit_entries
+        res = audit_entries(self.audit_entries)
+        if not res.items:
+            return []
+        crit = [i for i in res.items if i.severity == "CRIT"]
+        warn = [i for i in res.items if i.severity == "WARN"]
+        sev = "CRIT" if crit else ("WARN" if warn else "INFO")
+        return [Finding(
+            sev, "Startup configuration",
+            "mongod reported %d configuration warning(s) at startup "
+            "(%d critical)." % (len(res.items), len(crit)),
+            ["%s (%s)" % (i.title, i.severity.lower()) for i in res.items[:5]],
+            "Details and fixes: mdbkit audit <log>")]
 
 
 # ------------------------------------------------------------- sysprobe ----
@@ -796,7 +896,7 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
 
 
 def local_hostname() -> Optional[str]:
-    """This machine's name, read from the kernel — no socket calls."""
+    """This machine's name, read from the kernel, never looked up over the network."""
     try:
         return os.uname()[1].split(".")[0]
     except AttributeError:

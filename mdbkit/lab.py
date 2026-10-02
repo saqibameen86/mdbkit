@@ -87,6 +87,43 @@ def is_running(pid: int) -> bool:
     return True
 
 
+def _cmdline(pid: int) -> str:
+    """The command line of `pid`, or "" if it cannot be read."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            return fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        pass
+    try:                                   # macOS and other non-procfs systems
+        res = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+        return res.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def lab_pid(node: dict) -> int:
+    """The pid of this node's mongod, only if it really is that mongod.
+
+    A pid file outlives its process. After a reboot the same number can
+    belong to anything — signalling it blindly could stop an unrelated
+    service. So a pid counts only while its command line names this node's
+    own data directory.
+    """
+    pid = _read_pid(node.get("pidfile", "")) or node.get("pid", 0)
+    if not is_running(pid):
+        return 0
+    data_dir = node.get("data") or ""
+    if not data_dir:
+        return 0
+    cmd = _cmdline(pid)
+    if not cmd:
+        return 0
+    if os.path.abspath(data_dir) in cmd or data_dir in cmd:
+        return pid
+    return 0
+
+
 def _read_pid(pidfile: str) -> int:
     try:
         with open(pidfile, "r", encoding="utf-8") as fh:
@@ -95,11 +132,13 @@ def _read_pid(pidfile: str) -> int:
         return 0
 
 
-def _wait_ready(logpath: str, timeout: float = 40.0) -> bool:
+def _wait_ready(logpath: str, timeout: float = 40.0, offset: int = 0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with open(logpath, "r", encoding="utf-8", errors="replace") as fh:
+                if offset and os.path.getsize(logpath) >= offset:
+                    fh.seek(offset)
                 if READY_MARKER in fh.read():
                     return True
         except OSError:
@@ -110,11 +149,36 @@ def _wait_ready(logpath: str, timeout: float = 40.0) -> bool:
 
 # ----------------------------------------------------------------- start ---
 
+def port_in_use(port: int) -> bool:
+    """Whether something already listens on 127.0.0.1:port.
+
+    The lab is the one part of mdbkit allowed to touch the network stack,
+    and only this far: a local bind attempt, so a busy port produces a clear
+    message instead of a half-started replica set.
+    """
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        return True
+    finally:
+        probe.close()
+    return False
+
+
 def start(directory: str = DEFAULT_DIR, nodes: int = 3,
           base_port: int = DEFAULT_BASE_PORT, slowms: int = 0,
           standalone: bool = False, cache_gb: float = 0.25,
           echo=print) -> dict:
-    """Create and start a lab deployment. Returns the state dict."""
+    """Create and start a lab deployment. Returns the state dict.
+
+    The marker file is written before anything is started and updated as
+    each node comes up, so a start that fails half way always leaves a lab
+    that `stop` and `destroy` can clean up. Earlier versions wrote the
+    marker last: a failed start left a directory mdbkit then refused to
+    delete, and a mongod still running inside it.
+    """
     mongod = require_mongod()
     if os.path.isdir(directory) and os.listdir(directory):
         existing = load_state(directory)
@@ -123,7 +187,7 @@ def start(directory: str = DEFAULT_DIR, nodes: int = 3,
                 "%s already exists and was not created by mdbkit lab.\n"
                 "  Refusing to touch it. Choose another path with --dir."
                 % directory)
-        live = [n for n in existing["nodes"] if is_running(n.get("pid", 0))]
+        live = [n for n in existing.get("nodes", []) if lab_pid(n)]
         if live:
             raise LabError(
                 "a lab is already running in %s (%d node(s)).\n"
@@ -132,65 +196,115 @@ def start(directory: str = DEFAULT_DIR, nodes: int = 3,
         echo("note: reusing existing lab directory %s" % directory)
 
     nodes = 1 if standalone else max(1, nodes)
+    busy = [base_port + i for i in range(nodes) if port_in_use(base_port + i)]
+    if busy:
+        raise LabError(
+            "port(s) %s on 127.0.0.1 are already in use — probably another "
+            "lab or a local mongod.\n"
+            "  Pick another base port, e.g. --port %d, or check "
+            "`mdbkit lab status --dir <other lab>`."
+            % (", ".join(str(p) for p in busy), base_port + 100))
+
     os.makedirs(directory, exist_ok=True)
     state: Dict = {
         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "dir": os.path.abspath(directory),
         "replicaSet": None if standalone else RS_NAME,
         "slowms": slowms,
+        "status": "starting",
         "nodes": [],
     }
+    save_state(directory, state)          # marker first, always
 
-    for i in range(nodes):
-        port = base_port + i
-        node_dir = os.path.join(directory, "node%d" % i)
-        data_dir = os.path.join(node_dir, "data")
-        log_path = os.path.join(node_dir, "mongod.log")
-        pid_file = os.path.join(node_dir, "mongod.pid")
-        os.makedirs(data_dir, exist_ok=True)
-
-        cmd = [mongod,
-               "--port", str(port),
-               "--dbpath", data_dir,
-               "--logpath", log_path,
-               "--bind_ip", "127.0.0.1",
-               "--pidfilepath", pid_file,
-               "--slowms", str(slowms),
-               "--wiredTigerCacheSizeGB", str(cache_gb)]
-        if not standalone:
-            cmd += ["--replSet", RS_NAME]
-        if os.name == "posix":
-            cmd.append("--fork")
-
-        echo("starting node%d on 127.0.0.1:%d" % (i, port))
+    try:
+        for i in range(nodes):
+            _start_node(mongod, directory, state, i, base_port + i, slowms,
+                        standalone, cache_gb, echo)
+    except LabError as exc:
         try:
-            if os.name == "posix":
-                res = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=60)
-                if res.returncode != 0:
-                    raise LabError(
-                        "mongod failed to start on port %d:\n%s"
-                        % (port, (res.stdout or res.stderr or "").strip()[:600]))
-            else:
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            raise LabError("mongod did not return while starting node%d" % i)
+            stop(directory, echo=lambda *a: None)
+        except LabError:
+            pass
+        state["status"] = "failed"
+        save_state(directory, state)
+        raise LabError(
+            "%s\n  Anything already started was stopped. Remove the partial "
+            "lab with:\n    mdbkit lab destroy --dir %s --yes"
+            % (exc, directory))
 
-        if not _wait_ready(log_path):
-            raise LabError(
-                "node%d did not report '%s' within the timeout.\n"
-                "  Check %s" % (i, READY_MARKER, log_path))
-        state["nodes"].append({
-            "index": i, "port": port, "dir": node_dir, "data": data_dir,
-            "log": log_path, "pidfile": pid_file, "pid": _read_pid(pid_file),
-        })
-
+    state["status"] = "running"
     save_state(directory, state)
-
     if not standalone:
         _initiate(state, echo=echo)
     return state
+
+
+def _start_node(mongod, directory, state, i, port, slowms, standalone,
+                cache_gb, echo):
+    node_dir = os.path.join(directory, "node%d" % i)
+    data_dir = os.path.join(node_dir, "data")
+    log_path = os.path.join(node_dir, "mongod.log")
+    pid_file = os.path.join(node_dir, "mongod.pid")
+    os.makedirs(data_dir, exist_ok=True)
+
+    node = {"index": i, "port": port, "dir": node_dir, "data": data_dir,
+            "log": log_path, "pidfile": pid_file, "pid": 0}
+    state["nodes"] = [n for n in state["nodes"] if n["index"] != i] + [node]
+    save_state(directory, state)          # recorded before it can fail
+
+    cmd = [mongod,
+           "--port", str(port),
+           "--dbpath", data_dir,
+           "--logpath", log_path,
+           "--logappend",
+           "--bind_ip", "127.0.0.1",
+           "--pidfilepath", pid_file,
+           "--slowms", str(slowms),
+           "--wiredTigerCacheSizeGB", str(cache_gb)]
+    if not standalone:
+        cmd += ["--replSet", RS_NAME]
+    if os.name == "posix":
+        cmd.append("--fork")
+
+    # Readiness is judged only from what this start appends to the log, so a
+    # "Waiting for connections" line from a previous run cannot fool it.
+    try:
+        offset = os.path.getsize(log_path)
+    except OSError:
+        offset = 0
+
+    echo("starting node%d on 127.0.0.1:%d" % (i, port))
+    # Output goes to a file, not a pipe: a forked daemon that inherits a
+    # pipe keeps it open, and waiting on it would hang.
+    out_path = os.path.join(node_dir, "startup.out")
+    with open(out_path, "w") as out:
+        try:
+            if os.name == "posix":
+                res = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                     timeout=120)
+                if res.returncode != 0:
+                    out.flush()
+                    raise LabError("mongod failed to start on port %d:\n%s"
+                                   % (port, _tail(out_path)))
+            else:
+                subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
+        except subprocess.TimeoutExpired:
+            raise LabError("mongod did not return while starting node%d "
+                           "(see %s)" % (i, out_path))
+
+    if not _wait_ready(log_path, offset=offset):
+        raise LabError("node%d did not report '%s' within the timeout.\n"
+                       "  Check %s" % (i, READY_MARKER, log_path))
+    node["pid"] = _read_pid(pid_file)
+    save_state(directory, state)
+
+
+def _tail(path: str, limit: int = 600) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()[-limit:]
+    except OSError:
+        return "(no output)"
 
 
 def _initiate(state: dict, echo=print) -> None:
@@ -233,9 +347,10 @@ def status(directory: str = DEFAULT_DIR) -> Optional[dict]:
     state = load_state(directory)
     if not state:
         return None
-    for n in state["nodes"]:
-        n["pid"] = _read_pid(n["pidfile"]) or n.get("pid", 0)
-        n["running"] = is_running(n["pid"])
+    for n in state.get("nodes", []):
+        pid = lab_pid(n)
+        n["pid"] = pid
+        n["running"] = bool(pid)
     return state
 
 
@@ -244,21 +359,28 @@ def stop(directory: str = DEFAULT_DIR, echo=print) -> int:
     if not state:
         raise LabError("no lab found in %s" % directory)
     stopped = 0
-    for n in state["nodes"]:
-        pid = _read_pid(n["pidfile"]) or n.get("pid", 0)
-        if not is_running(pid):
+    for n in state.get("nodes", []):
+        pid = lab_pid(n)
+        if not pid:
             continue
         try:
             os.kill(pid, signal.SIGTERM)
             stopped += 1
-            echo("stopped node%d (pid %d)" % (n["index"], pid))
+            echo("stopping node%d (pid %d)" % (n["index"], pid))
         except OSError as exc:
             echo("could not stop node%d: %s" % (n["index"], exc))
-    for _ in range(40):
-        if not any(is_running(_read_pid(n["pidfile"])) for n in state["nodes"]):
+    # A clean WiredTiger shutdown takes a checkpoint and can take a while.
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if not any(lab_pid(n) for n in state.get("nodes", [])):
             break
         time.sleep(0.25)
     return stopped
+
+
+def still_running(directory: str) -> List[int]:
+    state = load_state(directory) or {}
+    return [p for p in (lab_pid(n) for n in state.get("nodes", [])) if p]
 
 
 def destroy(directory: str = DEFAULT_DIR, echo=print) -> None:
@@ -273,6 +395,12 @@ def destroy(directory: str = DEFAULT_DIR, echo=print) -> None:
         stop(directory, echo=echo)
     except LabError:
         pass
+    alive = still_running(directory)
+    if alive:
+        raise LabError(
+            "mongod (pid %s) is still shutting down; not deleting its data "
+            "underneath it. Run destroy again in a minute."
+            % ", ".join(str(p) for p in alive))
     shutil.rmtree(directory)
     echo("removed %s" % directory)
 

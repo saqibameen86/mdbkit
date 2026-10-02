@@ -42,6 +42,20 @@ implementing a design doc in this folder MUST honor these principles.
     collection ranking.
   * Election/failover timeline (part of triage design).
 * **v0.3 (shipped early, in v0.2)** — shareable Markdown/HTML reports.
+* **v0.4 (shipped)** — `compare`, rotated-log globbing, per-shape drill-down.
+* **v0.5 (shipped)** — `oslog`, `serverstatus` (`demo` and `lab` arrived in v0.3).
+* **v0.6 (shipped)** — MongoDB 8.x/9.0 log fields (workingMillis, ticket
+  queue time, queryShapeHash, planCacheShapeHash, spills, tracked memory,
+  in-progress slow ops), 8.0 FTDC ticket layout, `audit` (startup
+  configuration warnings), mongosh-paste and UTF-16 input, hardening pass
+  (fuzzed parsers, terminal escape sanitising, lab pid ownership).
+  *Principle 7 gap, stated openly:* the 8.x fields were built from MongoDB's
+  release notes and server source, not captured from a live 8.3/9.0 server,
+  because the build environment could not download MongoDB. Capture real
+  fixtures with `mdbkit lab` on 8.0, 8.3 and 9.0 and add them to the tests.
+* **v0.7 (next)** — sharded clusters (mongos logs, scatter-gather queries,
+  migrations, balancer) with `mdbkit lab --sharded`; `$indexStats`-based
+  index usage candidates.
 * **Later / separate product** — GUI control plane, continuous backup
   health, scheduling (the commercial platform). The CLI stays free and
   fully functional forever; it is the trust anchor, not a crippled demo.

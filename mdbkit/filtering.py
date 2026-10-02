@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from .parser import LogEntry
+from .parser import LogEntry, num, text
 
 
 class Filter:
@@ -36,10 +36,10 @@ class Filter:
             return False
         if self.severity and entry.severity.upper() != self.severity:
             return False
-        if self.namespace and entry.attr.get("ns") != self.namespace:
+        if self.namespace and text(entry.attr.get("ns")) != self.namespace:
             return False
         if self.slow_ms is not None:
-            if int(entry.attr.get("durationMillis", -1) or -1) < self.slow_ms:
+            if num(entry.attr.get("durationMillis"), -1) < self.slow_ms:
                 return False
         if self.ts_from is not None:
             if entry.ts is None or _lt(entry.ts, self.ts_from):

@@ -13,6 +13,7 @@ Pure stdlib, no network, writes only where you tell it to.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from datetime import datetime, timedelta, timezone
@@ -49,6 +50,18 @@ _SLOW_TEMPLATES = [
     ("shop.products", "update", {"sku": "SKU-40199"}, None,
      "COLLSCAN", 54000, 1, (400, 800), False),
 ]
+
+
+# The demo log is written in the format of the current MongoDB LTS, so the
+# 8.0-only fields (workingMillis, queues, queryShapeHash, planCacheShapeHash)
+# are exercised by every command.
+DEMO_VERSION = "8.0.34"
+
+
+def _stable_hex(text: str, length: int) -> str:
+    """Deterministic hash. Python's hash() is randomised per process, which
+    made the 'same seed, same log' promise false before 0.6.0."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()[:length]
 
 
 def _ts(dt: datetime) -> dict:
@@ -97,7 +110,7 @@ class DemoLog:
                   "architecture": "64-bit", "host": self.host})
         self.add(t + timedelta(milliseconds=6), "I", "CONTROL", 23403,
                  "initandlisten", "Build Info",
-                 {"buildInfo": {"version": "7.0.14", "gitVersion": "d7fbd0e",
+                 {"buildInfo": {"version": DEMO_VERSION, "gitVersion": "d7fbd0e",
                                 "modules": [], "allocator": "tcmalloc",
                                 "environment": {"distmod": "ubuntu2204",
                                                 "distarch": "x86_64"}}})
@@ -107,6 +120,34 @@ class DemoLog:
         self.add(t + timedelta(milliseconds=900), "I", "NETWORK", 23016,
                  "listener", "Waiting for connections",
                  {"port": self.port, "ssl": "off"})
+
+    def _startup_warnings(self):
+        """The configuration warnings a typical self-managed 8.0 node logs.
+
+        Message ids and wording follow the MongoDB server source."""
+        t = self.at(0) + timedelta(milliseconds=120)
+        tags = ["startupWarnings"]
+        for i, (mid, msg, attr) in enumerate((
+                (22120, "Access control is not enabled for the database. Read "
+                        "and write access to data and configuration is "
+                        "unrestricted", {}),
+                (22184, "Soft rlimits for open file descriptors too low",
+                 {"currentValue": 1024, "recommendedMinimum": 64000}),
+                (9068901, "For customers running the current memory "
+                          "allocator, we suggest re-enabling transparent "
+                          "hugepages",
+                 {"sysfsFile": "/sys/kernel/mm/transparent_hugepage/enabled",
+                  "currentValue": "never", "desiredValue": "always"}),
+                (8386700, "We suggest setting swappiness to 0 or 1, as "
+                          "swapping can cause performance problems.",
+                 {"sysfsFile": "/proc/sys/vm/swappiness",
+                  "currentValue": 60}))):
+            doc = {"t": _ts(t + timedelta(milliseconds=i)), "s": "W",
+                   "c": "CONTROL", "id": mid, "ctx": "initandlisten",
+                   "msg": msg, "tags": tags}
+            if attr:
+                doc["attr"] = attr
+            self.lines.append(json.dumps(doc, separators=(",", ":")))
 
     def _connection(self, minute: float, ip: Optional[str] = None,
                     app: Optional[tuple] = None):
@@ -132,7 +173,8 @@ class DemoLog:
                   "remote": "%s:%d" % (ip, port), "extraInfo": {}})
         return cid
 
-    def _slow(self, minute: float, template, conn: int):
+    def _slow(self, minute: float, template, conn: int,
+              waiting_share: Optional[float] = None):
         ns, op, filt, sort, plan, docs, nret, ms_range, heavy = template
         t = self.at(minute)
         ms = self.rng.randint(*ms_range)
@@ -158,11 +200,29 @@ class DemoLog:
                        "multi": False, "upsert": False}
             comp, otype = "WRITE", "update"
 
+        shape_key = "%s|%s|%s" % (ns, op, sorted(filt))
+        plan_hash = _stable_hex("plan:" + shape_key, 8)
+        # Normally almost all of an operation's time is execution; when the
+        # server is starved of tickets most of it becomes queueing instead.
+        if waiting_share is None:
+            waiting_share = self.rng.uniform(0.0, 0.08)
+        working = max(1, int(ms * (1.0 - waiting_share)))
+        queued_us = int((ms - working) * 1000 * 0.9)
         attr = {"type": otype, "ns": ns, "appName": app, "command": command,
-                "planSummary": plan, "keysExamined": 0 if "COLLSCAN" in plan else nret,
+                "planSummary": plan, "planningTimeMicros": self.rng.randint(80, 900),
+                "keysExamined": 0 if "COLLSCAN" in plan else nret,
                 "docsExamined": docs, "numYields": max(0, docs // 128),
-                "queryHash": "%08X" % (abs(hash(ns + op)) % (16 ** 8)),
-                "reslen": 200 + nret * 180, "protocol": "op_msg",
+                "queryShapeHash": _stable_hex("shape:" + shape_key, 64),
+                "planCacheShapeHash": plan_hash,
+                "queryHash": plan_hash,
+                "planCacheKey": _stable_hex("key:" + shape_key, 8),
+                "queryFramework": "classic",
+                "reslen": 200 + nret * 180,
+                "queues": {"execution": {"admissions": 1 + docs // 50000,
+                                         "totalTimeQueuedMicros": queued_us}},
+                "cpuNanos": working * 1_000_000,
+                "protocol": "op_msg",
+                "workingMillis": working,
                 "durationMillis": ms}
         if otype == "update":
             attr["nMatched"] = nret
@@ -171,6 +231,12 @@ class DemoLog:
             attr["nreturned"] = nret
         if sort and "COLLSCAN" in plan:
             attr["hasSortStage"] = True
+            if op == "aggregate":
+                # 8.1+ standardised spill metrics: the big blocking sort
+                # overflows its memory limit and writes to disk.
+                attr["sortSpills"] = 1 + docs // 400000
+                attr["sortSpilledBytes"] = docs * 310
+                attr["sortSpilledRecords"] = docs // 3
         self.add(t, "I", comp, 51803, "conn%d" % conn, "Slow query", attr)
 
     # -- incidents --------------------------------------------------------
@@ -249,6 +315,8 @@ class DemoLog:
     # -- build ------------------------------------------------------------
     def build(self) -> List[str]:
         self._startup()
+        if self.scenario != "healthy":
+            self._startup_warnings()
         self._replica_state()
         for i in range(6):
             self._connection(0.2 + i * 0.05)
@@ -279,9 +347,11 @@ class DemoLog:
             self._auth_failures(mid + 1.2)
             self._errors(mid + 1.5)
             self._slow_checkpoint(mid + 2)
-            # a burst of the worst shape right after the election
+            # a burst of the worst shape right after the election, while the
+            # storm has every execution ticket taken: mostly queueing.
             for i in range(28):
-                self._slow(mid + 2 + i / 90.0, _SLOW_TEMPLATES[0], 14)
+                self._slow(mid + 2 + i / 90.0, _SLOW_TEMPLATES[0], 14,
+                           waiting_share=self.rng.uniform(0.55, 0.8))
 
         for i in range(4):
             t = self.at(self.minutes - 0.5 + i * 0.05)

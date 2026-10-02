@@ -111,9 +111,8 @@ EXPLANATIONS = {kind: why for kind, _sev, _pat, why in RULES}
 
 
 def _open(path: str):
-    if path.endswith(".gz"):
-        return io.TextIOWrapper(gzip.open(path, "rb"), errors="replace")
-    return open(path, "r", encoding="utf-8", errors="replace")
+    from .parser import open_log
+    return open_log(path)       # sniffs gzip by content, rejects directories
 
 
 def parse_ts(line: str, year: Optional[int] = None):
@@ -129,16 +128,27 @@ def parse_ts(line: str, year: Optional[int] = None):
             return None
     m = _SYSLOG_TS.match(line)
     if m:
+        now = datetime.now()
         try:
-            return datetime(year or datetime.now().year,
-                            _MONTHS.get(m.group(1), 1), int(m.group(2)),
-                            int(m.group(3)), int(m.group(4)), int(m.group(5)))
+            ts = datetime(year or now.year,
+                          _MONTHS.get(m.group(1), 1), int(m.group(2)),
+                          int(m.group(3)), int(m.group(4)), int(m.group(5)))
         except ValueError:
             return None
+        # Syslog omits the year. A December line read in January belongs to
+        # last year, not to eleven months in the future.
+        if year is None and (ts - now).days > 1:
+            ts = ts.replace(year=ts.year - 1)
+        return ts
     return None
 
 
-def scan(paths, ts_from=None, ts_to=None) -> List[OsEvent]:
+# Kernel and systemd lines are short. Matching is limited to the start of a
+# line so a pathological multi-megabyte line cannot make a regex crawl.
+MAX_MATCH_CHARS = 4096
+
+
+def scan(paths, ts_from=None, ts_to=None, strict: bool = False) -> List[OsEvent]:
     """Scan one or more system logs for events that matter to a database."""
     if isinstance(paths, str):
         paths = [paths]
@@ -147,15 +157,19 @@ def scan(paths, ts_from=None, ts_to=None) -> List[OsEvent]:
         try:
             fh = _open(path)
         except OSError:
+            if strict:
+                raise
             continue
         with fh:
-            for raw in fh:
+            from .parser import _lines_until_damage
+            for raw in _lines_until_damage(fh, path, None):
                 line = raw.rstrip("\n")
                 if not line:
                     continue
                 matched = None
+                probe = line[:MAX_MATCH_CHARS]
                 for kind, sev, pattern, _why in RULES:
-                    m = pattern.search(line)
+                    m = pattern.search(probe)
                     if m:
                         matched = (kind, sev, m)
                         break
