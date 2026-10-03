@@ -31,7 +31,7 @@ import os
 import struct
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
 
 MASK64 = (1 << 64) - 1
@@ -336,6 +336,22 @@ def chunk_timestamp(doc: dict) -> Optional[datetime]:
     return _to_dt(ts) if isinstance(ts, int) else None
 
 
+# MongoDB 8.0+ sharded processes (shards, config servers, mongos) group
+# their FTDC by role: common.serverStatus..., shard.replSetGetStatus...,
+# router.... Replica sets and older versions write serverStatus... at the
+# top. Dropping the role prefix lets one set of metric paths read both.
+CHUNK_SPAN = timedelta(minutes=5)
+
+ROLE_PREFIXES = ("common.", "shard.", "router.")
+
+
+def _unrole(path: str) -> str:
+    for prefix in ROLE_PREFIXES:
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
+
+
 def decode_chunk(doc: dict, wanted_paths: Optional[set] = None
                  ) -> Optional[Chunk]:
     """Decode one type-1 metrics document.
@@ -357,7 +373,7 @@ def decode_chunk(doc: dict, wanted_paths: Optional[set] = None
     metric_count, sample_count = struct.unpack_from("<II", raw, pos)
     pos += 8
     leaves = numeric_metrics(ref)
-    paths = [p for p, _ in leaves]
+    paths = [_unrole(p) for p, _ in leaves]
     base = [v for _, v in leaves]
     if metric_count > len(paths) or sample_count > MAX_SAMPLES:
         # mongod's own decompressor rejects a count that disagrees with the
@@ -463,14 +479,28 @@ CURATED: List[Tuple[str, str, str]] = [
     # Checkpoint pressure. mongod does not log checkpoint duration at default
     # verbosity on modern versions (those calls are LOGV2_DEBUG level 4), so
     # FTDC is the authoritative source rather than the log.
+    # WiredTiger moved these statistics in MongoDB 8.0; each label lists the
+    # 8.0+ path and the 7.0-and-earlier one (checked on real FTDC from
+    # 6.0.29, 7.0.43, 8.0.32, 8.3.11 and 9.0.2).
+    ("checkpoint.lastMs",
+     "serverStatus.wiredTiger.checkpoint.most recent time (msecs)", "gauge"),
     ("checkpoint.lastMs",
      "serverStatus.wiredTiger.transaction.transaction checkpoint most recent time (msecs)",
      "gauge"),
     ("checkpoint.totalMs",
+     "serverStatus.wiredTiger.checkpoint.total time (msecs)", "counter"),
+    ("checkpoint.totalMs",
      "serverStatus.wiredTiger.transaction.transaction checkpoint total time (msecs)",
      "counter"),
     # Eviction done by application threads means the cache could not keep up
-    # and user operations are paying for it — the real eviction-pressure signal.
+    # and user operations are paying for it — the real eviction-pressure
+    # signal. Measured as time: 8.0 dropped the page count.
+    ("evict.appThreadMicros",
+     "serverStatus.wiredTiger.cache.application thread time evicting (usecs)",
+     "counter"),
+    ("evict.appThreadMicros",
+     "serverStatus.wiredTiger.thread-yield.application thread time evicting (usecs)",
+     "counter"),
     ("evict.appThreadPages",
      "serverStatus.wiredTiger.cache.pages evicted by application threads",
      "counter"),
@@ -524,9 +554,21 @@ class Series:
     last: Optional[int] = None
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
+    # counters: the busiest minute, as a per-second rate (a window average
+    # hides a five-minute incident inside a five-hour file)
+    peak_rate: Optional[float] = None
+    peak_rate_ts: Optional[datetime] = None
+    # gauges: how many samples were above zero, and when
+    nonzero: int = 0
+    first_nonzero_ts: Optional[datetime] = None
+    last_nonzero_ts: Optional[datetime] = None
+    # counters: the total increase, ignoring the drops a restart causes
+    # (last - first would go negative, or hide a whole process lifetime)
+    increase: int = 0
+    _tail: List[int] = field(default_factory=list, repr=False)
 
     def observe(self, vals: List[int], t0: Optional[datetime],
-                t1: Optional[datetime]):
+                t1: Optional[datetime], step: float = 1.0):
         if not vals:
             return
         lo = min(vals)
@@ -535,11 +577,49 @@ class Series:
         self.vmax = hi if self.vmax is None else (hi if hi > self.vmax else self.vmax)
         self.total += sum(vals)
         self.n += len(vals)
+        if self.kind == "counter":
+            inc = 0
+            if self.last is not None and vals[0] >= self.last:
+                inc += vals[0] - self.last
+            for a, b in zip(vals, vals[1:]):
+                if b >= a:
+                    inc += b - a
+            self.increase += inc
+        prev_ts = self.last_ts
         if self.first is None:
             self.first = vals[0]
             self.first_ts = t0
         self.last = vals[-1]
         self.last_ts = t1
+        n = len(vals)
+        step = step if step and step > 0 else 1.0
+        if self.kind == "counter":
+            # Busiest minute: windows of 60 s, continued across chunk
+            # boundaries (FTDC chunks can be a few samples long), but not
+            # across a gap in the data, where 60 samples are not 60 s.
+            w = max(1, int(round(60.0 / step)))
+            if self._tail and (t0 is None or prev_ts is None or
+                               (t0 - prev_ts).total_seconds() > 3 * step):
+                self._tail = []
+            seq = self._tail + list(vals)
+            if len(seq) > w:
+                stride = max(1, w // 12)
+                best, at = max((seq[i + w] - seq[i], i)
+                               for i in range(0, len(seq) - w, stride))
+                rate = best / (w * step)
+                # a counter that went down was reset by a restart: not a rate
+                if rate >= 0 and (self.peak_rate is None or rate > self.peak_rate):
+                    self.peak_rate = rate
+                    self.peak_rate_ts = (t0 + timedelta(
+                        seconds=(at - len(self._tail)) * step)) if t0 else None
+            self._tail = seq[-w:]
+        elif hi > 0:
+            idx = [i for i, v in enumerate(vals) if v > 0]
+            self.nonzero += len(idx)
+            if t0 is not None:
+                if self.first_nonzero_ts is None:
+                    self.first_nonzero_ts = t0 + timedelta(seconds=idx[0] * step)
+                self.last_nonzero_ts = t0 + timedelta(seconds=idx[-1] * step)
 
     def stats(self) -> Dict[str, float]:
         """Summary appropriate to the metric kind.
@@ -552,9 +632,7 @@ class Series:
         if not self.n:
             return {}
         if self.kind == "counter":
-            delta = (self.last - self.first) if (
-                self.last is not None and self.first is not None) else None
-            return {"change": delta, "last": self.last, "cumulative": True}
+            return {"change": self.increase, "last": self.last, "cumulative": True}
         return {"min": self.vmin, "max": self.vmax,
                 "avg": self.total / float(self.n), "last": self.last}
 
@@ -585,6 +663,14 @@ class FtdcReader:
         self.version: Optional[str] = None
         self._plan: Optional[List[Tuple[str, str, str]]] = None
         self._paths: Optional[set] = None
+        # Seconds the WiredTiger cache spent past the points where
+        # application threads must help evict: 95% full, or 20% dirty
+        # (WiredTiger's eviction_trigger and eviction_dirty_trigger).
+        self.cache_samples = 0
+        self.cache_hot_samples = 0
+        self.cache_hot_first: Optional[datetime] = None
+        self.cache_hot_last: Optional[datetime] = None
+        self.dirty_pct_peak: Optional[float] = None
 
     # -- metric selection -------------------------------------------------
     def _wanted_paths(self) -> set:
@@ -647,7 +733,10 @@ class FtdcReader:
                 # Cheap window check before zlib + delta decode.
                 cts = chunk_timestamp(doc)
                 if cts is not None:
-                    if ts_from and cts < ts_from:
+                    # a chunk holds up to ~5 minutes of samples from its
+                    # start time, so one starting a little earlier may
+                    # still cover the window
+                    if ts_from and cts < ts_from - CHUNK_SPAN:
                         self.skipped += 1
                         continue
                     if ts_to and cts > ts_to:
@@ -712,7 +801,27 @@ class FtdcReader:
                 if s is None:
                     s = self.series["repl.lagMs"] = Series(
                         "repl.lagMs", "derived", "gauge")
-                s.observe(lag, t0, t1)
+                s.observe(lag, t0, t1, step)
+
+        cols = {label: idx for label, _k, idx in plan}
+        if "cache.usedBytes" in cols and "cache.maxBytes" in cols:
+            used = chunk.rows[cols["cache.usedBytes"]]
+            mx = chunk.rows[cols["cache.maxBytes"]]
+            dirty = (chunk.rows[cols["cache.dirtyBytes"]]
+                     if "cache.dirtyBytes" in cols else [])
+            for j in range(min(n, len(used), len(mx))):
+                if mx[j] <= 0:
+                    continue
+                self.cache_samples += 1
+                d = 100.0 * dirty[j] / mx[j] if j < len(dirty) else 0.0
+                if self.dirty_pct_peak is None or d > self.dirty_pct_peak:
+                    self.dirty_pct_peak = d
+                if 100.0 * used[j] / mx[j] >= 95.0 or d >= 20.0:
+                    self.cache_hot_samples += 1
+                    at = datetime.fromtimestamp(t0s + j * step, tz=timezone.utc)
+                    if self.cache_hot_first is None:
+                        self.cache_hot_first = at
+                    self.cache_hot_last = at
 
         emit = {} if self.on_chunk else None
         for label, kind, idx in plan:
@@ -720,7 +829,7 @@ class FtdcReader:
             s = self.series.get(label)
             if s is None:
                 s = self.series[label] = Series(label, label, kind)
-            s.observe(vals, t0, t1)
+            s.observe(vals, t0, t1, step)
             if self.keep_values:
                 s.values.extend(vals)
                 s.times.extend(
@@ -741,6 +850,8 @@ class FtdcReader:
         if not s.first_ts or not s.last_ts:
             return None
         span = (s.last_ts - s.first_ts).total_seconds() or 1.0
+        if s.kind == "counter":
+            return s.increase / span
         return (s.last - s.first) / span
 
     def disks(self) -> Dict[str, dict]:
@@ -758,7 +869,7 @@ class FtdcReader:
             dev = dev.rstrip("]")
             entry = out.setdefault(dev, {})
             if s.first is not None and s.last is not None:
-                entry[metric] = s.last - s.first
+                entry[metric] = s.increase if s.kind == "counter" else s.last - s.first
             entry.setdefault("_span", 0.0)
             if s.first_ts and s.last_ts:
                 entry["_span"] = max(entry["_span"],

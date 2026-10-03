@@ -1,4 +1,4 @@
-"""Tests for `mdbkit triage` (beta)."""
+"""Tests for `mdbkit triage`."""
 
 import json
 import os
@@ -37,7 +37,7 @@ def test_election_detected_and_noise_ignored(tmp_path):
     f = by["Replica set instability"]
     assert f.severity == "CRIT"
     assert "2 election/stepdown" in f.detail  # start + succeeded; noise excluded
-    assert f.beta is True
+    assert f.beta is False   # validated on real 6.0-9.0 failovers in 0.8
 
 
 def test_quiet_log_has_ok_findings():

@@ -1,0 +1,7 @@
+{
+ "crashed": "node0",
+ "failover_winner": "node1",
+ "flow_primary": "node1",
+ "stepped_up": "node1",
+ "storm": "node0"
+}

@@ -1,75 +1,62 @@
-# mdbkit Roadmap & Design Principles
+# mdbkit: principles and history
 
-This document governs all future versions. Any model or contributor
-implementing a design doc in this folder MUST honor these principles.
+Read this before changing mdbkit, whoever (or whatever model) is doing the
+work. The principles are not negotiable.
 
-## Non-negotiable principles
+## Principles
 
-1. **Read-only, forever.** mdbkit never mutates a cluster, never runs
-   admin commands, never connects to a database. Where an action would help
-   (create index, resize oplog, step down), mdbkit PRINTS the command with
-   caveats for a human to review and run. Advice, never action.
-2. **Offline, forever.** No network code of any kind. No telemetry, no
-   update checks, no phoning home. Local OS inspection (reading /proc,
-   statvfs on the dbPath) is allowed — it never leaves the machine.
-3. **Zero runtime dependencies.** Python stdlib only. This is a feature
-   (air-gapped installs, no supply chain) and must not be traded away for
-   convenience. If a task seems to need a library (BSON, zlib), implement
-   the minimal subset in-tree (zlib IS stdlib; BSON needs ~150 lines).
-4. **Terminal-first.** Every feature must be fully usable over SSH with
-   plain-text output. HTML/Markdown export is a sharing convenience layer,
-   never the primary interface.
-5. **Untrusted input.** All files (logs, FTDC, serverStatus exports) are
-   parsed defensively: strict parsing, bounded recursion, no eval/exec, no
-   shell-outs, malformed input skipped and counted, never echoed into
-   errors.
-6. **Evidence, confidence, caveats.** Every diagnostic or recommendation
-   states what was observed, how sure we are, and what could make it wrong.
-   Deterministic rules only — same input, same output.
-7. **Tests gate everything.** New parsers require fixtures from REAL
-   MongoDB output (redacted), not just synthetic data. A feature without
-   real-world fixtures does not ship.
+1. **Read-only, forever.** Analysis commands never mutate a cluster, never
+   run admin commands and never connect to a database. Where an action would
+   help (create an index, hide one, resize the oplog), mdbkit prints the
+   command, with caveats, for a human to review and run. `mdbkit lab` is the
+   one exception: it starts a disposable local MongoDB, and is bounded as
+   SECURITY.md describes.
+2. **Offline, forever.** No network code outside `lab.py` (which only probes
+   a local port), no telemetry, no update checks. Reading the local machine
+   (`/proc`, `statvfs` on the dbPath) is allowed: it never leaves the host.
+3. **Zero runtime dependencies.** Python standard library only, Python 3.8+.
+   This is a feature (air-gapped installs, no supply chain). If a task seems
+   to need a library, implement the small subset needed in-tree, as was done
+   for BSON and FTDC.
+4. **Terminal-first.** Everything works over SSH as plain text. Markdown and
+   HTML reports are a sharing layer, never the primary interface.
+5. **Untrusted input.** Logs, FTDC and exports are parsed defensively:
+   strict JSON, bounded recursion and decompression, no eval or exec, no
+   shell-outs, malformed input skipped and counted, never echoed into errors,
+   control characters neutralised before they reach the terminal.
+6. **Evidence, confidence, caveats.** Every finding says what was observed,
+   how sure mdbkit is, and what could make it wrong. Deterministic rules
+   only: same input, same output.
+7. **Real output gates everything.** A parser or detector ships only with
+   fixtures from a real MongoDB server (`mdbkit lab` makes that easy), not
+   just synthetic data. Every bug found in real output so far had passed
+   the synthetic tests.
 
-## Version plan
+## Compatibility
 
-* **v0.1 (shipped)** — structured log toolkit: loginfo, queries,
-  connections, filter, advise, explain, export-script.
-* **v0.2 (shipped)** — the incident release:
-  * FTDC decoder (`DESIGN-ftdc.md`) — offline metrics from diagnostic.data,
-    including system CPU/memory/disk that FTDC already records.
-  * Triage command (`DESIGN-triage.md`) — one-command incident snapshot:
-    log detectors + local OS probes + optional serverStatus digest + hot
-    collection ranking.
-  * Election/failover timeline (part of triage design).
-* **v0.3 (shipped early, in v0.2)** — shareable Markdown/HTML reports.
-* **v0.4 (shipped)** — `compare`, rotated-log globbing, per-shape drill-down.
-* **v0.5 (shipped)** — `oslog`, `serverstatus` (`demo` and `lab` arrived in v0.3).
-* **v0.6 (shipped)** — MongoDB 8.x/9.0 log fields (workingMillis, ticket
-  queue time, queryShapeHash, planCacheShapeHash, spills, tracked memory,
-  in-progress slow ops), 8.0 FTDC ticket layout, `audit` (startup
-  configuration warnings), mongosh-paste and UTF-16 input, hardening pass
-  (fuzzed parsers, terminal escape sanitising, lab pid ownership).
-* **v0.6.1 (shipped)** — closes v0.6's principle-7 gap: tested against real
-  7.0.43, 8.0.32, 8.3.11 and 9.0.2 servers via `mdbkit lab`, with trimmed real
-  output in `tests/fixtures/real/`. Fixes what that turned up (getMore shapes,
-  double-counted updates on 8.0 and earlier, Long counters in the serverStatus
-  export, export scripts defaulting to the `test` database, FTDC timeline
-  helper columns) plus multi-instance host handling and crash detection.
-* **v0.7 (shipped)** — `mdbkit host`: hosts running many mongods
-  (per-instance overview, cache sizes vs RAM, crashes and OOM kills per
-  instance, startup warnings across instances), tested on a real
-  eight-instance host.
-* **v0.8 (next)** — sharded clusters: mongos logs, scatter-gather queries,
-  migrations and the balancer, with `mdbkit lab --sharded`; then
-  `$indexStats`-based index usage candidates.
-* **Later / separate product** — GUI control plane, continuous backup
-  health, scheduling (the commercial platform). The CLI stays free and
-  fully functional forever; it is the trust anchor, not a crippled demo.
+* Semantic versioning. Breaking CLI changes need a major version.
+* `--json` output is a contract: within a minor version, keys are only
+  added, never removed or renamed.
+* Structured (JSON) logs: MongoDB 4.4 and later. A new server version is
+  claimed only after a real server of that version has been run and its
+  output added to `tests/fixtures/real/`.
 
-## Naming & compatibility
+## History
 
-* Follow semver. Breaking CLI-flag changes require a major bump.
-* `--json` output schemas are contracts: additive changes only within a
-  minor version; document every schema in the design docs.
-* Support MongoDB 4.4 through current; new server versions get a fixture
-  and a CI entry before we claim support.
+* **0.1** structured log toolkit: `loginfo`, `queries`, `connections`,
+  `filter`, `advise`, `explain`, `export-script`.
+* **0.2** FTDC decoding, incident `triage`, shareable reports.
+* **0.3** `demo` and `lab`. **0.4** `compare`, rotated logs, per-shape
+  detail. **0.5** `oslog`, `serverstatus`.
+* **0.6** MongoDB 8.x/9.0 fields, `audit`, hardening. **0.6.1** tested
+  against real 7.0, 8.0, 8.3 and 9.0 servers; the bugs that turned up fixed.
+* **0.7** `host`, for hosts running many mongods.
+* **0.8** (long-term release) sharded clusters, `indexes`, and every triage
+  detector checked against real failures on 6.0 to 9.0.
+
+## Ideas, not scheduled
+
+* Jumbo chunks and balancer windows.
+* Slow oplog application on secondaries ("Applied op" lines). Needs real
+  output of a secondary falling behind before it can be built.
+* `lab` on Windows.

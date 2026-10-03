@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 from .audit import audit_entries
 from .parser import (ID_BUILD_INFO, ID_STARTUP, LogEntry, ParseStats,
                      iter_entries, iter_entries_multi, num, text)
+from .sharding import ID_SHARD_REGISTRY
 from .triage import (ID_OPTIONS, ID_PROCESS_DETAILS, SEV_ORDER, Finding,
                      TriageEngine, dbpath_from_argv, dbpath_of_options,
                      find_mongods, local_hostname, port_from_argv)
@@ -62,10 +63,25 @@ class Instance:
         return self.key
 
     @property
+    def kind(self) -> str:
+        """mongos, shard, config, replica or standalone."""
+        if self.engine and self.engine.sharding.role:
+            return self.engine.sharding.role
+        return "replica" if self.repl_set else "standalone"
+
+    @property
     def role(self) -> str:
+        if self.kind == "mongos":
+            return "mongos"
         if self.engine and self.engine.self_state:
             return self.engine.self_state
         return "replica set" if self.repl_set else "standalone"
+
+    @property
+    def set_label(self) -> str:
+        if self.kind in ("shard", "config") and self.repl_set:
+            return "%s (%s)" % (self.repl_set, self.kind)
+        return self.repl_set or "-"
 
     @property
     def crashes(self) -> int:
@@ -109,6 +125,7 @@ class Instance:
         return {
             "instance": self.key, "files": self.files, "host": self.host,
             "port": self.port, "replicaSet": self.repl_set or None,
+            "kind": self.kind,
             "version": self.version or None, "role": self.role,
             "dbPath": self.dbpath or None,
             "cacheMB": self.cache_mb, "cacheSource": self.cache_source or None,
@@ -190,7 +207,14 @@ def _header(path: str) -> dict:
             if host and port:
                 info.setdefault("host", host.split(":")[0])
                 info.setdefault("port", port)
-        if n >= HEADER_LINES and "port" in info:
+        elif e.msg_id == ID_OPTIONS and "options_port" not in info:
+            # mongos never logs "MongoDB starting"; its options give the port
+            opts = e.attr.get("options") if isinstance(e.attr.get("options"), dict) else {}
+            net = opts.get("net") if isinstance(opts.get("net"), dict) else {}
+            port = int(num(net.get("port"), 0))
+            if port:
+                info["options_port"] = port
+        if n >= HEADER_LINES and ("port" in info or "options_port" in info):
             break
         if n >= HEADER_LINES * 5:
             break
@@ -203,23 +227,28 @@ def group_instances(paths: List[str]) -> List[Instance]:
     headers = {p: _header(p) for p in paths}
     by_key: Dict[str, Instance] = {}
     base_key: Dict[str, str] = {}
-    for p in paths:
-        h = headers[p]
+    def key_of(h):
         if "port" in h:
-            key = "%s:%d" % (h["host"], h["port"])
+            return "%s:%d" % (h["host"], h["port"])
+        if "options_port" in h:
+            return "port %d" % h["options_port"]
+        return None
+
+    for p in paths:
+        key = key_of(headers[p])
+        if key:
             base_key.setdefault(_base_name(p), key)
     for p in paths:
         h = headers[p]
-        if "port" in h:
-            key = "%s:%d" % (h["host"], h["port"])
+        if key_of(h):
+            key = key_of(h)
         else:
             key = base_key.get(_base_name(p)) or _base_name(p)
         inst = by_key.setdefault(key, Instance(key=key))
         inst.files.append(p)
     for inst in by_key.values():
-        far = headers[inst.files[0]]["first_ts"]
-        inst.files.sort(key=lambda f: (headers[f]["first_ts"] is None,
-                                       headers[f]["first_ts"] or far))
+        inst.files.sort(key=lambda f: headers[f]["first_ts"].timestamp()
+                        if headers[f]["first_ts"] else float("inf"))
     return list(by_key.values())
 
 
@@ -286,6 +315,9 @@ def analyse_instance(inst: Instance, window_min: int) -> None:
         if cutoff is not None and e.ts is not None and e.ts < cutoff:
             if e.msg_id in (ID_STARTUP, ID_PROCESS_DETAILS):
                 engine.note_pid(e)
+            elif e.msg_id == ID_OPTIONS or e.msg_id in ID_SHARD_REGISTRY:
+                # mongos / shard / config server, and the shard list
+                engine.sharding.consume(e)
             first = False
             continue
         if first:
@@ -338,6 +370,8 @@ def host_findings(instances: List[Instance], ram_mb: Optional[float],
     # 1. WiredTiger caches against RAM
     known, defaults, unknown = 0.0, [], []
     for inst in instances:
+        if inst.kind == "mongos":
+            continue                      # a router has no storage engine
         if inst.cache_mb is not None:
             inst.cache_source = "logged"
         elif inst.cache_option_gb is not None:
@@ -352,13 +386,14 @@ def host_findings(instances: List[Instance], ram_mb: Optional[float],
         known += inst.cache_mb
         if inst.cache_option_gb is None:
             defaults.append(inst)
-    if len(instances) > 1 and defaults:
+    storage = [i for i in instances if i.kind != "mongos"]
+    if len(storage) > 1 and defaults:
         out.append(Finding(
             "WARN", "Default cache size on a shared host",
-            "%d of %d instances run with the default WiredTiger cache "
+            "%d of %d mongod instances run with the default WiredTiger cache "
             "(cacheSizeGB not set). The default is half of (RAM - 1 GB) and "
             "assumes the mongod has the machine to itself." % (
-                len(defaults), len(instances)),
+                len(defaults), len(storage)),
             _capped(["%s: %s" % (i.key, _gb(i.cache_mb))
                      for i in sorted(defaults, key=lambda i: i.key)]),
             "Set storage.wiredTiger.engineConfig.cacheSizeGB on every "
@@ -542,9 +577,9 @@ def render_host(rep: HostReport, limit: int = 0) -> str:
         own = i.own_findings()
         e = i.engine
         rows.append((
-            i.key, i.repl_set or "-", i.version or "?", i.role,
+            i.key, i.set_label, i.version or "?", i.role,
             ("%s%s" % (_gb(i.cache_mb), "*" if i.cache_source.startswith("default") else ""))
-            if i.cache_mb else "?",
+            if i.cache_mb else ("-" if i.kind == "mongos" else "?"),
             str(len(e.startups) if e else 0), str(i.crashes),
             format(count, ","), _ms(total) if total else "-",
             ("%.0f%%" % waiting) if waiting is not None else "-",

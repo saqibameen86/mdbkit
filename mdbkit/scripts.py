@@ -84,12 +84,22 @@ print(EJSON.stringify(out, { relaxed: true }));
 
 INDEXES_SCRIPT = r"""// mdbkit index export -- run with:
 //   mongosh --quiet "mongodb://HOST:PORT/" --eval "$(cat this_file.js)" > indexes.json
-// Exports index metadata only (getIndexes), for every database you can
-// read (admin/config/local skipped). Reads nothing else.
+// Exports index definitions (getIndexes) and, where your role allows it,
+// how often each index has been used ($indexStats), for every database you
+// can read (admin/config/local skipped), plus the shard keys from
+// config.collections (through mongos) or config.cache.collections (on a
+// shard). Reads no documents.
+// Usage counters are kept per member and reset when a member restarts:
+// run this on each member, or through mongos for a sharded cluster.
 const ONLY_DB = null;    // e.g. "shop" to export a single database
 // Collections are keyed by full namespace ("shop.orders"), so "db" is empty.
+let hello;
+try { hello = db.hello(); } catch (e) { hello = db.isMaster(); }  // 4.4.0-4.4.1
 const out = { db: "", generatedAt: new Date().toISOString(),
-              databases: [], collections: {} };
+              source: { me: hello.me || null, setName: hello.setName || null,
+                        isPrimary: !!(hello.isWritablePrimary || hello.ismaster),
+                        isMongos: hello.msg === "isdbgrid" },
+              databases: [], collections: {}, usage: {}, shardKeys: {} };
 const names = ONLY_DB ? [ONLY_DB] :
   db.adminCommand({ listDatabases: 1, nameOnly: true, authorizedDatabases: true })
     .databases.map(d => d.name)
@@ -99,10 +109,23 @@ names.forEach(name => {
   out.databases.push(name);
   d.getCollectionInfos({ type: "collection" }).map(c => c.name)
    .filter(c => !c.startsWith("system.")).forEach(coll => {
-    try { out.collections[name + "." + coll] = d.getCollection(coll).getIndexes(); }
-    catch (e) { /* no privilege on this collection: skip it */ }
+    const ns = name + "." + coll;
+    try { out.collections[ns] = d.getCollection(coll).getIndexes(); }
+    catch (e) { return; /* no privilege on this collection */ }
+    try {
+      out.usage[ns] = d.getCollection(coll).aggregate([{ $indexStats: {} }]).toArray()
+        .map(u => ({ name: u.name, host: u.host, shard: u.shard || null,
+                     ops: u.accesses.ops, since: u.accesses.since }));
+    } catch (e) { /* $indexStats needs the indexStats privilege */ }
   });
 });
+// Shard keys: config.collections through mongos, or a shard's routing cache.
+for (const src of ["collections", "cache.collections"]) {
+  try {
+    db.getSiblingDB("config").getCollection(src).find({}, { key: 1 })
+      .forEach(c => { if (c.key && !out.shardKeys[c._id]) out.shardKeys[c._id] = c.key; });
+  } catch (e) { /* not a sharded cluster, or no privilege */ }
+}
 print(EJSON.stringify(out, { relaxed: true }));
 """
 

@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=61"]
+# Capped so a future setuptools cannot break the build: `license = { text }`
+# is deprecated (removal announced for 2027), and the SPDX form needs
+# setuptools 77+, which no longer installs on Python 3.8.
+requires = ["setuptools>=61,<85"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mdbkit"
-version = "0.7.0"
-description = "Offline toolkit for MongoDB 4.4 to 9.0 structured logs: slow-query shapes, index advice, incident triage, multi-instance host checks, startup configuration audit, FTDC decoding. A spiritual successor to mtools' log tools."
+version = "0.8.0"
+description = "Offline toolkit for MongoDB 4.4 to 9.0 logs and diagnostics: slow-query shapes, index advice and index usage, incident triage, sharded clusters, multi-instance hosts, startup configuration audit, FTDC decoding. A spiritual successor to mtools' log tools."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -16,14 +19,24 @@ keywords = [
     "index-advisor", "dba", "sre", "devops", "ftdc", "diagnostic-data",
     "explain-plan", "query-performance", "database-performance",
     "replica-set", "wiredtiger", "troubleshooting", "incident-response",
+    "sharding", "mongos", "sharded-cluster", "chunk-migration", "index-usage",
 ]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: System Administrators",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: OS Independent",
   "Topic :: Database",
   "Topic :: System :: Systems Administration",
 ]

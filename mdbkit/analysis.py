@@ -131,7 +131,8 @@ def extract_shape(entry: LogEntry) -> Optional[QueryShape]:
         sort_doc = command.get("sort") or {}
     elif "aggregate" in command:
         operation = "aggregate"
-        pipeline = command.get("pipeline") or []
+        pipeline = command.get("pipeline")
+        pipeline = pipeline if isinstance(pipeline, list) else []
         for stage in pipeline:
             if not isinstance(stage, dict):
                 continue
@@ -237,6 +238,13 @@ class ShapeStats:
     # MongoDB 8.3+: tracked memory per operation.
     peak_mem_bytes: int = 0
     cpu_nanos: int = 0
+    # mongos (router) lines: how many shards each execution went to, time
+    # spent waiting on the shards, and routing-table lookups.
+    shard_counts: Counter = field(default_factory=Counter)
+    remote_wait_ms: int = 0
+    routing_ms: int = 0
+    # Executions that failed (ok: 0), by MongoDB error name.
+    errors: Counter = field(default_factory=Counter)
 
     def add(self, entry: LogEntry):
         attr = entry.attr
@@ -294,6 +302,17 @@ class ShapeStats:
         self.peak_mem_bytes = max(self.peak_mem_bytes,
                                   int(max(0, num(attr.get("peakTrackedMemBytes")))))
         self.cpu_nanos += int(max(0, num(attr.get("cpuNanos"))))
+        if "nShards" in attr:
+            self.shard_counts[int(max(0, num(attr.get("nShards"))))] += 1
+        if "remoteOpWaitMillis" in attr:
+            wait = int(max(0, num(attr.get("remoteOpWaitMillis"))))
+            self.remote_wait_ms += min(wait, duration) if duration else wait
+        for key, value in attr.items():
+            if key.startswith("catalogCache") and key.endswith("DurationMillis"):
+                self.routing_ms += int(max(0, num(value)))
+        err = attr.get("errName")
+        if err:
+            self.errors[text(err)] += 1
         if not self.example:
             self.example = entry.raw[:2000]
 
@@ -307,6 +326,21 @@ class ShapeStats:
         if not self.timed_total_ms:
             return None
         return 100.0 * self.waiting_ms / self.timed_total_ms
+
+    @property
+    def routed(self) -> bool:
+        """True for a mongos (router) shape: it records nShards."""
+        return bool(self.shard_counts)
+
+    @property
+    def max_shards(self) -> int:
+        return max(self.shard_counts) if self.shard_counts else 0
+
+    def all_shard_runs(self, total_shards: int) -> int:
+        """Executions sent to every shard (scatter-gather)."""
+        if total_shards < 2:
+            return 0
+        return sum(n for k, n in self.shard_counts.items() if k >= total_shards)
 
     # -- derived metrics ---------------------------------------------------
     @property
@@ -368,6 +402,11 @@ class ShapeStats:
             "spilledBytes": self.spilled_bytes,
             "peakTrackedMemBytes": self.peak_mem_bytes or None,
             "cpuNanos": self.cpu_nanos or None,
+            "nShards": ({str(k): v for k, v in sorted(self.shard_counts.items())}
+                        if self.shard_counts else None),
+            "remoteOpWaitMs": self.remote_wait_ms if self.shard_counts else None,
+            "routingLookupMs": self.routing_ms or None,
+            "errors": dict(self.errors) or None,
         }
 
 
@@ -415,6 +454,20 @@ class BatchDedup:
                 db = text(cmd.get("$db")) or text(entry.attr.get("ns")).split(".", 1)[0]
                 return pending == "%s.%s" % (db, coll)
         return False
+
+
+# Cluster administration a mongos logs as slow operations. Their time belongs
+# to migrations and DDL, which triage reports on its own.
+SHARDING_ADMIN_OPS = frozenset({
+    "moveRange", "moveChunk", "split", "splitChunk", "shardCollection",
+    "enableSharding", "addShard", "removeShard", "reshardCollection",
+    "refineCollectionShardKey", "balancerStart", "balancerStop",
+    "balancerStatus", "mergeChunks", "mergeAllChunksOnShard",
+    "configureCollectionBalancing", "unshardCollection", "moveCollection",
+    "cleanupOrphaned", "_flushRoutingTableCacheUpdates", "flushRouterConfig",
+    "transitionToDedicatedConfigServer", "transitionFromDedicatedConfigServer",
+    "addShardToZone", "removeShardFromZone", "updateZoneKeyRange",
+})
 
 
 class QueryAggregator:
@@ -466,6 +519,9 @@ class QueryAggregator:
         if not shape.ns:
             # Commands not run against any collection (e.g. a driver
             # handshake probing for an unknown command). Not a query shape.
+            return
+        if shape.operation in SHARDING_ADMIN_OPS or shape.operation.startswith("_shardsvr") \
+                or shape.operation.startswith("_configsvr"):
             return
         if shape.operation in self.NOISE_OPS and not shape.filter_fields:
             return
@@ -681,9 +737,17 @@ class LogSummary:
     connections_accepted: int = 0
     warnings: int = 0
     errors: int = 0
+    role: Optional[str] = None           # mongos, shard, config, replica, standalone
+    repl_set: Optional[str] = None
+    config_set: Optional[str] = None
+    migrations: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
+            "role": self.role,
+            "replicaSet": self.repl_set,
+            "configServers": self.config_set,
+            "migrations": self.migrations,
             "startups": self.startups,
             "versions": self.versions,
             "hosts": self.host_info,
@@ -701,9 +765,20 @@ class LogSummary:
 
 class SummaryAggregator:
     def __init__(self):
+        from .sharding import ShardingState
         self.summary = LogSummary()
+        self._sharding = ShardingState()
+
+    def finish(self) -> LogSummary:
+        sh, s = self._sharding, self.summary
+        s.role, s.repl_set, s.config_set = sh.role, sh.repl_set, sh.config_set
+        m = sh.migration_summary()
+        if m["started"] or m["moved"] or m["failed"] or m["receiveFailed"]:
+            s.migrations = m
+        return s
 
     def consume(self, entry: LogEntry):
+        self._sharding.consume(entry)
         s = self.summary
         s.severity_counts[entry.severity] += 1
         s.component_counts[entry.component] += 1

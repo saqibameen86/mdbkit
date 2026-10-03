@@ -44,8 +44,17 @@ def render_parse_stats(stats: ParseStats) -> str:
 
 
 def render_summary(summary: LogSummary, stats: ParseStats) -> str:
+    from .sharding import ROLE_LABEL
     parts = ["== mdbkit loginfo ==", render_parse_stats(stats), ""]
     parts.append(f"server version(s): {', '.join(summary.versions) or 'not found in log'}")
+    role = getattr(summary, "role", None)
+    if role:
+        extra = ""
+        if role == "mongos" and summary.config_set:
+            extra = f" — config servers: {summary.config_set}"
+        elif summary.repl_set:
+            extra = f" — replica set {summary.repl_set}"
+        parts.append(f"role: {ROLE_LABEL.get(role, role)}{extra}")
     if summary.host_info:
         parts.append(f"host: {', '.join(dict.fromkeys(summary.host_info))}")
     parts.append(f"restarts/startups seen: {summary.startups}")
@@ -63,6 +72,12 @@ def render_summary(summary: LogSummary, stats: ParseStats) -> str:
     if getattr(summary, "slow_in_progress", 0):
         parts.append(f"still-running operations logged (8.3+): "
                      f"{summary.slow_in_progress:,}")
+    mig = getattr(summary, "migrations", None)
+    if mig:
+        parts.append(f"chunk migrations: {mig['started']:,} started here, "
+                     f"{mig['moved']:,} moved, {mig['failed']:,} failed"
+                     + (f", {mig['receiveFailed']:,} incoming failed"
+                        if mig.get("receiveFailed") else ""))
     parts.append(f"warnings: {summary.warnings:,}   errors: {summary.errors:,}")
     if summary.warnings:
         parts.append(f"  next: mdbkit filter <log> --severity W")
@@ -97,13 +112,16 @@ def _plan_core(s) -> str:
     return top[:18]
 
 
-def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
+def render_queries(results: List[ShapeStats], stats: ParseStats,
+                   total_shards: int = 0) -> str:
     parts = ["== mdbkit queries (slow query shapes) ==", render_parse_stats(stats), ""]
     if not results:
         parts.append("No slow queries found. (mongod logs operations exceeding "
                       "slowms, default 100 ms; lower slowms or enable profiling "
                       "to capture more.)")
         return "\n".join(parts)
+    if any(r.routed for r in results):
+        return _render_router_queries(results, parts, total_shards)
     rows = []
     for s in results:
         # scan ratio: handle zero-return ops (updates, deletes) gracefully
@@ -153,6 +171,50 @@ def render_queries(results: List[ShapeStats], stats: ParseStats) -> str:
             "MongoDB 8.0+ timing: %.0f%% of this time was spent waiting "
             "(tickets, locks, flow control) rather than executing — "
             "--shape N shows the split per shape." % (100.0 * waiting / total))
+    return "\n".join(parts)
+
+
+def _shards_label(s: ShapeStats) -> str:
+    if not s.shard_counts:
+        return "-"
+    lo, hi = min(s.shard_counts), max(s.shard_counts)
+    return str(hi) if lo == hi else "%d-%d" % (lo, hi)
+
+
+def _render_router_queries(results: List[ShapeStats], parts: List[str],
+                           total_shards: int = 0) -> str:
+    """A mongos log: no plans or documents examined (the shards have those),
+    but how each query was routed. The shard count comes from the shard
+    registry lines when the log has them; otherwise the most shards any
+    query reached stands in for it."""
+    seen = max(r.max_shards for r in results)
+    total = max(total_shards, seen)
+    known = total_shards >= seen and total_shards > 0
+    rows = []
+    for s in results:
+        all_runs = s.all_shard_runs(total)
+        rows.append((
+            s.shape.ns, s.shape.operation, s.count, _ms(s.total_ms),
+            _ms(s.mean_ms), _ms(s.max_ms), _shards_label(s),
+            ("%d/%d" % (all_runs, s.count)) if total >= 2 and s.routed else "-",
+            ("%.0f%%" % (100.0 * s.remote_wait_ms / s.total_ms))
+            if s.routed and s.total_ms else "-",
+            s.shape.pretty()[:55],
+        ))
+    parts.append(_table(["namespace", "op", "count", "cumMs", "mean", "max",
+                         "shards", "to all", "shard wait", "shape"], rows))
+    parts.append("")
+    parts.append(
+        "This is a mongos (router) log: it records how each query was routed,\n"
+        "while plans and documents examined are recorded on the shards.\n"
+        "shards     = shards each execution was sent to\n"
+        "to all     = executions sent to every shard (%d %s): scatter-gather,\n"
+        "             usually a filter without the shard key, or a range that\n"
+        "             spans every shard\n"
+        "shard wait = share of the time spent waiting for the shards\n"
+        "next       : mdbkit queries <shard log> for plans; mdbkit triage <this log>"
+        % (total, "in this cluster" if known else
+           "here: the most any query reached, since the log does not list the shards"))
     return "\n".join(parts)
 
 
@@ -296,8 +358,8 @@ def render_ftdc_summary(reader, file_count: int) -> str:
     parts = ["== mdbkit ftdc summary =="]
     span = ""
     if reader.first_ts and reader.last_ts:
-        span = "  %s -> %s" % (reader.first_ts.strftime("%Y-%m-%d %H:%M"),
-                               reader.last_ts.strftime("%H:%M"))
+        span = "  %s -> %s UTC" % (reader.first_ts.strftime("%Y-%m-%d %H:%M"),
+                                   reader.last_ts.strftime("%H:%M"))
     parts.append("files: %d   chunks: %d   samples: %s%s" % (
         file_count, reader.chunks, format(reader.samples, ","), span))
     if reader.errors:
@@ -421,7 +483,7 @@ def render_ftdc_timeline(reader, step: int = 60, show_internal: bool = False) ->
             else:
                 row.append(_human(max(v for _, v in pts), lb))
         rows.append(row)
-    parts.append(_table(["time"] + labels, rows))
+    parts.append(_table(["UTC"] + labels, rows))
     parts.append("")
     parts.append("Gauges show the peak within each %ds bucket; counters "
                  "(ops.*, sys.cpu.*, ...) show their rate per second." % step)
@@ -517,13 +579,34 @@ def render_shape_detail(s, stats) -> str:
     parts.append("occurrences   : %d" % s.count)
     parts.append("total time    : %s" % _ms(s.total_ms))
     parts.append("mean / max    : %s / %s" % (_ms(s.mean_ms), _ms(s.max_ms)))
-    parts.append("docs examined : %s" % format(s.docs_examined, ","))
-    parts.append("docs returned : %s" % format(s.n_returned, ","))
-    if s.n_returned:
-        parts.append("scan ratio    : %.0f examined per document returned"
-                     % s.scan_ratio)
-    parts.append("keys examined : %s" % format(s.keys_examined, ","))
+    if s.routed:
+        parts.append("docs returned : %s" % format(s.n_returned, ","))
+        parts.append("")
+        parts.append("routing (mongos)")
+        for n, runs in sorted(s.shard_counts.items()):
+            parts.append("  sent to %d shard(s) : %dx" % (n, runs))
+        if s.total_ms:
+            parts.append("  waiting on shards  : %s (%.0f%%)" % (
+                _ms(s.remote_wait_ms), 100.0 * s.remote_wait_ms / s.total_ms))
+        if s.routing_ms:
+            parts.append("  routing lookups    : %s (refreshing the routing table)"
+                         % _ms(s.routing_ms))
+        if s.max_shards >= 2:
+            parts.append("  a query sent to several shards usually has no shard key "
+                         "in its filter, or a range that spans shards")
+    else:
+        parts.append("docs examined : %s" % format(s.docs_examined, ","))
+        parts.append("docs returned : %s" % format(s.n_returned, ","))
+        if s.n_returned:
+            parts.append("scan ratio    : %.0f examined per document returned"
+                         % s.scan_ratio)
+        parts.append("keys examined : %s" % format(s.keys_examined, ","))
     parts.append("")
+    if s.errors:
+        parts.append("failed executions")
+        for name, n in s.errors.most_common(5):
+            parts.append("  %-38s %dx" % (name, n))
+        parts.append("")
     if s.plan_summaries:
         parts.append("plans observed")
         for plan, n in s.plan_summaries.most_common():
@@ -545,7 +628,7 @@ def render_shape_detail(s, stats) -> str:
             parts.append("  %-30s %dx" % (app, n))
         parts.append("")
 
-    if s.timed_count:
+    if s.timed_count and not s.routed:
         parts.append("where the time went (MongoDB 8.0+)")
         parts.append("  executing     : %s" % _ms(s.working_ms))
         parts.append("  waiting       : %s (%.0f%%) — tickets, locks, flow control"
@@ -593,6 +676,9 @@ def render_shape_detail(s, stats) -> str:
             parts.append("next: an index cannot speed up an insert. Look at "
                          "document size, the number of indexes to maintain, and "
                          "write concern.")
+    elif s.routed:
+        parts.append("next: the plan is on the shards: mdbkit queries <shard log> "
+                     "--ns %s" % s.shape.ns)
     else:
         parts.append("next: mdbkit advise <log> --ns %s" % s.shape.ns)
     return "\n".join(parts)

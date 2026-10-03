@@ -1,3 +1,3 @@
 """mdbkit — an offline toolkit for MongoDB structured logs and index advice."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

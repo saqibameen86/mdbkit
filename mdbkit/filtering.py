@@ -22,6 +22,7 @@ class Filter:
         ts_from: Optional[datetime] = None,
         ts_to: Optional[datetime] = None,
         msg_contains: Optional[str] = None,
+        failed: bool = False,
     ):
         self.component = component.upper() if component else None
         self.severity = severity.upper() if severity else None
@@ -30,6 +31,7 @@ class Filter:
         self.ts_from = ts_from
         self.ts_to = ts_to
         self.msg_contains = msg_contains.lower() if msg_contains else None
+        self.failed = failed
 
     def matches(self, entry: LogEntry) -> bool:
         if self.component and entry.component.upper() != self.component:
@@ -49,6 +51,8 @@ class Filter:
                 return False
         if self.msg_contains and self.msg_contains not in entry.msg.lower():
             return False
+        if self.failed and not entry.attr.get("errName"):
+            return False                  # operations that ended in an error
         return True
 
 

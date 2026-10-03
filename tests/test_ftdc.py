@@ -320,7 +320,7 @@ def test_streaming_stats_without_keeping_values(tmp_path):
     assert r.summary()["series"]["conns.current"]["max"] == 12
 
 
-def test_curated_covers_the_beta_detector_metrics():
+def test_curated_covers_the_checkpoint_eviction_flow_metrics():
     """Checkpoint duration, application-thread eviction and flow control are
     not reliably present in the mongod log (checkpoint timing is LOGV2_DEBUG
     level 4 on modern versions), so FTDC must carry them."""

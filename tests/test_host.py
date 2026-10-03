@@ -65,7 +65,7 @@ def test_cache_total_against_ram(report):
     f = {x.title: x for x in report.findings}
     assert f["Cache sizes vs RAM"].severity == "CRIT"     # ~11.8 GiB on 8 GiB
     defaults = f["Default cache size on a shared host"]
-    assert "3 of 8 instances" in defaults.detail
+    assert "3 of 8 mongod instances" in defaults.detail
 
 
 def test_cache_total_is_ok_with_enough_ram():

@@ -1,4 +1,4 @@
-"""`mdbkit triage` — one-command incident snapshot (beta).
+"""`mdbkit triage` — one-command incident snapshot.
 
 Answers the question a DBA has at 3 a.m.: *what happened in the last hour?*
 
@@ -11,12 +11,14 @@ Read-only, offline, single pass over the log plus optional local OS probes
 connects to a database, never mutates anything; findings carry next steps
 for a HUMAN to run.
 
-Detector validation status:
-  stable : restarts, fatal errors, connection storms, hot collections,
-           slow-query bursts, COLLSCAN volume, index builds, noise filtering
-  beta   : elections/stepdowns, slow checkpoints, eviction pressure,
-           flow control — pattern-matched from documented log messages,
-           pending broader validation (see docs/TESTING-PLAYBOOK.md).
+The detectors have been checked against real MongoDB 6.0, 7.0, 8.0 and 9.0
+servers put through the failures they look for: a primary killed with
+kill -9, a stepdown, a connection storm, flow control (secondaries frozen
+with fsyncLock), cache pressure, a checkpoint held up for over a minute,
+chunk migrations and a shard outage. That output, trimmed, is in
+tests/fixtures/real/. WiredTiger does not log eviction pressure at the
+default level, so that comes from FTDC; the log is only scanned for its
+"cache stuck" style errors.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from .analysis import BatchDedup, QueryAggregator
 from .audit import KNOWN as _AUDIT_KNOWN
 from .parser import (ID_CONN_ACCEPTED, ID_LISTENING, ID_SHUTDOWN,
                      ID_SLOW_IN_PROGRESS, ID_STARTUP, LogEntry, ParseStats,
-                     iter_entries, iter_entries_multi, num, text)
+                     expand_paths, iter_entries, iter_entries_multi, num, text)
 
 AUDIT_IDS = frozenset(_AUDIT_KNOWN)
 # "mongod startup complete", whose attr says whether the previous shutdown
@@ -42,6 +44,10 @@ ID_STARTUP_COMPLETE = 8423403
 # string), port and host; and the startup options (with storage.dbPath).
 ID_PROCESS_DETAILS = 20721
 ID_OPTIONS = 21951
+ID_FLOW_CONTROL = 22225
+ID_STEPDOWN_CMD = 21579      # "Attempting to step down in response to replSetStepDown"
+CHECKPOINT_PROGRESS = re.compile(
+    r"[Cc]heckpoint (has been running|ran) for (\d{1,9}) seconds?")
 
 
 def dbpath_of_options(entry: LogEntry) -> Optional[str]:
@@ -101,6 +107,10 @@ class TriageEngine:
                          "application thread", "cache full", "cache overflow")
     ELECTION_EVENT = ("starting an election", "election succeeded",
                       "stepping down", "stepped down")
+    # reasons that mean the primary was lost or moved on purpose, as opposed
+    # to a higher-priority member taking over a newly created set
+    FAILOVER_REASONS = ("no primary", "election timeout", "step up", "stepdown",
+                        "in response to heartbeat")
     ELECTION_STATE = ("member is in new state", "replica set state transition",
                       "transition to")
     INDEX_BUILD = ("index build", "build index", "index builds")
@@ -108,12 +118,15 @@ class TriageEngine:
     def __init__(self):
         self.qagg = QueryAggregator()
         self.dedup = BatchDedup()
+        from .sharding import ShardingState
+        self.sharding = ShardingState()
         self.startups: List = []
         self.errors: Counter = Counter()
         self.error_examples: Dict = {}
         self.conn_minutes: Counter = Counter()
         self.conn_ips: defaultdict = defaultdict(Counter)
         self.elections: List = []
+        self.election_terms: List = []   # term per election event, if logged
         self.pids: List[int] = []    # this log's mongod, one pid per start
         self.pid_starts: List = []   # (startup time, pid)
         self.initiated_at = None     # replSetInitiate: a brand-new set
@@ -121,6 +134,8 @@ class TriageEngine:
         self.checkpoints: List = []
         self.evictions = 0
         self.flow_control = 0
+        self.flow_control_first = None
+        self.flow_control_last = None
         self.dbpath: Optional[str] = None
         self.slow_minutes: Counter = Counter()
         self.collscan_count = 0
@@ -142,19 +157,40 @@ class TriageEngine:
         self.shutdown_at = None
         self.start_clean: List[bool] = []   # per startup: was it a clean restart?
         self.start_reported: List[bool] = []  # ...as stated by mongod itself
+        # Several members' logs read as one stream: the first start of each
+        # further instance is where its log begins, not a restart.
+        self.start_new_instance: List[bool] = []
+        self._start_keys: set = set()
+        self._file_history = 0          # non-startup lines so far in this file
+        self._file_shutdown = False     # a clean shutdown seen in this file
         self._shutdown_pending = False
         self.log_host = None
         self.in_progress: List = []       # 8.3+ "Slow in-progress query"
         self.audit_entries: List[LogEntry] = []
 
     # ---------------------------------------------------------- consume ----
+    def begin_file(self):
+        """A new file starts in a multi-file stream (rotated logs, or the
+        logs of several members)."""
+        self._file_history = 0
+        self._file_shutdown = False
+
+    def note_skipped(self, entry: LogEntry):
+        """An entry before the window: not analysed, but it is history."""
+        if entry.msg_id != ID_STARTUP and entry.ctx not in ("main", "-"):
+            self._file_history += 1
+
     def consume(self, entry: LogEntry):
+        self.sharding.consume(entry)
         self.seen += 1
         if not self.startups and entry.msg_id != ID_STARTUP and \
-                entry.ctx != "main":
-            # mongod writes a few lines from its "main" thread before
-            # "MongoDB starting"; anything else means the log has history.
+                entry.ctx not in ("main", "-"):
+            # mongod writes a few lines from its "main" thread (6.0 also
+            # from "-") before "MongoDB starting"; anything else means the
+            # log has history.
             self.history_before_start += 1
+        if entry.msg_id != ID_STARTUP and entry.ctx not in ("main", "-"):
+            self._file_history += 1
         if entry.ts is not None:
             self.last_seen = entry.ts
         if self.log_tz is None and entry.ts is not None:
@@ -188,9 +224,19 @@ class TriageEngine:
         elif entry.msg_id == ID_OPTIONS and not self.dbpath:
             self.dbpath = dbpath_of_options(entry)
         if entry.msg_id == ID_STARTUP:
-            self.start_clean.append(self._shutdown_pending)
+            # Which instance: its dbPath, else host and port.
+            key = text(entry.attr.get("dbPath")) or "%s:%s" % (
+                text(entry.attr.get("host")), text(entry.attr.get("port")))
+            new_here = bool(self._start_keys) and key not in self._start_keys
+            # Another instance's log (members read as one stream) that
+            # begins with its startup: where that log begins, not a restart.
+            self.start_new_instance.append(new_here and self._file_history == 0)
+            self._start_keys.add(key)
+            self.start_clean.append(self._file_shutdown if new_here
+                                    else self._shutdown_pending)
             self.start_reported.append(False)
             self._shutdown_pending = False
+            self._file_shutdown = False
             self.startups.append(entry.ts)
             self.dbpath = text(entry.attr.get("dbPath")) or self.dbpath
             self.note_pid(entry)
@@ -219,9 +265,13 @@ class TriageEngine:
         if entry.msg_id == ID_LISTENING or "waiting for connections" in msg_l:
             self.listening = True
             self.listening_at = entry.ts
-        if entry.msg_id == ID_SHUTDOWN or msg_l.startswith("shutting down"):
+        if entry.msg_id == ID_SHUTDOWN:
+            # 23138 "Shutting down" is the process going down. Many other
+            # messages start with "Shutting down ..." in normal operation:
+            # every chunk migration logs one on the recipient shard.
             self.shutdown_at = entry.ts
             self._shutdown_pending = True
+            self._file_shutdown = True
 
         if entry.component in ("REPL", "ELECTION", "REPL_HB"):
             new_state = entry.attr.get("newState")
@@ -241,16 +291,42 @@ class TriageEngine:
         if entry.component in ("REPL", "ELECTION"):
             if "replsetinitiate admin command received" in msg_l:
                 self.initiated_at = entry.ts
-            if any(p in msg_l for p in self.ELECTION_EVENT) and \
-                    "not starting" not in msg_l:
+            elif entry.msg_id == 21392 and self.initiated_at is None:
+                # "New replica set config in use" with term 0: a set that
+                # has never held an election, i.e. one being created. Only
+                # the member that ran replSetInitiate logs that command;
+                # the others see this.
+                cfg = entry.attr.get("config")
+                if isinstance(cfg, dict) and num(cfg.get("term"), -1) == 0:
+                    self.initiated_at = entry.ts
+            if entry.msg_id == ID_STEPDOWN_CMD:
+                pass        # recorded below, whatever the component
+            elif any(p in msg_l for p in self.ELECTION_EVENT) and \
+                    "not starting" not in msg_l and "shutdown" not in msg_l:
+                # (a primary stepping down because it is shutting down is
+                # part of the shutdown, which health reports on its own)
                 self.elections.append((entry.ts, entry.msg))
+                term = entry.attr.get("term")
+                self.election_terms.append(
+                    int(num(term)) if term is not None else None)
             elif any(p in msg_l for p in self.ELECTION_STATE):
                 self.state_changes.append(
                     (entry.ts, entry.msg,
                      str(entry.attr.get("newState",
                                         entry.attr.get("memberState", "")))))
-            if "flow control" in msg_l or "flow control" in wt_msg.lower():
-                self.flow_control += 1
+
+        if entry.msg_id == ID_STEPDOWN_CMD:
+            # 21579 (COMMAND) on the primary that was asked to step down
+            self.elections.append((entry.ts, "Stepping down in response to a "
+                                   "replSetStepDown command (%s)" % entry.ctx))
+            self.election_terms.append(None)
+
+        if entry.msg_id == ID_FLOW_CONTROL or "flow control is engaged" in msg_l:
+            # 22225 (STORAGE, W), every 10 s while the primary throttles
+            # writes because the majority-commit point is not moving.
+            self.flow_control += 1
+            self.flow_control_first = self.flow_control_first or entry.ts
+            self.flow_control_last = entry.ts
 
         if entry.component == "INDEX" and any(p in msg_l for p in self.INDEX_BUILD):
             ns = str(entry.attr.get("namespace") or entry.attr.get("ns") or "")
@@ -262,13 +338,13 @@ class TriageEngine:
             else:
                 self.index_builds.append((entry.ts, entry.msg, ns))
 
-        if "checkpoint" in msg_l or "checkpoint" in wt_msg.lower():
-            dur = entry.attr.get("durationMillis")
-            dur = num(dur, None) if dur is not None else None
-            if dur is None:
-                m = re.search(r"took (\d+) second", wt_msg.lower())
-                dur = int(m.group(1)) * 1000 if m else None
-            self.checkpoints.append((entry.ts, dur))
+        if "checkpoint" in wt_msg.lower() or "checkpoint" in msg_l:
+            # WiredTiger reports a checkpoint every 20 s while it runs:
+            # "Checkpoint has been running for 40 seconds and wrote: ...",
+            # and "Checkpoint ran for 61 seconds ..." when it ends.
+            m = CHECKPOINT_PROGRESS.search(wt_msg) or CHECKPOINT_PROGRESS.search(entry.msg)
+            if m:
+                self.checkpoints.append((entry.ts, int(m.group(2)), m.group(1) == "ran"))
 
         text_l = msg_l + " " + wt_msg.lower()
         if "evict" in text_l or any(p in text_l for p in self.EVICTION_PRESSURE):
@@ -333,6 +409,14 @@ class TriageEngine:
                            % (len(unhealthy), ", ".join(unhealthy)))
             next_step = ("Check those hosts directly: process alive, disk, "
                          "network reachability from this node.")
+        elif self.sharding.no_primary or self.sharding.host_failures:
+            # a mongos (or any process with a replica set monitor) that
+            # could not reach some members: serving, but not cleanly
+            sev = "WARN"
+            detail_head = ("Serving connections, but it could not reach some "
+                           "replica set members (see \"Members unreachable\" "
+                           "below).")
+            next_step = "Check those members: mdbkit triage <their logs>"
         elif self.heartbeat_errors:
             sev = "WARN"
             total = sum(self.heartbeat_errors.values())
@@ -387,39 +471,137 @@ class TriageEngine:
                     best = (ts, pid)
         return best[1] if best else None
 
+    def _checkpoint_runs(self) -> List:
+        """One (first report, seconds) per long checkpoint: WiredTiger
+        reports a running checkpoint every 20 s, with a growing count."""
+        runs: List = []
+        prev = None
+        for ts, secs, ended in self.checkpoints:
+            if prev is None or secs < prev[1] or prev[2]:
+                runs.append([ts, secs])
+            else:
+                runs[-1][1] = secs
+            prev = (ts, secs, ended)
+        # WiredTiger also reports some short checkpoints (at startup, for
+        # example, "running for 0 seconds"); only long ones matter here.
+        return [(t, secs) for t, secs in runs if secs >= 20]
+
     def _unplanned_elections(self) -> List:
         """Elections other than the first one of a newly initiated set."""
         if self.initiated_at is None:
             return list(self.elections)
+        # A new set's first election is term 1. A member with a higher
+        # priority may then take over (term 2): also part of setting the
+        # set up. A term-2 election because no primary was seen is a real
+        # failover (the first primary died), so the reason decides.
+        # "Starting an election" lines carry no term: they take the term of
+        # the election that follows within a few seconds.
+        terms = list(self.election_terms)
+        for i in range(len(terms) - 1, -1, -1):
+            if terms[i] is None and i + 1 < len(terms) and terms[i + 1] is not None:
+                t0, t1 = self.elections[i][0], self.elections[i + 1][0]
+                if t0 and t1 and 0 <= (t1 - t0).total_seconds() <= 15:
+                    terms[i] = terms[i + 1]
+        known = any(t is not None for t in terms)
         settle = self.initiated_at + timedelta(seconds=120)
-        return [(t, m) for t, m in self.elections
-                if t is None or t < self.initiated_at or t > settle]
+        term2 = " ".join(m.lower() for (_, m), t in zip(self.elections, terms) if t == 2)
+        term2_failover = any(w in term2 for w in self.FAILOVER_REASONS)
+        out = []
+        for (ts, msg), term in zip(self.elections, terms):
+            after = ts is not None and ts >= self.initiated_at
+            if after and term == 1:
+                continue
+            if after and term == 2 and ts <= settle and not term2_failover:
+                continue
+            if after and term is None and not known and ts <= settle:
+                continue
+            out.append((ts, msg))
+        return out
 
     def findings(self) -> List[Finding]:
         out: List[Finding] = [self._health_finding()]
 
         elections = self._unplanned_elections()
         if elections:
-            times = [t.strftime("%H:%M:%S") if t else "?" for t, _ in elections]
-            out.append(Finding(
-                "CRIT", "Replica set instability",
-                "%d election/stepdown event(s) at %s." % (
-                    len(elections), ", ".join(times[:6])),
-                [m for _, m in elections[:6]],
-                "Correlate with connection storms and slow checkpoints below; "
-                "check node health and network at those timestamps.",
-                beta=True))
+            msgs = " ".join(m.lower() for _, m in elections)
+            deliberate = ("priority takeover" in msgs or "step up" in msgs
+                          or "replsetstepdown" in msgs)
+
+            primaries = [t for t, _m, state in self.state_changes
+                         if t is not None and state == "PRIMARY"]
+
+            def after_own_start(ts):
+                # A member that starts and never sees a primary calls an
+                # election: a restart, not a lost primary. One that saw a
+                # primary first and then saw none, lost it.
+                for st in self.startups:
+                    if st is None or ts is None or not 0 <= (ts - st).total_seconds() <= 45:
+                        continue
+                    if not any(st <= p < ts for p in primaries):
+                        return True
+                return False
+            no_primary = [(t, m) for t, m in elections
+                          if "no primary" in m.lower() or "election timeout" in m.lower()]
+            lost = any(not after_own_start(t) for t, _ in no_primary)
+            # several members' logs are read one after another: show in time order
+            ordered = sorted(elections, key=lambda e: e[0].timestamp() if e[0]
+                             else float("inf"))
+            evidence = ["%s  %s" % (t.strftime("%H:%M:%S") if t else "?", m)
+                        for t, m in ordered[:8]]
+            if len(elections) > 8:
+                evidence.append("... and %d more" % (len(elections) - 8))
+            if lost:
+                out.append(Finding(
+                    "CRIT", "Replica set instability",
+                    "%d election/stepdown event(s); at least once a member saw "
+                    "no primary and called an election, which is what losing "
+                    "the primary (crash, kill, hang or network) looks like."
+                    % len(elections),
+                    evidence,
+                    "Find why the primary went away at the first timestamp: "
+                    "its own log (mdbkit triage on it), then the OS log "
+                    "(mdbkit oslog) for OOM kills or restarts."))
+            elif deliberate:
+                out.append(Finding(
+                    "WARN", "Elections",
+                    "%d election/stepdown event(s) that look deliberate: a "
+                    "stepdown command (replSetStepDown, \"step up request\") or "
+                    "a higher-priority member taking over. Confirm they were "
+                    "planned." % len(elections),
+                    evidence,
+                    "If nobody stepped the primary down, look for what made the "
+                    "higher-priority member return (a restart) at those times."))
+            elif no_primary:
+                out.append(Finding(
+                    "WARN", "Elections",
+                    "%d election/stepdown event(s) right after this node started: "
+                    "a member that starts and finds no primary calls an election, "
+                    "as after a restart of the whole set or of a one-member set. "
+                    "The start itself is reported separately." % len(elections),
+                    evidence,
+                    "If the restart was not planned, find out why it happened."))
+            else:
+                out.append(Finding(
+                    "WARN", "Elections",
+                    "%d election/stepdown event(s), with no reason recorded in "
+                    "this log. The member that called the election logs it: "
+                    "\"no PRIMARY\" means the primary was lost; \"priority "
+                    "takeover\" or \"step up request\" means it was moved."
+                    % len(elections),
+                    evidence,
+                    "Run mdbkit triage on the other members' logs for the same "
+                    "time."))
         elif self.elections:
             out.append(Finding(
                 "INFO", "Replica set created",
                 "The set was initiated at %s and elected its first primary "
                 "straight after. That is how a new replica set starts, not "
                 "instability." % self.initiated_at.strftime("%H:%M:%S"),
-                [m for _, m in self.elections[:4]], beta=True))
+                [m for _, m in sorted(self.elections, key=lambda e: e[0].timestamp()
+                                      if e[0] else float("inf"))[:4]]))
         else:
             out.append(Finding("OK", "Replica set",
-                               "No election or stepdown messages in window.",
-                               beta=True))
+                               "No election or stepdown messages in window."))
 
         log_begins_with_start = (len(self.startups) == 1 and self.at_file_start
                                  and self.history_before_start == 0)
@@ -444,15 +626,21 @@ class TriageEngine:
                 next_step="If it was not planned: mdbkit oslog /var/log/syslog "
                           "(OOM kills, fd limits), or the previous rotated log."))
         elif self.startups:
-            starts = list(zip(self.startups, self.start_clean))
+            starts = list(zip(self.startups, self.start_clean, self.start_reported,
+                              self.start_new_instance))
             first_crashed = []
             if self.at_file_start and self.history_before_start == 0:
                 # Where the log begins: only a crash if mongod says so.
                 if self.start_reported[:1] == [True] and not self.start_clean[0]:
                     first_crashed = [self.startups[0]]
                 starts = starts[1:]
+            # Where another member's log begins: likewise.
+            first_crashed += [t for t, clean, said, new in starts
+                              if new and said and not clean]
+            starts = [(t, clean) for t, clean, _, new in starts if not new]
             crashed = first_crashed + [t for t, clean in starts if not clean]
             planned = [t for t, clean in starts if clean]
+            crashed.sort(key=lambda t: t.timestamp() if t else float("inf"))
             fmt = lambda ts: ", ".join(t.strftime("%H:%M:%S") if t else "?"
                                        for t in ts[:5])
             if crashed:
@@ -514,16 +702,22 @@ class TriageEngine:
                 "(admin/config/local) — normal startup housekeeping." %
                 self.system_index_builds))
 
-        slow_cp = [(t, d) for t, d in self.checkpoints if d and d >= 60_000]
-        if slow_cp:
-            worst = max(d for _, d in slow_cp)
+        runs = self._checkpoint_runs()
+        if runs:
+            slow = [(t, secs) for t, secs in runs if secs >= 60]
+            worst = max(secs for _, secs in runs)
+            evidence = ["%s  a checkpoint that ran for at least %ds"
+                        % (t.strftime("%H:%M:%S") if t else "?", secs)
+                        for t, secs in runs[:6]]
             out.append(Finding(
-                "WARN", "Slow WiredTiger checkpoints (log)",
-                "%d checkpoint(s) over 60s (worst %.1fs). Usually disk I/O "
-                "saturation or a large dirty cache." % (
-                    len(slow_cp), worst / 1000.0),
-                next_step="Check disk latency/utilisation at those times.",
-                beta=True))
+                "WARN" if slow else "INFO", "Slow WiredTiger checkpoints (log)",
+                "%d checkpoint(s) ran for 20s or more, %d of them over 60s; "
+                "the longest at least %ds. Checkpoints normally start every "
+                "60s, so a long one delays the next and leaves more dirty "
+                "data in the cache." % (len(runs), len(slow), worst),
+                evidence,
+                next_step="Check disk latency and utilisation at those times "
+                          "(mdbkit ftdc timeline on diagnostic.data shows both)."))
 
         if self.evictions:
             out.append(Finding(
@@ -532,15 +726,23 @@ class TriageEngine:
                 "doing eviction work (cache too small or workload spike)." %
                 self.evictions,
                 next_step="Compare WT cache used vs configured: "
-                          "db.serverStatus().wiredTiger.cache", beta=True))
+                          "db.serverStatus().wiredTiger.cache"))
 
         if self.flow_control:
+            first, last = self.flow_control_first, self.flow_control_last
             out.append(Finding(
                 "WARN", "Flow control engaged",
-                "%d flow-control message(s): the primary throttled writes "
-                "because the majority-commit point lagged." % self.flow_control,
-                next_step="Check secondary health and replication lag.",
-                beta=True))
+                "The primary throttled writes because the majority-commit "
+                "point stopped moving: %d warning(s) between %s and %s (it "
+                "repeats every 10s while engaged)." % (
+                    self.flow_control,
+                    first.strftime("%H:%M:%S") if first else "?",
+                    last.strftime("%H:%M:%S") if last else "?"),
+                next_step="Find the secondary that fell behind: its log and "
+                          "metrics at that time (disk, CPU, a long-running "
+                          "operation, fsyncLock), or a network problem."))
+        from .sharding import findings as sharding_findings
+        out.extend(sharding_findings(self.sharding, self.qagg.results()))
         return out
 
     def _storm_finding(self) -> Finding:
@@ -622,6 +824,10 @@ class TriageEngine:
         # A dominant share of a trivial total is not an incident.
         sev = ("WARN" if share >= 50 and len(shapes) >= 3 and ms >= 5_000
                else "INFO")
+        if ms < 100:
+            # (e.g. slowms 0 logs every operation, most of them 0 ms)
+            out.extend(self._waiting_findings(shapes))
+            return out
         out.append(Finding(
             sev, "Hot collection",
             "%s accounts for %.0f%% of slow-query time (%.1fs)." % (
@@ -630,7 +836,8 @@ class TriageEngine:
                 s.shape.ns, s.shape.operation, s.count, _ms(s.total_ms),
                 s.shape.pretty()[:60])
              for s in shapes[:3]],
-            "mdbkit advise <log> --ns %s" % ns))
+            ("Plans are in the shard logs: mdbkit advise <shard log> --ns %s" % ns
+             if self.sharding.role == "mongos" else "mdbkit advise <log> --ns %s" % ns)))
 
         out.extend(self._waiting_findings(shapes))
         return out
@@ -703,7 +910,7 @@ class TriageEngine:
         sev = "CRIT" if crit else ("WARN" if warn else "INFO")
         return [Finding(
             sev, "Startup configuration",
-            "mongod reported %d configuration warning(s) at startup "
+            "the server reported %d configuration warning(s) at startup "
             "(%d critical)." % (len(res.items), len(crit)),
             ["%s (%s)" % (i.title, i.severity.lower()) for i in res.items[:5]],
             "Details and fixes: mdbkit audit <log>")]
@@ -853,9 +1060,18 @@ def pick_mongod(running: List[Tuple[int, List[str]]],
 
 def sysprobe(dbpath_from_log: Optional[str],
              explicit: Optional[str] = None,
-             log_pids: Optional[List[int]] = None) -> List[Finding]:
+             log_pids: Optional[List[int]] = None,
+             router: bool = False) -> List[Finding]:
     """Local OS probes. Stdlib only, no shell-outs, all failures soft."""
     out: List[Finding] = []
+    if router and not explicit:
+        # A mongos has no dbPath. Guessing one would report some other
+        # process's disk as this one's.
+        out.append(Finding(
+            "INFO", "System probes",
+            "This is a mongos log: it has no dbPath, so only memory and load "
+            "are checked."))
+        return out + _host_probes()
     running = find_mongods()
     if explicit:
         dbpath, how = explicit, "--dbpath"
@@ -935,7 +1151,11 @@ def sysprobe(dbpath_from_log: Optional[str],
             "Free space or extend the volume — a full dbPath stops writes."))
     except OSError as exc:
         out.append(Finding("INFO", "Disk probe unavailable", str(exc)))
+    return out + _host_probes()
 
+
+def _host_probes() -> List[Finding]:
+    out: List[Finding] = []
     try:
         info = {}
         with open("/proc/meminfo") as fh:
@@ -965,19 +1185,20 @@ def sysprobe(dbpath_from_log: Optional[str],
                            next_step="" if sev == "OK" else
                            "Find the cost: mdbkit queries <log> --sort totalMs "
                            "--limit 10"))
-    except OSError:
+    except (OSError, AttributeError):          # no load average on Windows
         out.append(Finding("INFO", "Load probe unavailable", ""))
     return out
 
 
 # ------------------------------------------------------------------ run ----
 
-def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
+def ftdc_findings(path: str, ts_from=None, ts_to=None, tz=None) -> List[Finding]:
     """Turn decoded FTDC metrics into triage findings.
 
     FTDC is MongoDB's own flight recorder: it already holds CPU, memory,
     cache and connection history for every node, with no monitoring stack
-    installed. This reads it offline.
+    installed. This reads it offline. Times are shown in `tz` (the log's
+    UTC offset) so they line up with the log findings; FTDC itself is UTC.
     """
     from .ftdc import FtdcReader, ftdc_files
     out: List[Finding] = []
@@ -996,10 +1217,23 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
                       % (len(files), reader.skipped))
         return [Finding("INFO", "FTDC", detail)]
 
+    def hm(t, secs=False, label=True):
+        if t is None:
+            return "?"
+        if tz is not None and t.tzinfo is not None:
+            return t.astimezone(tz).strftime("%H:%M:%S" if secs else "%H:%M")
+        return t.strftime("%H:%M:%S" if secs else "%H:%M") + (" UTC" if label else "")
+
+    def dur(seconds):
+        seconds = int(round(seconds))
+        return ("%ds" % seconds if seconds < 120 else
+                "%dm" % round(seconds / 60.0) if seconds < 7200 else
+                "%.1fh" % (seconds / 3600.0))
+
+    step = reader.sample_secs or 1
     span = ""
     if reader.first_ts and reader.last_ts:
-        span = " (%s -> %s)" % (reader.first_ts.strftime("%H:%M"),
-                                reader.last_ts.strftime("%H:%M"))
+        span = " (%s -> %s)" % (hm(reader.first_ts, label=False), hm(reader.last_ts))
     out.append(Finding(
         "INFO", "FTDC metrics",
         "Decoded %d chunk(s), %d sample(s) from %d file(s)%s." % (
@@ -1007,13 +1241,22 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
 
     pct = reader.cache_pct()
     if pct is not None:
-        sev = "CRIT" if pct >= 95 else "WARN" if pct >= 90 else "OK"
+        hot = reader.cache_hot_samples * step
+        dirty = reader.dirty_pct_peak
+        detail = "Peak %.0f%% full%s." % (
+            pct, ", %.0f%% dirty" % dirty if dirty is not None else "")
+        if hot:
+            detail += (" Past WiredTiger's default eviction triggers (95%% "
+                       "full or 20%% dirty, where application threads start "
+                       "helping to evict) for %s in total, between %s and %s." % (dur(hot), hm(reader.cache_hot_first, True, False),
+                                                hm(reader.cache_hot_last, True)))
+        sev = "WARN" if hot >= 60 else "INFO" if hot or pct >= 80 else "OK"
         out.append(Finding(
-            sev, "WiredTiger cache",
-            "Peak usage %.0f%% of configured maximum." % pct,
-            next_step="" if sev == "OK" else
-            "Sustained pressure above 95%% forces application threads to "
-            "evict, which shows up as slow queries."))
+            sev, "WiredTiger cache", detail,
+            next_step="" if sev != "WARN" else
+            "Read the eviction finding below: if application threads spent "
+            "real time evicting, operations were slowed by it. A larger "
+            "cache, a smaller working set or fewer bulk writes at once help."))
 
     conns = reader.series.get("conns.current")
     if conns and conns.values:
@@ -1046,36 +1289,74 @@ def ftdc_findings(path: str, ts_from=None, ts_to=None) -> List[Finding]:
     # the log: mongod does not log checkpoint duration at default verbosity,
     # and eviction pressure has no log line at all. FTDC records all three.
     cp = reader.series.get("checkpoint.lastMs")
-    if cp and cp.vmax is not None:
+    if cp and cp.vmax:
         worst = cp.vmax / 1000.0
-        sev = "WARN" if worst >= 60 else "INFO"
+        sev = "WARN" if worst >= 60 else "INFO" if worst >= 10 else "OK"
         out.append(Finding(
             sev, "Checkpoints (FTDC)",
-            "Longest checkpoint in window %.1fs." % worst,
-            next_step="" if sev == "INFO" else
+            "Longest checkpoint in window %.1fs%s." % (
+                worst, " (they normally run every 60s, so one this long "
+                "starts the next late)" if sev == "WARN" else ""),
+            next_step="" if sev != "WARN" else
             "Sustained long checkpoints usually mean disk saturation or a "
             "large dirty cache; correlate with disk metrics."))
 
-    evict = reader.rate("evict.appThreadPages")
-    if evict is not None and evict > 0:
-        sev = "WARN" if evict >= 1 else "INFO"
+    # Time application threads spent evicting (all versions); the page
+    # count it replaced is gone from 8.0's statistics. Judged on the
+    # busiest minute: a window average hides a short incident.
+    ev = reader.series.get("evict.appThreadMicros")
+    pages = reader.series.get("evict.appThreadPages")
+    avg = reader.rate("evict.appThreadMicros")
+    if ev is not None and (ev.peak_rate is not None or avg is not None):
+        # under a minute of data has no busiest minute: use the average
+        peak_ms = (ev.peak_rate if ev.peak_rate is not None else avg) / 1000.0
+        if peak_ms < 1:
+            out.append(Finding("OK", "Cache eviction (FTDC)",
+                               "Application threads did (almost) no eviction "
+                               "work; background eviction kept up."))
+        else:
+            sev = "WARN" if peak_ms >= 100 else "INFO"
+            out.append(Finding(
+                sev, "Cache eviction pressure (FTDC)",
+                "Application threads had to evict pages themselves: %.0f ms "
+                "per second in the busiest minute (from %s), %.1f ms/s on "
+                "average. Time an operation spends evicting is time it is not "
+                "doing its own work." % (peak_ms, hm(ev.peak_rate_ts),
+                                         (avg or 0) / 1000.0)
+                if ev.peak_rate is not None else
+                "Application threads had to evict pages themselves: %.0f ms "
+                "per second (less than a minute of metrics). Time an operation "
+                "spends evicting is time it is not doing its own work." % peak_ms,
+                next_step="" if sev == "INFO" else
+                "Compare with the WiredTiger cache finding above; a larger "
+                "cache, a smaller working set or spreading out bulk writes "
+                "relieves it."))
+    elif pages is not None and pages.peak_rate is not None and pages.peak_rate >= 1:
+        sev = "WARN" if pages.peak_rate >= 100 else "INFO"
         out.append(Finding(
             sev, "Cache eviction pressure (FTDC)",
-            "Application threads evicted ~%.1f pages/s. When user operations "
-            "have to evict, the cache is not keeping up." % evict,
+            "Application threads evicted up to %.0f pages/s (busiest minute, "
+            "from %s). When user operations have to evict, the cache is not "
+            "keeping up." % (pages.peak_rate, hm(pages.peak_rate_ts)),
             next_step="" if sev == "INFO" else
             "Compare cache used vs configured above; consider a larger "
             "WiredTiger cache or reducing the working set."))
 
     lagged = reader.series.get("flowControl.isLagged")
-    fc_wait = reader.rate("flowControl.waitMicros")
+    fc_wait = reader.series.get("flowControl.waitMicros")
     if lagged and lagged.vmax:
+        waited = fc_wait.increase / 1e6 if fc_wait and fc_wait.increase else None
         out.append(Finding(
             "WARN", "Flow control engaged (FTDC)",
-            "The primary throttled writes because the majority-commit point "
-            "lagged%s." % ("; ~%.0f ms/s spent waiting" % (fc_wait / 1000.0)
-                           if fc_wait else ""),
-            next_step="Check secondary health and replication lag."))
+            "The majority-commit point fell behind, so the primary throttled "
+            "writes: lagged for %s between %s and %s%s." % (
+                dur(lagged.nonzero * step), hm(lagged.first_nonzero_ts, True, False),
+                hm(lagged.last_nonzero_ts, True),
+                "; writers spent %s in total waiting for flow-control tickets"
+                % dur(waited) if waited else ""),
+            next_step="Find the secondary that fell behind: replication lag "
+                      "and secondary health (disk, CPU, a long-running "
+                      "operation, fsyncLock) at that time."))
 
     mem = reader.series.get("mem.residentMB")
     if mem and mem.values:
@@ -1131,6 +1412,31 @@ def find_diagnostic_data(dbpath: Optional[str]) -> Optional[str]:
                 return candidate
         except OSError:
             return None
+    return None
+
+
+def find_router_ftdc(logpath: str) -> Optional[str]:
+    """mongos keeps FTDC next to its log, named after it: mongos.log ->
+    mongos.diagnostic.data. A rotated or compressed log (mongos.log.1.gz)
+    belongs to the same directory."""
+    folder, name = os.path.split(logpath)
+    if name.endswith(".gz"):
+        name = name[:-3]
+    stems = []
+    if ".log" in name:
+        stems.append(name[:name.index(".log")])        # mongos.log.2026-10-01
+    stems.append(os.path.splitext(name)[0])            # last extension only
+    stems.append(name.split(".", 1)[0])                # every extension
+    for stem in stems:
+        if not stem:
+            continue
+        candidate = os.path.join(folder, stem + ".diagnostic.data")
+        if os.path.isdir(candidate):
+            try:
+                if any(n.startswith("metrics.") for n in os.listdir(candidate)):
+                    return candidate
+            except OSError:
+                return None
     return None
 
 
@@ -1192,8 +1498,10 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
     if window_min and paths != ["-"]:
         pre = ParseStats()
         early: List[LogEntry] = []
+        from .sharding import ID_SHARD_REGISTRY
         for e in iter_entries_multi(paths, pre):
-            if e.msg_id in (ID_STARTUP, ID_PROCESS_DETAILS, ID_OPTIONS):
+            if e.msg_id in (ID_STARTUP, ID_PROCESS_DETAILS, ID_OPTIONS) or \
+                    e.msg_id in ID_SHARD_REGISTRY:
                 early.append(e)
         if pre.last_ts:
             cutoff = pre.last_ts - timedelta(minutes=window_min)
@@ -1206,22 +1514,33 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
         # The process that wrote the log may have started before the
         # window; its pid and dbPath still identify it on this host.
         for e in early:
+            # What the process is (mongos, shard, config server) and which
+            # shards exist are logged at startup, usually before the window.
+            if e.msg_id == ID_OPTIONS or e.msg_id in ID_SHARD_REGISTRY:
+                engine.sharding.consume(e)
+            if e.msg_id in ID_SHARD_REGISTRY:
+                continue
             if e.msg_id == ID_OPTIONS:
                 engine.dbpath = engine.dbpath or dbpath_of_options(e)
                 continue
             engine.note_pid(e)
             engine.dbpath = text(e.attr.get("dbPath")) or engine.dbpath
-    for entry in iter_entries_multi(paths, stats):
-        if cutoff and entry.ts and entry.ts < cutoff:
-            continue
-        engine.consume(entry)
+    for path in expand_paths(paths):
+        engine.begin_file()
+        for entry in iter_entries(path, stats):
+            if cutoff and entry.ts and entry.ts < cutoff:
+                engine.note_skipped(entry)
+                continue
+            engine.consume(entry)
 
     findings = engine.findings()
     resolved_dbpath = None
+    router = engine.sharding.role == "mongos"
     if not no_sysprobe:
-        resolved_dbpath = dbpath or discover_dbpath(engine.dbpath)[0]
+        if not router:
+            resolved_dbpath = dbpath or discover_dbpath(engine.dbpath)[0]
         findings += sysprobe(engine.dbpath, explicit=dbpath,
-                             log_pids=engine.pids)
+                             log_pids=engine.pids, router=router)
     if not ftdc_path:
         # Only auto-discover local metrics when the log actually belongs to
         # this machine. Correlating one host's log with another host's
@@ -1238,14 +1557,24 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
                 next_step="If you copied the metrics too, pass "
                           "--ftdc /path/to/diagnostic.data"))
         else:
-            auto = find_diagnostic_data(resolved_dbpath or dbpath
-                                        or engine.dbpath)
+            auto, where = None, "next to the dbPath"
+            if router:
+                # mongos has no dbPath; it writes FTDC next to its log,
+                # named after it: mongos.log -> mongos.diagnostic.data.
+                # Looking anywhere else would find a mongod's metrics.
+                files = [p for p in expand_paths(paths) if p != "-"]
+                if files:
+                    auto = find_router_ftdc(files[-1])
+                    where = "next to the log"
+            else:
+                auto = find_diagnostic_data(resolved_dbpath or dbpath
+                                            or engine.dbpath)
             if auto:
                 ftdc_path = auto
                 findings.append(Finding(
                     "INFO", "FTDC discovered",
-                    "Using %s (found next to the dbPath). Pass --ftdc to "
-                    "override." % auto))
+                    "Using %s (found %s). Pass --ftdc to "
+                    "override." % (auto, where)))
     if ftdc_path:
         try:
             # Bound the decode even when the log's window does not overlap
@@ -1266,7 +1595,12 @@ def run_triage(logfile: str, window_min: Optional[int] = None,
             effective = cutoff
             if floor and (effective is None or effective < floor):
                 effective = floor
-            findings += ftdc_findings(ftdc_path, ts_from=effective)
+            # and not past the end of the log, so metrics and log describe
+            # the same time
+            findings += ftdc_findings(
+                ftdc_path, ts_from=effective,
+                ts_to=stats.last_ts + timedelta(minutes=1) if stats.last_ts else None,
+                tz=stats.last_ts.tzinfo if stats.last_ts else None)
         except Exception as exc:  # never let metrics break log triage
             findings.append(Finding("INFO", "FTDC unavailable", str(exc)[:200]))
     # OS-level events. The mongod log cannot record its own OOM kill: the
@@ -1330,8 +1664,6 @@ def render_triage(findings: List[Finding], stats: ParseStats, cutoff) -> str:
     parts.append("")
     parts.append("Window defaults to the last 60 minutes of log time "
                  "(--window N, or --window 0 for the whole file).")
-    parts.append("Checkpoint, eviction and flow-control detectors are marked "
-                 "[beta] and pending validation against real incident logs.")
     parts.append("mdbkit is read-only: it never runs commands against your "
                  "cluster. Review every next step before acting.")
     return "\n".join(parts)

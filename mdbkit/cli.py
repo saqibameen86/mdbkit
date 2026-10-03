@@ -39,12 +39,12 @@ def cmd_loginfo(args) -> int:
         agg.consume(entry)
     _warn_if_pre44(stats)
     if args.json:
-        out = agg.summary.to_dict()
+        out = agg.finish().to_dict()
         out["parse"] = {"lines": stats.total_lines, "parsed": stats.parsed,
                         "unparsed": stats.unparsed}
         print(dump_json(out))
     else:
-        print(render_summary(agg.summary, stats))
+        print(render_summary(agg.finish(), stats))
     return 0
 
 
@@ -53,8 +53,13 @@ def cmd_queries(args) -> int:
     stats = ParseStats()
     agg = QueryAggregator(min_ms=args.min_ms,
                           include_system=getattr(args, "include_system", False))
+    from .sharding import ID_SHARD_REGISTRY, ShardingState
+    from .triage import ID_OPTIONS
+    shards = ShardingState()      # only how many shards the cluster has
     for entry in iter_entries_multi(args.logfile, stats):
         agg.consume(entry)
+        if entry.msg_id == ID_OPTIONS or entry.msg_id in ID_SHARD_REGISTRY:
+            shards.consume(entry)
     _warn_if_pre44(stats)
     results = agg.results(sort_by=args.sort, limit=args.limit)
     if agg.skipped_system:
@@ -76,13 +81,26 @@ def cmd_queries(args) -> int:
     if args.report:
         from .report import Report, stamp
         rep = Report("MongoDB slow query analysis", stamp())
-        rows = [[s.shape.ns, s.shape.operation, s.count, s.total_ms,
-                 round(s.mean_ms), s.max_ms, s.docs_examined,
-                 ("%.0f:1" % s.scan_ratio) if s.n_returned else "-",
-                 s.shape.pretty()[:80]] for s in results]
-        rep.table("Slow query shapes",
-                  ["namespace", "op", "count", "cumMs", "mean", "max",
-                   "docsEx", "scan", "shape"], rows)
+        if any(r.routed for r in results):
+            # a mongos log: routing, not plans (the shards have those)
+            from .render import _shards_label
+            total = max([shards.total_shards] + [r.max_shards for r in results])
+            rows = [[s.shape.ns, s.shape.operation, s.count, s.total_ms,
+                     round(s.mean_ms), s.max_ms, _shards_label(s),
+                     ("%d/%d" % (s.all_shard_runs(total), s.count))
+                     if total >= 2 and s.routed else "-",
+                     s.shape.pretty()[:80]] for s in results]
+            rep.table("Slow query shapes (mongos)",
+                      ["namespace", "op", "count", "cumMs", "mean", "max",
+                       "shards", "to all %d" % total, "shape"], rows)
+        else:
+            rows = [[s.shape.ns, s.shape.operation, s.count, s.total_ms,
+                     round(s.mean_ms), s.max_ms, s.docs_examined,
+                     ("%.0f:1" % s.scan_ratio) if s.n_returned else "-",
+                     s.shape.pretty()[:80]] for s in results]
+            rep.table("Slow query shapes",
+                      ["namespace", "op", "count", "cumMs", "mean", "max",
+                       "docsEx", "scan", "shape"], rows)
         rep.text("Note",
                  "cumMs is time summed across all occurrences of a shape, not "
                  "a single query. Literal values are never included: these are "
@@ -92,7 +110,7 @@ def cmd_queries(args) -> int:
     if args.json:
         print(dump_json([s.to_dict() for s in results]))
     else:
-        print(render_queries(results, stats))
+        print(render_queries(results, stats, total_shards=shards.total_shards))
     return 0
 
 
@@ -135,6 +153,7 @@ def cmd_filter(args) -> int:
             ts_from=parse_when(args.ts_from) if args.ts_from else None,
             ts_to=parse_when(args.ts_to) if args.ts_to else None,
             msg_contains=args.msg,
+            failed=args.failed,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -208,6 +227,21 @@ def cmd_advise(args) -> int:
     results = agg.results()
     if args.ns:
         results = [r for r in results if r.shape.ns == args.ns]
+    if results and all(r.routed or not r.plan_summaries for r in results) \
+            and any(r.routed for r in results):
+        msg = ("This is a mongos (router) log. Index advice needs query plans "
+               "and documents examined, which are recorded in the shard logs, "
+               "not on the router.\n"
+               "  Run: mdbkit advise <a shard's mongod.log>\n"
+               "  On this log, mdbkit queries and mdbkit triage show which "
+               "queries went to every shard.")
+        if args.json:
+            # same shape as any other advise --json: a list of recommendations
+            print("note: " + msg.split("\n")[0], file=sys.stderr)
+            print(dump_json([]))
+        else:
+            print(msg)
+        return 0
     recs = advise(results, indexes=indexes, schema=schema,
                   min_count=args.min_count)
     if not args.indexes:
@@ -347,8 +381,14 @@ def _ftdc_window(path, args):
     """
     from .ftdc import ftdc_files, iter_documents, chunk_timestamp
     from datetime import timedelta
-    ts_from = parse_when(args.ts_from) if args.ts_from else None
-    ts_to = parse_when(args.ts_to) if args.ts_to else None
+    from datetime import timezone
+
+    def utc(v):
+        # FTDC time is UTC; a value without an offset is read as UTC too
+        t = parse_when(v)
+        return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t
+    ts_from = utc(args.ts_from) if args.ts_from else None
+    ts_to = utc(args.ts_to) if args.ts_to else None
     if ts_from or ts_to or getattr(args, "all", False):
         return ts_from, ts_to, None
     minutes = parse_duration(args.last) if args.last else 240
@@ -522,6 +562,22 @@ def cmd_host(args) -> int:
     return 0
 
 
+def cmd_indexes(args) -> int:
+    from .indexusage import analyse, render
+    try:
+        rep = analyse(args.files, ns_filter=args.ns)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        print(dump_json(rep.to_dict()))
+    else:
+        print(render(rep, min_days=args.min_days))
+    if args.exit_code:
+        return 1 if any(f.kind in ("unused", "redundant") for f in rep.findings) else 0
+    return 0
+
+
 def cmd_compare(args) -> int:
     from .compare import aggregate_file, compare
     from .render import render_compare
@@ -600,20 +656,35 @@ def cmd_lab(args) -> int:
     from . import lab
     try:
         if args.lab_action == "start":
-            state = lab.start(directory=args.dir, nodes=args.nodes,
-                              base_port=args.port, slowms=args.slowms,
-                              standalone=args.standalone, echo=_lab_echo)
+            if args.shards and args.standalone:
+                print("error: --shards and --standalone cannot be combined",
+                      file=sys.stderr)
+                return 2
+            nodes = args.nodes or (1 if args.shards else 3)
+            # what was asked for explicitly, so an existing lab made with
+            # other options is refused instead of silently restarted as is
+            requested = {k: v for k, v in (
+                ("shards", args.shards), ("nodes", args.nodes),
+                ("standalone", args.standalone or None),
+                ("port", args.port), ("slowms", args.slowms)) if v is not None}
+            state = lab.start(directory=args.dir, nodes=nodes,
+                              base_port=args.port or lab.DEFAULT_BASE_PORT,
+                              slowms=args.slowms if args.slowms is not None else 0,
+                              standalone=args.standalone,
+                              shards=args.shards or 0, echo=_lab_echo,
+                              requested=requested)
             print("")
             print("lab ready: %s" % lab.connection_string(state))
             print("directory: %s" % state["dir"])
             for n in state["nodes"]:
-                print("  node%d  port %d  log %s"
-                      % (n["index"], n["port"], n["log"]))
+                print("  %-9s %-10s port %d  log %s"
+                      % (n.get("name") or "node%d" % n["index"],
+                         n.get("role") or "", n["port"], n["log"]))
             print("")
             print("Next:")
             print("  mdbkit lab seed                     # sample data + workload")
-            print("  mdbkit queries %s" % state["nodes"][0]["log"])
-            print("  mdbkit lab destroy                  # remove it all")
+            print("  mdbkit queries %s" % lab.log_paths(state)[0])
+            print("  mdbkit lab destroy --yes            # remove it all")
         elif args.lab_action == "status":
             state = lab.status(args.dir)
             if not state:
@@ -622,17 +693,24 @@ def cmd_lab(args) -> int:
             print("lab in %s (created %s)" % (state["dir"], state["createdAt"]))
             print("connection: %s" % lab.connection_string(state))
             for n in state["nodes"]:
-                print("  node%d  port %-6d pid %-8s %s"
-                      % (n["index"], n["port"], n.get("pid") or "-",
+                print("  %-9s %-10s port %-6d pid %-8s %s"
+                      % (n.get("name") or "node%d" % n["index"],
+                         n.get("role") or "", n["port"], n.get("pid") or "-",
                          "running" if n.get("running") else "stopped"))
         elif args.lab_action == "seed":
-            ok = lab.seed(args.dir, docs=args.docs, echo=_lab_echo)
+            ok = lab.seed(args.dir, docs=args.docs, echo=_lab_echo,
+                          workload_only=args.workload_only)
             if ok:
                 state = lab.status(args.dir)
                 print("")
                 print("Now analyse what it produced:")
-                print("  mdbkit queries %s" % state["nodes"][0]["log"])
-                print("  mdbkit advise %s" % state["nodes"][0]["log"])
+                first = lab.log_paths(state)[0]
+                print("  mdbkit queries %s" % first)
+                print("  mdbkit advise %s" % first)
+                if state.get("sharded"):
+                    from .lab import DEFAULT_DIR
+                    print("  mdbkit triage $(mdbkit lab logs%s | head -1) --window 0"
+                          % ("" if args.dir == DEFAULT_DIR else " --dir %s" % args.dir))
         elif args.lab_action == "stop":
             n = lab.stop(args.dir, echo=_lab_echo)
             print("stopped %d node(s)" % n)
@@ -669,10 +747,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mdbkit",
         description=(
-            "Offline toolkit for MongoDB 4.4+ structured logs: log summaries, "
-            "slow-query analysis, connection churn, log filtering, and "
-            "deterministic candidate-index advice. A spiritual successor to "
-            "mtools' log tools. Never connects to a network."
+            "Offline toolkit for MongoDB 4.4+ logs and diagnostics: slow "
+            "queries, index advice and usage, incident triage, sharded "
+            "clusters, hosts running many mongods, startup configuration, "
+            "FTDC metrics. Analysis commands are read-only and never connect "
+            "to anything; only `lab` starts processes."
         ),
     )
     p.add_argument("--version", action="version", version=f"mdbkit {__version__}")
@@ -685,7 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "stream, e.g. \"mongod.log*\"")
         sp.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
-    sp = sub.add_parser("loginfo", help="overall log summary (versions, restarts, counts)")
+    sp = sub.add_parser("loginfo", help="overall log summary: version, role, restarts, migrations, counts")
     add_common(sp)
     sp.set_defaults(func=cmd_loginfo)
 
@@ -722,6 +801,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--from", dest="ts_from", help="ISO timestamp lower bound")
     sp.add_argument("--to", dest="ts_to", help="ISO timestamp upper bound")
     sp.add_argument("--msg", help="substring match on the msg field")
+    sp.add_argument("--failed", action="store_true",
+                    help="only operations that failed (logged with an errName)")
     sp.add_argument("--limit", type=NON_NEG, metavar="N",
                     help="print only the first N matching lines")
     sp.add_argument("--last", type=POSITIVE, metavar="N",
@@ -763,14 +844,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_explain)
 
     sp = sub.add_parser("triage",
-                        help="one-command incident snapshot (beta): elections, "
-                             "storms, hot collections, errors + local disk/"
-                             "memory/load probes")
+                        help="one-command incident snapshot: crashes, elections, "
+                             "storms, flow control, cache pressure, sharding, "
+                             "hot collections, errors + local disk/memory probes")
     sp.add_argument("logfile", nargs="+",
                     help="mongod log file(s) or a glob, or '-' for stdin")
     sp.add_argument("--window", type=NON_NEG, metavar="MINUTES",
                     help="analyze only the last N minutes of log time "
-                         "(default: whole file)")
+                         "(default 60; 0 = the whole file)")
     sp.add_argument("--dbpath", help="override dbPath for the disk probe")
     sp.add_argument("--no-sysprobe", action="store_true",
                     help="skip local disk/memory/load probes")
@@ -849,6 +930,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_host)
 
+    sp = sub.add_parser("indexes",
+                        help="unused and redundant indexes, from "
+                             "`mdbkit export-script indexes` output")
+    sp.add_argument("files", nargs="+", metavar="FILE",
+                    help="index export(s); give one per replica set member to "
+                         "combine their usage counters")
+    sp.add_argument("--ns", help="only this namespace (db.collection)")
+    sp.add_argument("--min-days", type=POSITIVE, default=7, metavar="N",
+                    help="warn when usage counters cover fewer days (default 7)")
+    sp.add_argument("--exit-code", action="store_true",
+                    help="exit 1 when there is an unused or redundant index")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_indexes)
+
     sp = sub.add_parser("oslog",
                         help="scan a system log for OOM kills, fd limits, "
                              "I/O errors and service restarts")
@@ -914,30 +1009,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_demo)
 
     sp = sub.add_parser("lab",
-                        help="start a disposable local MongoDB for testing "
-                             "(the only command that runs external processes)")
+                        help="start a disposable local MongoDB (replica set, "
+                             "standalone or sharded) for testing; the only "
+                             "command that runs external processes")
     sp.add_argument("lab_action",
                     choices=["start", "seed", "status", "stop", "destroy",
                              "logs"])
     sp.add_argument("--dir", default=None,
                     help="lab directory (default ~/.mdbkit-lab)")
-    sp.add_argument("--nodes", type=_int_range(1, 7, "--nodes"), default=3,
-                    help="replica set size (default 3)")
-    sp.add_argument("--port", type=_int_range(1024, 65000, "--port"), default=28110,
+    sp.add_argument("--nodes", type=_int_range(1, 7, "--nodes"), default=None,
+                    help="replica set size (default 3; with --shards, the "
+                         "size of each shard's replica set, default 1)")
+    sp.add_argument("--shards", type=_int_range(1, 6, "--shards"), default=None,
+                    help="start a sharded cluster with this many shards, a "
+                         "config server and a mongos (e.g. --shards 2)")
+    sp.add_argument("--port", type=_int_range(1024, 65000, "--port"), default=None,
                     help="base port (default 28110, deliberately far from 27017)")
-    sp.add_argument("--slowms", type=int, default=0,
+    sp.add_argument("--slowms", type=int, default=None,
                     help="slow query threshold in ms (default 0 = log every "
                          "operation, which is what makes the log interesting)")
     sp.add_argument("--standalone", action="store_true",
                     help="single node, no replica set")
     sp.add_argument("--docs", type=_int_range(1, 10_000_000, "--docs"), default=50000,
                     help="documents to insert for `seed` (default 50000)")
+    sp.add_argument("--workload-only", action="store_true",
+                    help="`seed`: run the queries again on the existing data, "
+                         "without reloading it (keeps indexes you added)")
     sp.add_argument("--yes", action="store_true",
                     help="confirm destructive actions")
     sp.set_defaults(func=cmd_lab)
 
     sp = sub.add_parser("export-script",
-                        help="print a mongosh script to export schema or indexes")
+                        help="print a read-only mongosh script that exports schema, indexes "
+                             "(with usage counters) or serverStatus")
     sp.add_argument("kind", choices=["schema", "indexes", "serverstatus"])
     sp.set_defaults(func=cmd_export_script)
 

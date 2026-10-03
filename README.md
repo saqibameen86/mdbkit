@@ -5,12 +5,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/mdbkit.svg)](https://pypi.org/project/mdbkit/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**An offline toolkit for MongoDB structured logs** — slow-query analysis,
-deterministic index advice, incident triage, a startup configuration audit,
-and diagnostic-data decoding. For MongoDB 4.4 through 8.x and 9.0, from the
-terminal, without connecting to anything.
-**[Tested against real MongoDB 9.0.2, 8.3.11, 8.0.32 and 7.0.43](#compatibility)**
-(October 2026).
+**An offline toolkit for MongoDB logs and diagnostics** — slow-query
+analysis, deterministic index advice, unused and redundant indexes, incident
+triage, sharded clusters, hosts running many mongods, a startup
+configuration audit, and diagnostic-data (FTDC) decoding. For MongoDB 4.4
+through 9.0, from the terminal, without connecting to anything.
+**[Tested against real MongoDB 9.0.2, 8.3.11, 8.0.32, 7.0.43 and 6.0.29](#compatibility)**
+— replica sets, standalones and sharded clusters (October 2026).
 
 A spiritual successor to mtools' log tools, which never learned to read the
 JSON log format introduced in 4.4.
@@ -240,40 +241,47 @@ updates — upgrades are always explicit.
 ## Compatibility
 
 **Tested against (October 2026):** MongoDB **9.0.2**, **8.3.11**, **8.0.32**
-(LTS) and **7.0.43** (LTS), the newest release in each series at the time.
-mdbkit reads the structured JSON log format, so anything from **4.4** onwards
-works; 4.2 and earlier wrote plain text logs and are not supported.
+(LTS), **7.0.43** (LTS) and **6.0.29**, the newest release in each series at
+the time: replica sets and standalones on all five, and sharded clusters
+(mongos, shards and config servers) on 6.0, 7.0, 8.0 and 9.0. mdbkit reads the structured JSON log format, so anything
+from **4.4** onwards works; 4.2 and earlier wrote plain text logs and are not
+supported.
 
 | MongoDB | What mdbkit uses from it |
 |---|---|
 | 4.4 – 7.0 | Everything except the 8.x-only fields below |
-| 8.0 | `workingMillis` (time executing, as distinct from waiting), `queues.execution.totalTimeQueuedMicros` (ticket queue time), `queryShapeHash` (usable with `setQuerySettings`), `planCacheShapeHash`, the 8.0 transparent-huge-page guidance |
+| 8.0 | `workingMillis` (time executing, as distinct from waiting), `queues.execution.totalTimeQueuedMicros` (ticket queue time), `queryShapeHash` (usable with `setQuerySettings`), `planCacheShapeHash`, the 8.0 transparent-huge-page guidance, and FTDC's new layout (sharded processes group metrics by role; WiredTiger checkpoint and eviction statistics were renamed) |
 | 8.1+ | `<stage>Spills` / `<stage>SpilledBytes` (disk spills per stage) |
 | 8.3+ | "Slow in-progress query" lines (id 1794200, component `SLOWPROG`), logged by default for operations still running after 5 s (`--defaultSlowInProgMS`), and `peakTrackedMemBytes` |
 | 9.0 | Same log fields as 8.3. Adds a few fields mdbkit does not use yet (`delinquencyInfo`, `queues.ingress`) |
 
 When a field is missing because the log predates it, that part of the output
-is left out. It is never guessed. FTDC decoding and `serverstatus` read
-concurrency tickets from either the older `wiredTiger.concurrentTransactions`
-or the newer `queues.execution` layout.
+is left out. It is never guessed. Where MongoDB moved a metric between
+versions (concurrency tickets, checkpoint times, eviction), mdbkit reads both
+the old and the new location.
 
-**How it was tested.** Official MongoDB builds of each version were run with
-`mdbkit lab` (a three-node replica set and a standalone), seeded, and put
-through a workload built to produce every field above: unindexed queries,
-sorts and groups forced to spill to disk, writes blocked behind `fsyncLock` so
-they wait rather than work, long-running server-side JavaScript, a clean
-restart and a `kill -9`. Every mdbkit command was then run on the resulting
-logs, `diagnostic.data`, serverStatus and explain output and `getLog`
-captures, and compared with what the server actually did. Trimmed copies of
-that output are in [`tests/fixtures/real/`](tests/fixtures/real/) and run with
-every test.
+**How it was tested.** Official MongoDB builds of each version were run
+with `mdbkit lab` as a three-node replica set, a standalone and (6.0, 7.0,
+8.0 and 9.0) a sharded cluster with a config server, two shards and a
+mongos. Then each one was broken on purpose, in the ways mdbkit is meant to
+spot:
 
-> **Correction.** The 0.6.0 README and release notes said "last checked
-> against 9.0.2, 8.3.13, 8.0.34 and 7.0.45". Three of those version numbers
-> were wrong: MongoDB's release index has no 8.3.13, 8.0.34 or 7.0.45. That
-> release was also checked against release notes and server source only, not
-> a running server. Testing against real servers in 0.6.1 found several bugs
-> 0.6.0 had missed (see the release notes).
+* unindexed queries, sorts that spill to disk, writes blocked behind
+  `fsyncLock` and long-running operations;
+* a clean restart, and a primary killed with `kill -9` (the crash, the
+  failover and the recovery);
+* a stepdown, and a connection storm of 300 connections at once;
+* flow control, with both secondaries frozen by `fsyncLock` while the
+  primary took writes;
+* cache pressure from a working set four times the cache, and a checkpoint
+  that ran for over a minute (the process frozen mid-checkpoint);
+* chunk migrations (one failing on purpose), the balancer moving data on its
+  own, and a shard killed while queries ran.
+
+Every mdbkit command was run on the resulting logs, `diagnostic.data`,
+serverStatus, explain, `getLog` and `$indexStats` output, and compared with
+what the servers did. Trimmed copies of that output are in
+[`tests/fixtures/real/`](tests/fixtures/real/) and run with every test.
 
 If mdbkit misreads a line from your deployment, please
 [open an issue](../../issues) with the line (redact as you like).
@@ -330,12 +338,15 @@ mdbkit triage mongod.log --window 0             # the whole file
 mdbkit triage mongod.log --report incident.html # something to attach to a ticket
 ```
 
-Cluster health, elections, connection storms, hot collections, index builds,
-error clusters, slow-query peaks, startup misconfiguration, time spent
-waiting rather than working (8.0+), and still-running operations (8.3+) —
-plus disk, memory, CPU and FTDC metrics when run on the database host. Every
-finding ends with the next command to run. A shutdown followed by the server
-listening again is reported as a restart (WARN), not an outage (CRIT).
+Crashes and restarts, elections, connection storms, flow control, hot
+collections, index builds, error clusters, slow-query peaks, startup
+misconfiguration, time spent waiting rather than working (8.0+),
+still-running operations (8.3+), and on sharded clusters scatter-gather
+queries, chunk migrations and unreachable shards — plus disk, memory, CPU,
+cache pressure and checkpoints from FTDC when run on the database host.
+Every finding ends with the next command to run. A shutdown followed by the
+server listening again is reported as a restart (WARN); a start with no
+clean shutdown before it, as a crash (CRIT).
 
 ### 4. Did my change actually help?
 
@@ -425,7 +436,7 @@ last 1440 minutes of each log | 7.8 GiB RAM (this machine)
 [CRIT] Cache sizes vs RAM: WiredTiger caches add up to 11.8 GiB, 150% of 7.8 GiB RAM (this machine).
 [CRIT] Instances that crashed: 1 instance(s) started after an unclean stop (crash, kill -9 or OOM kill).
         - vm:29021: 1 unclean start(s)
-[WARN] Default cache size on a shared host: 3 of 8 instances run with the default WiredTiger cache (cacheSizeGB not set). [...]
+[WARN] Default cache size on a shared host: 3 of 8 mongod instances run with the default WiredTiger cache (cacheSizeGB not set). [...]
 
 instance  set   version  role        cache    starts  crashes  slow ops  slow time  waiting  worst  first issue
 --------  ----  -------  ----------  -------  ------  -------  --------  ---------  -------  -----  --------------------------
@@ -440,6 +451,60 @@ of many replica sets. The usual failure is that every instance was left on
 the default WiredTiger cache, which assumes the machine is its alone; the
 caches add up to several times the RAM and the OOM killer picks off
 instances. (Output above is from a real 8-instance test host.)
+
+### 8. Is my sharded cluster sending queries to every shard?
+
+```bash
+mdbkit queries /var/log/mongodb/mongos.log     # how each query was routed
+mdbkit triage  /var/log/mongodb/mongos.log     # scatter-gather, unreachable shards
+mdbkit triage  /var/log/mongodb/shard1.log     # chunk migrations and why they failed
+```
+
+```
+namespace    op         count  cumMs  mean  max   shards  to all  shard wait  shape
+shop.orders  find       50     520ms  10ms  28ms  2       50/50   97%         {createdAt:gt, status:eq} sort:{createdAt:-1}
+shop.orders  aggregate  20     291ms  14ms  20ms  2       20/20   90%         {status:eq}
+shop.orders  find       80     19ms   0ms   3ms   1       0/80    21%         {customerId:eq}
+```
+
+The router's log shows which query shapes went to every shard (usually no
+shard key in the filter) and which went to one. The shards' logs show chunk
+migrations, how much they moved and why any failed; the config server's
+shows balancer errors. Plans live on the shards, so run `queries` and
+`advise` on a shard log for index advice. (Output from a real 8.0 cluster,
+sharded on `customerId`.)
+
+### 9. Which indexes are not earning their keep?
+
+```bash
+mdbkit export-script indexes > export_indexes.js
+mongosh --quiet "mongodb://your_db_host:27017/" --eval "$(cat export_indexes.js)" > indexes.json
+mdbkit indexes indexes.json
+```
+
+```
+exported from: a mongos (usage from each shard's primary)
+
+Unused since the counters started (1)
+  shop.orders  customerId_1_status_1 { customerId: 1, status: 1 } — 0 use(s)
+      no recorded use since the counters started
+      test safely: db.getSiblingDB("shop").getCollection("orders").hideIndex("customerId_1_status_1")
+
+Redundant: a prefix of another index (1)
+  shop.orders  status_1 { status: 1 } — 20 use(s)
+      its key is a prefix of status_1_createdAt_-1 { status: 1, createdAt: -1 }, which can serve the same queries
+      test safely: db.getSiblingDB("shop").getCollection("orders").hideIndex("status_1")
+
+Unused, but not a candidate (1)
+  shop.orders  createdAt_1 { createdAt: 1 } — 0 use(s)
+      unused for queries, but it is a TTL index: the TTL monitor uses it, which the counters do not show
+```
+
+Every index costs write time, memory and disk. This lists the ones with no
+recorded use and the ones another index already covers, and explains the
+ones it deliberately leaves alone (unique, TTL, hidden, the shard key's
+index). It never says "drop": `hideIndex` is the reversible test. (Output
+from a real 8.0 cluster, exported through mongos.)
 
 ---
 
@@ -515,6 +580,8 @@ mdbkit lab start                    # 3-node replica set on 127.0.0.1:28110-2811
 mdbkit lab seed                     # 50k documents + a deliberately mixed workload
 mdbkit queries $(mdbkit lab logs | head -1)
 mdbkit lab destroy --yes            # remove it entirely
+
+mdbkit lab start --shards 2         # or a sharded cluster: config server, 2 shards, mongos
 ```
 
 It binds to localhost only, uses ports far from 27017 so it can never be
@@ -547,8 +614,11 @@ cat mongod.log | mdbkit queries -               # stdin
 
 ### `mdbkit loginfo <log>`
 
-Overall log summary: server version, host, restarts, connections accepted,
-slow-query count, warning/error counts, and a per-component line breakdown.
+Overall log summary: server version, what wrote the log (replica set
+member, standalone, mongos, shard or config server, and its replica set),
+host, restarts, connections accepted, slow-query count, still-running
+operations (8.3+), chunk migrations (on a shard), warning/error counts, and a
+per-component line breakdown.
 
 | Option | Description |
 |---|---|
@@ -592,6 +662,14 @@ under the shape of the query that opened the cursor. Slow `insert` rows are
 included even though no index can speed up an insert: a slow insert is still
 latency your application saw, and on 8.0+ the `--shape` view says whether it
 was executing or waiting (on locks, flow control or write concern).
+
+**On a mongos (router) log** the table changes: a router records how each
+query was routed but not its plan (the shards have that), so `docsEx`,
+`scan` and `plan` give way to `shards` (how many shards each execution went
+to), `to all` (executions sent to every shard: scatter-gather) and
+`shard wait` (the share of time spent waiting for the shards). Cluster
+administration commands (`moveRange`, `shardCollection`, ...) are left out;
+`triage` on the shard logs reports migrations.
 
 ```bash
 mdbkit queries mongod.log
@@ -689,13 +767,14 @@ it chains with other tools (including mdbkit itself).
 
 | Option | Description |
 |---|---|
-| `--component NAME` | `COMMAND`, `NETWORK`, `REPL`, `STORAGE`, `INDEX`, `WRITE`, `QUERY`, `CONTROL`, … |
+| `--component NAME` | `COMMAND`, `NETWORK`, `REPL`, `ELECTION`, `STORAGE`, `INDEX`, `WRITE`, `QUERY`, `SHARDING`, `CONTROL`, … |
 | `--severity S` | `I` info, `W` warning, `E` error, `F` fatal |
 | `--ns NAMESPACE` | Exact namespace, e.g. `shop.orders` |
 | `--slow N` | Only operations with `durationMillis` >= N |
 | `--from TIMESTAMP` | Lower time bound (inclusive) |
 | `--to TIMESTAMP` | Upper time bound (inclusive) |
 | `--msg TEXT` | Substring match on the message field |
+| `--failed` | Only operations that ended in an error (logged with an `errName`) |
 | `--limit N` | Print only the **first** N matches |
 | `--last N` | Print only the **last** N matches — usually what you want during an incident |
 | `--as-explain` | Rebuild each matching slow query as a runnable `mongosh` `.explain()` command instead of printing the raw log line |
@@ -716,7 +795,7 @@ it chains with other tools (including mdbkit itself).
 mdbkit filter mongod.log --severity E --last 20    # errors (most recent 20)
 mdbkit filter mongod.log --severity F               # fatal — always investigate
 mdbkit filter mongod.log --severity W --last 50     # warnings
-mdbkit filter mongod.log --component REPL --msg election
+mdbkit filter mongod.log --component ELECTION      # elections and stepdowns
 mdbkit filter mongod.log --slow 500 --ns shop.orders --limit 50
 mdbkit filter mongod.log --from 2026-07-01T14:30:00+04:00 --to 2026-07-01T15:00:00+04:00
 mdbkit filter mongod.log --slow 100 | mdbkit queries -
@@ -731,8 +810,8 @@ mdbkit filter mongod.log --ns shop.orders --slow 500 --last 3 --as-explain
 
 # Or produce a runnable script, get the plan, and analyze it
 mdbkit filter mongod.log --slow 500 --last 1 --as-explain --explain-script > q.js
-mongosh --quiet --host your_db_host --username your_username \\
-        --password your_password --authenticationDatabase admin \\
+mongosh --quiet --host your_db_host --username your_username \
+        --password your_password --authenticationDatabase admin \
         --eval "$(cat q.js)" > explain.json
 mdbkit explain explain.json
 ```
@@ -787,13 +866,13 @@ help — a candidate index from the same advisor engine.
 
 ```bash
 # 1. Capture the plan (adjust host/credentials for your deployment)
-mongosh --quiet \\
-  --host your_db_host \\
-  --port 27017 \\
-  --username your_username \\
-  --password your_password \\
-  --authenticationDatabase admin \\
-  --eval 'EJSON.stringify(db.getSiblingDB("shop").orders.find({status:"open"}).sort({ts:-1}).explain("executionStats"))' \\
+mongosh --quiet \
+  --host your_db_host \
+  --port 27017 \
+  --username your_username \
+  --password your_password \
+  --authenticationDatabase admin \
+  --eval 'EJSON.stringify(db.getSiblingDB("shop").orders.find({status:"open"}).sort({ts:-1}).explain("executionStats"))' \
   > explain.json
 
 # 2. Analyze it
@@ -824,7 +903,10 @@ one screen that says what happened, how bad it is, and where to look next.
 | `--window N` | 60 | Analyze the last N minutes of log time; `0` = the whole file |
 | `--dbpath PATH` | auto | Override the data directory used for the disk check |
 | `--no-sysprobe` | off | Skip local disk/memory/CPU probes — use when analyzing a log copied off the host |
-| `--ftdc PATH` | | `diagnostic.data` directory — adds CPU, memory, cache, queue and connection history from MongoDB's own recorder |
+| `--ftdc PATH` | | `diagnostic.data` directory — adds CPU, memory, cache, checkpoint, eviction, flow-control and connection history from MongoDB's own recorder. Found automatically when the log is from this host (a mongos keeps it next to its log) |
+| `--oslog FILE...` | | System log(s): OOM kills, file-descriptor limits and I/O errors that the mongod log cannot record |
+| `--only LEVELS` | | Show only these severities, e.g. `--only CRIT,WARN` |
+| `--exit-code` | | Exit 2 on CRIT, 1 on WARN, else 0 |
 | `--report FILE` | | Write a shareable `.md` or `.html` report instead of terminal output |
 | `--json` | | Machine-readable output |
 
@@ -840,8 +922,33 @@ mdbkit triage mongod.log --window 0 --no-sysprobe
 with no clean shutdown before it is a CRIT, because that is what a crash,
 `kill -9` or OOM kill looks like. mongod itself records whether its previous
 shutdown was clean, so mdbkit can tell even when the crash happened before
-the log you are reading begins. The first election of a newly initiated
-replica set is reported as INFO, not as instability.
+the log you are reading begins.
+
+**Elections.** An election because a member saw no primary is a CRIT: the
+primary was lost (crash, kill, hang or network). A stepdown command ("step
+up request") or a higher-priority member taking over is a WARN, worded as
+probably deliberate. The first election of a newly initiated replica set is
+INFO, not instability.
+
+**Flow control, cache pressure and checkpoints.** Flow control is read from
+the log (MongoDB warns every 10 seconds while it throttles writes) and from
+FTDC (how long it was engaged and how long writers waited). Cache pressure
+comes from FTDC: how long the cache sat past the points where application
+threads must help evict (95% full or 20% dirty), and how much time they
+spent evicting in the busiest minute. A slow checkpoint is a WARN past 60
+seconds; FTDC records every checkpoint's duration, and MongoDB 8.3+ also
+logs one that runs past 20 seconds. Each of these was checked on real 6.0,
+7.0, 8.0 and 9.0 servers driven into that state.
+
+**Sharded clusters.** On a mongos log, `triage` reports queries sent to every
+shard (scatter-gather), time spent waiting on the shards, routing-table
+refreshes, and shards or members the router could not reach. On a shard's
+log it reports chunk migrations (how many, how much data, and why any
+failed, e.g. waiting for the range deleter); on the config server's,
+balancer errors. On any log, **failed operations** on your collections (a
+query or write that ended in an error such as
+`FailedToSatisfyReadPreference` or `MaxTimeMSExpired`) are grouped by
+error; `mdbkit filter <log> --failed` prints them.
 
 **Hosts running several mongods.** `triage` reads one instance's log; don't
 pass several instances' logs to it, because several files are read as one
@@ -883,7 +990,9 @@ startup line.
 **Per instance:** replica set, version, role, WiredTiger cache size, starts
 and crashes (unclean stops), slow operations and their total time, the share
 of that time spent waiting (8.0+), and its worst finding from the same
-detectors `triage` uses.
+detectors `triage` uses. Shard and config server members are labelled as
+such, and a mongos on the same host gets a line of its own (it has no cache,
+so it is left out of the cache total).
 
 **For the host:**
 
@@ -956,7 +1065,7 @@ not encrypted; mdbkit decodes it offline.
 | `--all` | off | Analyze the entire history (see the performance note below) |
 | `--metric LABEL` | all | Restrict to one metric (repeatable), e.g. `--metric conns.current` |
 | `--step SECONDS` | 60 | Timeline bucket size |
-| `--from` / `--to` | | Explicit time bounds (same formats as `filter`) |
+| `--from` / `--to` | | Explicit time bounds, UTC unless the value has an offset (same formats as `filter`) |
 | `--json` | | Machine-readable output |
 
 **Performance note.** `diagnostic.data` can hold weeks of per-second samples —
@@ -975,12 +1084,18 @@ mdbkit ftdc export diagnostic.data > metrics.csv
 
 In `timeline`, gauges (connections, cache bytes, tickets) show the peak in
 each bucket and cumulative counters (`ops.*`, `sys.cpu.*`) show their rate
-per second over it.
+per second over it. FTDC records time in UTC, and these commands show it as
+UTC; `triage --ftdc` converts it to the log's own time zone so the two line
+up.
 
 Metric labels include `ops.*` (insert/query/update/delete/getmore/command),
 `conns.current`, `conns.available`, `queue.readers`, `queue.writers`,
 `cache.usedBytes`, `cache.maxBytes`, `cache.dirtyBytes`, `tickets.*`,
-`mem.residentMB`, and on Linux `sys.cpu.*` and `sys.mem.availableKB`.
+`checkpoint.lastMs`, `evict.appThreadMicros`, `flowControl.*`,
+`mem.residentMB`, and on Linux `sys.cpu.*` and `sys.mem.availableKB`. The
+same labels work across versions where MongoDB renamed the underlying
+statistic (checked on 6.0 to 9.0), and on 8.0+ shard servers and mongos,
+which group their metrics by role.
 
 The data directory can be copied off the host and analyzed elsewhere — it
 contains metrics only, never document contents.
@@ -1005,16 +1120,17 @@ Markdown output looks like this:
 ```markdown
 # MongoDB incident triage
 
-*window 2026-07-01 08:10 -> 09:10  ·  generated 2026-07-01 09:12*
+*window 2026-07-01 08:29 -> 09:29  ·  generated 2026-07-01 09:31*
 
 ## Findings
 
-- **[CRIT] Replica set instability** — 3 election/stepdown event(s) at 08:41:02, 08:58:14
-    - Starting an election, since we've seen no PRIMARY in election timeout period
-    - *next:* `Correlate with connection storms and slow checkpoints below`
-- **[WARN] Connection storm** — 2 minute(s) at >= 60 new connections/min; peak 480 at 08:41
-    - 10.2.1.7: 312 in the peak minute
-    - *next:* `mdbkit connections <log>`
+- **[CRIT] Replica set instability** — 2 election/stepdown event(s); at least once a member saw no primary and called an election, which is what losing the primary (crash, kill, hang or network) looks like.
+    - 08:50:32  Starting an election, since we've seen no PRIMARY in election timeout period
+    - 08:50:34  Election succeeded, assuming primary role
+    - *next:* `Find why the primary went away at the first timestamp: its own log (mdbkit triage on it), then the OS log (mdbkit oslog) for OOM kills or restarts.`
+- **[WARN] Connection storm** — 1 minute(s) at >= 60 new connections/min (baseline median 0/min); peak 220 at 08:49.
+    - 10.20.9.77: 220 in the peak minute
+    - *next:* `Identify the client: mdbkit connections <log> — look for pool misconfiguration or crash-loop reconnects.`
 - **[OK] Errors** — No error/fatal severity lines in window.
 ```
 
@@ -1063,12 +1179,12 @@ or rehearsing a demo. This is the only command that starts external
 processes; see [SECURITY.md](SECURITY.md) for exactly how it is bounded.
 
 Requires `mongod` on your `PATH` (and `mongosh` to initiate the replica set
-and seed data). Linux and macOS.
+and seed data; a sharded lab also needs `mongos`). Linux and macOS.
 
 | Action | What it does |
 |---|---|
-| `start` | Create and start a replica set, print the connection string and log paths |
-| `seed` | Insert sample data and run a workload with deliberately interesting queries |
+| `start` | Create and start a replica set (or standalone, or sharded cluster), print the connection string and log paths. On an existing lab, start the nodes that are down, with their data and ports (options that would make a different lab are refused) |
+| `seed` | Insert sample data and run a workload with deliberately interesting queries (`--workload-only`: just the queries, on the data already there) |
 | `status` | Show ports, pids and whether each node is running |
 | `logs` | Print the log file paths, ready to pipe into other commands |
 | `stop` | Stop the nodes, keep the data |
@@ -1077,11 +1193,13 @@ and seed data). Linux and macOS.
 | Option | Default | Description |
 |---|---|---|
 | `--dir PATH` | `~/.mdbkit-lab` | Where the lab lives |
-| `--nodes N` | 3 | Replica set size |
+| `--nodes N` | 3 | Replica set size (with `--shards`: each shard's replica set, default 1) |
+| `--shards N` | | A sharded cluster with N shards, a config server and a mongos |
 | `--port N` | 28110 | Base port — deliberately far from 27017 |
 | `--slowms N` | 0 | Log every operation, which is what makes the log worth reading |
 | `--standalone` | off | Single node, no replica set |
 | `--docs N` | 50000 | Documents inserted by `seed` |
+| `--workload-only` | | `seed` runs the queries again on the data already there |
 | `--yes` | | Confirm `destroy` |
 
 **The full loop:**
@@ -1105,9 +1223,23 @@ mdbkit lab logs
 # /home/you/.mdbkit-lab/node1/mongod.log
 # /home/you/.mdbkit-lab/node2/mongod.log
 
-mdbkit queries $(mdbkit lab logs | head -1)     # just the primary
+mdbkit queries $(mdbkit lab logs | head -1)     # node0, the preferred primary
 mdbkit triage  $(mdbkit lab logs)               # all three as one stream
 mdbkit loginfo $(mdbkit lab logs | sed -n 2p)   # a specific secondary
+```
+
+**A sharded cluster**: a config server, N single-node shards (`--nodes 3`
+makes each shard a three-node replica set) and a mongos. `seed` shards
+`shop.orders` on `customerId`, moves a range to every shard, then runs
+targeted and scatter-gather queries through mongos. `logs` lists the mongos
+log first:
+
+```bash
+mdbkit lab start --shards 2          # config 28110, shards 28111-28112, mongos 28113
+mdbkit lab seed
+mdbkit queries $(mdbkit lab logs | head -1)     # the router: shards per query
+mdbkit triage  $(mdbkit lab logs | sed -n 3p)   # a shard: migrations, its queries
+mdbkit lab destroy --yes
 ```
 
 **A single node**, when you do not need replication. It starts faster, and
@@ -1140,21 +1272,38 @@ mdbkit lab start                    # back up with the same data
 mdbkit lab status                   # ports, pids, running or not
 ```
 
+**Rehearse a failure.** Kill a node the way a crash or the OOM killer would,
+see what mdbkit makes of it, then bring it back. `start` on an existing lab
+starts only the nodes that are down, on their old ports:
+
+```bash
+kill -9 $(cat ~/.mdbkit-lab/node0/mongod.pid)   # the primary dies
+sleep 20                                        # the others elect a new one
+mdbkit lab start                                # node0 comes back
+mdbkit triage $(mdbkit lab logs) --window 0     # crash, failover, recovery
+```
+
 **A complete before/after experiment**, which is what `lab` is really for:
 
 ```bash
 mdbkit lab start && mdbkit lab seed
 cp $(mdbkit lab logs | head -1) before.log
+mongosh --port 28110 --quiet --eval 'db.adminCommand({logRotate: 1})'  # start a fresh log
 
 mongosh --port 28110 --eval \
   'db.getSiblingDB("shop").orders.createIndex({status:1, createdAt:-1})'
 
-mdbkit lab seed                     # run the workload again with the index
+mdbkit lab seed --workload-only     # the same queries, now with the index
 cp $(mdbkit lab logs | head -1) after.log
 
 mdbkit compare before.log --after after.log
 mdbkit lab destroy --yes
 ```
+
+`--workload-only` runs the queries again without reloading the data, so the
+index you added stays; a plain `seed` reloads and would drop it. Rotating the
+log keeps the second run's lines apart from the first's, because lab logs
+are appended to across restarts.
 
 `seed` runs indexed point lookups alongside deliberately unindexed queries —
 an equality-plus-range-plus-sort with no supporting index, an aggregation
@@ -1164,8 +1313,9 @@ log immediately contains something worth analysing.
 **Safety.** The lab binds to `127.0.0.1` only, refuses to use or delete any
 directory it did not create, and never touches a MongoDB it did not start.
 Before it signals a process it checks that the pid still belongs to one of
-its own `mongod`s (its command line names the lab's data directory), so a
-stale pid file can never kill something unrelated. `destroy` refuses to
+its own `mongod`s or its `mongos` (the command line names the lab's data
+directory or log file), so a stale pid file can never kill something
+unrelated. `destroy` refuses to
 delete data while a lab node is still running. If a port is already taken it
 says so before starting anything. If a start fails halfway, the lab is left
 in a state `mdbkit lab destroy --yes` can clean up, and the error says so.
@@ -1304,19 +1454,59 @@ duration moving by more than 20%.
 
 ---
 
-### `mdbkit export-script {schema|indexes}`
+### `mdbkit indexes <file>...`
+
+Unused and redundant indexes, from what `mdbkit export-script indexes`
+exported (index definitions plus `$indexStats` usage counters).
+
+| Option | Default | Description |
+|---|---|---|
+| `--ns NAMESPACE` | all | Only this collection |
+| `--min-days N` | 7 | Warn when the usage counters cover fewer days than this |
+| `--exit-code` | | Exit 1 when there is an unused or redundant index |
+| `--json` | | Machine-readable output |
+
+```bash
+mdbkit indexes indexes.json
+mdbkit indexes primary.json secondary1.json secondary2.json   # combine members
+mdbkit indexes indexes.json --ns shop.orders
+```
+
+What it reports:
+
+- **Unused:** no recorded use since the counters started.
+- **Redundant:** its key is a prefix of another index with the same
+  collation, which can serve the same queries (`{a: 1}` when `{a: 1, b: 1}`
+  exists). Partial, sparse and special (text, 2dsphere, hashed, wildcard)
+  indexes are never treated as covering or covered.
+- **Not candidates:** `_id`, unique indexes (they enforce a constraint),
+  TTL indexes (the TTL monitor's deletes do not count as use, checked on
+  8.0 and 9.0), hidden indexes, and the index the shard key needs.
+
+Usage counters are kept **per member** and **reset when a member restarts**.
+An index unused on the primary may serve reads on a secondary, and one used
+monthly can look unused after a week. So export from every member (or
+through mongos for a sharded cluster) and pass all the files, and check the
+counter window mdbkit prints. It never recommends dropping anything: it
+prints the `hideIndex` command, which makes the planner ignore the index
+while it is still maintained, so `unhideIndex` undoes it instantly.
+
+---
+
+### `mdbkit export-script {schema|indexes|serverstatus}`
 
 Prints a small `mongosh` script to stdout. **mdbkit never connects to your
 database**. You run these yourself, so you can read exactly what they do
-first. Both are read-only. `schema` exports **field names and types only,
+first. All are read-only. `schema` exports **field names and types only,
 never document values**. `indexes` exports the index definitions from
-`getIndexes()`; a partial index's filter expression can contain literal
-values.
+`getIndexes()` (a partial index's filter expression can contain literal
+values) and, where your role allows `$indexStats`, how often each index has
+been used; through mongos it also records the shard keys.
 
-Both cover **every database you can read** (`admin`, `config` and `local`
-skipped) and key collections by full namespace, so it does not matter which
-database mongosh connects to. To export one database only, set `ONLY_DB` at
-the top of the script. The `serverstatus` script writes relaxed Extended
+`schema` and `indexes` cover **every database you can read** (`admin`,
+`config` and `local` skipped) and key collections by full namespace, so it
+does not matter which database mongosh connects to. To export one database
+only, set `ONLY_DB` at the top of the script. They write relaxed Extended
 JSON, so 64-bit counters come out as plain numbers.
 
 ```bash
@@ -1332,41 +1522,42 @@ mdbkit export-script serverstatus > export_serverstatus.js
 Terminal output is and will remain first-class — this tool is built for the
 Linux box the database actually runs on.
 
-**Shipped in v0.7:** `mdbkit host`, for hosts running many mongods: one
-line per instance, cache sizes added up against RAM, crashes and OOM kills
-per instance, startup warnings counted across instances. Rotated logs are
-tied to their process.
+**v0.8 is a long-term release.** Nothing further is scheduled. Bug reports
+are still read, and misread log lines are still the most useful thing to
+send.
 
-**Shipped in v0.6.1:** tested against real MongoDB 7.0, 8.0, 8.3 and 9.0
-servers, with the bugs that turned up fixed; crash vs clean restart
-detection; correct behaviour on hosts running many mongods.
+**Shipped in v0.8:**
 
-**Shipped in v0.6:** MongoDB 8.x/9.0 support (executing vs waiting time,
-query shape hashes, disk spills, peak memory, in-progress operations, the
-8.0 ticket layout in FTDC), the `audit` command, mongosh-paste input, and a
-hardening pass. Before that: v0.5's `oslog` and `serverstatus`, v0.4's
-`compare`, rotated-log globbing and per-shape drill-down, v0.3's `demo` and
-`lab`, and v0.2's FTDC decoding, incident triage, query reconstruction and
-shareable reports.
+* **Sharded clusters.** mongos logs show how many shards each query shape
+  went to, which ones went to all of them, and the time spent waiting on
+  shards and refreshing routing tables. Shard and config server logs show
+  chunk migrations (with the reason when one fails), the range deleter, the
+  balancer's errors, unreachable shards and failed application operations.
+  FTDC from 8.0+ shard servers and mongos decodes. `mdbkit lab --shards N`
+  builds a cluster to try it on.
+* **`mdbkit indexes`:** unused and redundant indexes from `$indexStats`,
+  across replica set members or shards, with the reversible `hideIndex`
+  command rather than a drop.
+* **The beta detectors checked against real failures.** Elections and
+  stepdowns, flow control, cache pressure and slow checkpoints were
+  reproduced on real MongoDB 6.0, 7.0, 8.0 and 9.0 servers (a killed
+  primary, a stepdown, a connection storm, frozen secondaries, a small
+  cache under load, a checkpoint held up for a minute), so none is labelled
+  beta any more. That turned up real bugs, now fixed: flow control was never
+  spotted in the log, a failover soon after a set was created was taken for
+  its set-up, a stepdown was invisible on the primary that stepped down, and
+  every chunk migration looked like a shutdown on the receiving shard.
+* `filter --failed`, `lab start` restarting only the nodes that are down,
+  `lab seed --workload-only`, and FTDC checkpoint and eviction metrics under
+  their 8.0 names.
 
-Next up, roughly in order:
+**Shipped before:** v0.7's `host` (hosts running many mongods); v0.6.1's
+testing against real servers; v0.6's 8.x/9.0 log fields and `audit`; v0.5's
+`oslog` and `serverstatus`; v0.4's `compare`; v0.3's `demo` and `lab`; v0.2's
+FTDC decoding, incident triage and shareable reports.
 
-* **Sharded clusters.** `mongos` logs are a different shape, and the classic
-  sharded failure — a query with no shard key fanning out to every shard — is
-  visible in the log. Also chunk migrations, balancer windows and jumbo
-  chunks. Would come with `mdbkit lab --sharded` so it can be tested.
-* **Index usage candidates.** Prefix-redundant indexes (an index on `{a: 1}`
-  when `{a: 1, b: 1}` exists) are worth *examining*, but static analysis is
-  not sufficient grounds to drop one — the planner may still be choosing it.
-  So mdbkit will flag candidates and print an `$indexStats` script to confirm
-  real usage first, never a drop recommendation.
-* **Confirming the FTDC-based checkpoint, eviction and flow-control
-  detectors** against real `diagnostic.data` — see
-  `docs/TESTING-PLAYBOOK.md`. Real logs and metrics very welcome.
-
-mdbkit is validated against real-world structured logs (tens of thousands of
-lines) in addition to its synthetic test fixtures, and its tests include real
-output from MongoDB 7.0.43, 8.0.32, 8.3.11 and 9.0.2.
+**Ideas, not scheduled:** jumbo chunks and balancer windows; slow oplog
+application on secondaries; `lab` on Windows.
 
 ## Bugs, feature requests, questions
 

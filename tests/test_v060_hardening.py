@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -704,3 +705,84 @@ def test_lab_never_signals_a_process_it_does_not_own(tmp_path, fake_mongod):
     finally:
         victim.kill()
         victim.wait()
+
+
+def test_lab_start_brings_back_only_the_nodes_that_are_down(tmp_path, fake_mongod):
+    """Before 0.8 a lab with one node down could not be repaired: start
+    refused while any node ran, so the playbook's "kill the primary, then
+    lab start" never brought it back."""
+    d = str(tmp_path / "lab")
+    fake_mongod.append(d)
+    base = _free_port()
+    lab.start(directory=d, base_port=base, nodes=3, echo=lambda *a: None)
+    before = {n["name"]: n["pid"] for n in lab.status(d)["nodes"]}
+    victim = next(n for n in lab.status(d)["nodes"] if n["name"] == "node1")
+    os.kill(victim["pid"], signal.SIGKILL)
+    for _ in range(50):
+        if not lab.lab_pid(victim):
+            break
+        time.sleep(0.1)
+    msgs = []
+    lab.start(directory=d, base_port=base, nodes=3, echo=msgs.append)
+    after = {n["name"]: (n["pid"], n["running"], n["port"]) for n in lab.status(d)["nodes"]}
+    assert all(running for _, running, _ in after.values())
+    assert after["node0"][0] == before["node0"]          # left alone
+    assert after["node1"][0] != before["node1"]          # restarted
+    assert after["node1"][2] == base + 1                  # same port
+    assert any("starting the 1 that are down" in m for m in msgs)
+    with pytest.raises(lab.LabError) as exc:
+        lab.start(directory=d, base_port=base, nodes=3, echo=lambda *a: None)
+    assert "already running" in str(exc.value)
+    lab.destroy(d, echo=lambda *a: None)
+
+
+def test_port_probe_ignores_connections_left_by_a_killed_node():
+    """After kill -9 the port keeps connections in TIME_WAIT for about a
+    minute. mongod binds with SO_REUSEADDR and starts fine, but the probe
+    used to call the port taken, so `lab start` refused to restart it."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    assert lab.port_in_use(port)                  # a live listener counts
+    c = socket.create_connection(("127.0.0.1", port))
+    a, _ = srv.accept()
+    a.close()
+    c.close()
+    srv.close()
+    assert not lab.port_in_use(port)              # TIME_WAIT leftovers do not
+
+
+def test_lab_start_refuses_options_that_make_a_different_lab(tmp_path, fake_mongod):
+    """0.8 review: `lab start --shards 2` on a stopped replica-set lab used
+    to restart the replica set and say "lab ready"."""
+    d = str(tmp_path / "lab")
+    fake_mongod.append(d)
+    base = _free_port()
+    lab.start(directory=d, base_port=base, nodes=3, echo=lambda *a: None)
+    lab.stop(d, echo=lambda *a: None)
+    assert lab.topology(lab.load_state(d)) == {
+        "shards": 0, "nodes": 3, "standalone": False, "port": base, "slowms": 0}
+    for asked in ({"shards": 2}, {"standalone": True}, {"nodes": 1},
+                  {"port": base + 10}):
+        with pytest.raises(lab.LabError) as exc:
+            lab.start(directory=d, base_port=base, echo=lambda *a: None,
+                      requested=asked)
+        assert "made differently" in str(exc.value)
+    # the same options, or none, start it as it is
+    lab.start(directory=d, base_port=base, echo=lambda *a: None,
+              requested={"nodes": 3, "port": base})
+    assert all(n["running"] for n in lab.status(d)["nodes"])
+    lab.destroy(d, echo=lambda *a: None)
+
+
+def test_lab_start_after_an_interrupted_start_says_so(tmp_path, fake_mongod):
+    d = str(tmp_path / "lab")
+    fake_mongod.append(d)
+    os.makedirs(d)
+    lab.save_state(d, {"createdAt": "x", "dir": d, "status": "starting",
+                       "nodes": [], "replicaSet": "mdbkitlab"})
+    with pytest.raises(lab.LabError) as exc:
+        lab.start(directory=d, base_port=_free_port(), echo=lambda *a: None)
+    assert "did not finish" in str(exc.value)

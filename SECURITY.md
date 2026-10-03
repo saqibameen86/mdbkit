@@ -3,8 +3,8 @@
 ## Design posture
 
 Every **analysis** command — `loginfo`, `queries`, `connections`, `filter`,
-`advise`, `explain`, `triage`, `host`, `audit`, `ftdc`, `oslog`, `serverstatus`,
-`compare`, `demo`, `export-script` — is safe to run on a production database
+`advise`, `explain`, `triage`, `host`, `audit`, `ftdc`, `indexes`, `oslog`,
+`serverstatus`, `compare`, `demo`, `export-script` — is safe to run on a production database
 host:
 
 * **No network code.** The tool never opens a socket, phones home, checks for
@@ -41,7 +41,9 @@ host:
 it necessarily starts external processes. It is the only part of mdbkit that
 does, and it is bounded:
 
-* It runs only `mongod` and `mongosh` from your `PATH`. Nothing else, ever.
+* It runs only `mongod`, `mongos` and `mongosh` (or the legacy `mongo`
+  shell when there is no `mongosh`) from your `PATH`, plus `ps` on macOS to
+  check a pid before signalling it. Nothing else, ever.
 * It binds to `127.0.0.1` only, on a base port of **28110** — deliberately
   far from 27017–27019 so a lab can never be mistaken for a real deployment.
 * It refuses to use or delete a directory it did not create. Every lab
@@ -49,13 +51,13 @@ does, and it is bounded:
   without one.
 * It never connects to, reads, or modifies any MongoDB it did not start.
 * Before signalling a pid it confirms the process is still one of its own
-  `mongod`s (its command line names the lab's data directory, read from
-  `/proc` or `ps`). A stale pid that now belongs to something else is never
-  signalled.
+  `mongod`s or its `mongos` (the command line names the lab's data
+  directory or log file, read from `/proc` or `ps`). A stale pid that now
+  belongs to something else is never signalled.
 * `lab destroy` refuses to delete a directory while any lab node in it is
   still running.
-* Its only network-stack use is a bind attempt on `127.0.0.1:<port>`, to
-  report a busy port clearly before anything starts.
+* Its only network-stack use is a connection attempt and a bind attempt on
+  `127.0.0.1:<port>`, to report a busy port clearly before anything starts.
 * `lab seed` writes sample data only into the lab it created.
 
 If you want the guarantee that mdbkit never starts a process on a given
